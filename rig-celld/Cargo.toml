@@ -1,0 +1,20 @@
+[package]
+name = "rig-celld"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rig integrations for celld and workers-rs"
+
+[dependencies]
+rig-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+worker = { workspace = true, optional = true }
+
+[features]
+default = []
+sqlite-vec = ["dep:worker"]
+
+[lints]
+workspace = true
