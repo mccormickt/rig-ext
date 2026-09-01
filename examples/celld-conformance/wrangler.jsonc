@@ -1,0 +1,10 @@
+{
+  "name": "rig-celld-conformance",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["sqlite_vec"],
+  "durable_objects": {
+    "bindings": [{ "name": "CONFORMANCE", "class_name": "ConformanceCell" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ConformanceCell"] }]
+}

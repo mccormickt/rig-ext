@@ -1,0 +1,15 @@
+{
+  "name": "rig-celld-agent",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["sqlite_vec"],
+  "durable_objects": {
+    "bindings": [{ "name": "AGENTS", "class_name": "AgentCell" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AgentCell"] }],
+  "vars": {
+    "OPENAI_COMPLETION_MODEL": "gpt-4o-mini",
+    "OPENAI_EMBEDDING_MODEL": "text-embedding-3-small",
+    "OPENAI_EMBEDDING_DIMENSIONS": "512"
+  }
+}

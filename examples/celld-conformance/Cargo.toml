@@ -1,0 +1,19 @@
+[package]
+name = "celld-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rig-core.workspace = true
+rig-celld = { path = "../../rig-celld", features = ["sqlite-vec"] }
+serde.workspace = true
+serde_json.workspace = true
+worker.workspace = true
+
+[lints]
+workspace = true
