@@ -1,22 +1,19 @@
-use std::{collections::BTreeSet, future::Future, pin::Pin};
+use std::{collections::BTreeSet, future::Future, pin::Pin, time::Duration};
 
 use duroxide::{Either2, OrchestrationContext, RetryPolicy};
 use rig::{
-    OneOrMany,
     agent::run::{StreamedTurnAssembler, StreamedTurnEvent},
-    agent::{
-        AgentRun, AgentRunStep, InvalidToolCallAction, ModelTurnOutcome, PendingToolCall,
-        PromptResponse,
-    },
-    completion::{CompletionRequest, Message},
+    agent::{AgentRun, AgentRunStep, InvalidToolCallAction, PendingToolCall, PromptResponse},
+    completion::{CompletionRequest, ResponseIdentity},
     message::{ToolResultContent, UserContent},
 };
-use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    activity_types::{ToolActivityInput, ToolActivityOutput},
-    approval::{ApprovalDecision, ApprovalRequest},
+    activity_types::{ToolActivityInput, ToolActivityOutput, ToolInvocation},
+    approval::ApprovalDecision,
     config::{CheckpointPolicy, CompletionMode, DurableAgentConfig},
+    driver::{self, CompletionOptions},
     names::RuntimeNames,
     streaming::StreamTranscript,
     tools::ToolRoute,
@@ -24,6 +21,14 @@ use crate::{
 };
 
 type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<UserContent, String>> + Send + 'a>>;
+
+pub(crate) const STEERING_QUEUE_NAME: &str = "RigAgentSteeringV1";
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct SteeringCommand {
+    pub command_id: String,
+    pub message: rig::completion::Message,
+}
 
 pub async fn run(
     ctx: OrchestrationContext,
@@ -40,38 +45,41 @@ pub(crate) async fn run_with_names(
     names: RuntimeNames,
 ) -> Result<PromptResponse, String> {
     let is_resume = input.is_resume();
-    let (mut agent, generation, mut model_turn) = input.into_run(config.max_turns)?;
+    let (mut agent, generation, mut model_turn, mut prompt_index) =
+        input.into_run(config.max_turns)?;
     if !is_resume && let Some(tool_choice) = config.completion.tool_choice.clone() {
         agent = agent.with_tool_choice(tool_choice);
     }
     let mut operations = 0;
+    let mut last_steering_id = ctx
+        .get_custom_status()
+        .as_deref()
+        .and_then(last_steering_id_from_status);
     loop {
         match agent.next_step().map_err(|error| error.to_string())? {
             AgentRunStep::CallModel {
                 prompt,
-                mut history,
+                history,
                 turn,
             } => {
                 model_turn = turn;
-                ctx.set_custom_status(serde_json::json!({"phase":"model","turn":turn}).to_string());
-                if let Some(preamble) = &config.preamble {
-                    history.insert(0, Message::system(preamble));
-                }
-                history.push(prompt);
-                let request = CompletionRequest {
-                    model: None,
-                    preamble: None,
-                    chat_history: OneOrMany::many(history)
-                        .map_err(|_| "empty completion history")?,
-                    documents: Vec::new(),
-                    tools: config.tools.definitions(),
-                    temperature: config.completion.temperature,
-                    max_tokens: config.completion.max_tokens,
-                    tool_choice: config.completion.tool_choice.clone(),
-                    additional_params: config.completion.additional_params.clone(),
-                    output_schema: None,
-                    record_telemetry_content: false,
-                };
+                set_status(
+                    &ctx,
+                    serde_json::json!({"phase":"model","turn":turn}),
+                    last_steering_id.as_deref(),
+                );
+                let request = driver::completion_request(
+                    prompt,
+                    history,
+                    CompletionOptions {
+                        preamble: config.preamble.clone(),
+                        tools: config.tools.definitions(),
+                        temperature: config.completion.temperature,
+                        max_tokens: config.completion.max_tokens,
+                        tool_choice: config.completion.tool_choice.clone(),
+                        additional_params: config.completion.additional_params.clone(),
+                    },
+                );
                 match config.completion_mode {
                     CompletionMode::Blocking => {
                         let turn = ctx
@@ -81,14 +89,7 @@ pub(crate) async fn run_with_names(
                                 config.completion_retry.clone(),
                             )
                             .await?;
-                        match agent.model_response(turn).map_err(|e| e.to_string())? {
-                            ModelTurnOutcome::Continue { .. } | ModelTurnOutcome::TurnRetried => {}
-                            ModelTurnOutcome::NeedsResolution(_) => {
-                                agent
-                                    .resolve_invalid_tool_call(InvalidToolCallAction::fail())
-                                    .map_err(|error| error.to_string())?;
-                            }
-                        }
+                        driver::apply_model_turn(&mut agent, turn)?;
                     }
                     CompletionMode::Streaming => {
                         let transcript = ctx
@@ -103,24 +104,51 @@ pub(crate) async fn run_with_names(
                 }
                 operations += 1;
                 if should_checkpoint(&agent, operations, &config) {
-                    return checkpoint(&ctx, agent, generation, model_turn, &config).await;
+                    return checkpoint(
+                        &ctx,
+                        agent,
+                        generation,
+                        model_turn,
+                        prompt_index,
+                        &config,
+                        last_steering_id.as_deref(),
+                    )
+                    .await;
                 }
             }
             AgentRunStep::CallTools { calls } => {
                 let mut resolved = Vec::with_capacity(calls.len());
                 for (call_index, pending) in calls.into_iter().enumerate() {
                     resolved.push(
-                        resolve_approval(&ctx, pending, &config, model_turn, call_index).await?,
+                        resolve_approval(
+                            &ctx,
+                            pending,
+                            &config,
+                            prompt_index,
+                            model_turn,
+                            call_index,
+                        )
+                        .await?,
                     );
                 }
-                ctx.set_custom_status(
-                    serde_json::json!({"phase":"tools","count":resolved.len()}).to_string(),
+                set_status(
+                    &ctx,
+                    serde_json::json!({"phase":"tools","count":resolved.len()}),
+                    last_steering_id.as_deref(),
                 );
                 let futures: Vec<ToolFuture<'_>> = resolved
                     .into_iter()
-                    .map(|pending| {
-                        Box::pin(execute_tool_call(&ctx, pending, &config, &names))
-                            as ToolFuture<'_>
+                    .enumerate()
+                    .map(|(call_index, pending)| {
+                        Box::pin(execute_tool_call(
+                            &ctx,
+                            pending,
+                            &config,
+                            &names,
+                            prompt_index,
+                            model_turn,
+                            call_index,
+                        )) as ToolFuture<'_>
                     })
                     .collect();
                 let results = ctx
@@ -131,11 +159,56 @@ pub(crate) async fn run_with_names(
                 agent.tool_results(results).map_err(|e| e.to_string())?;
                 operations += 1;
                 if should_checkpoint(&agent, operations, &config) {
-                    return checkpoint(&ctx, agent, generation, model_turn, &config).await;
+                    return checkpoint(
+                        &ctx,
+                        agent,
+                        generation,
+                        model_turn,
+                        prompt_index,
+                        &config,
+                        last_steering_id.as_deref(),
+                    )
+                    .await;
                 }
             }
             AgentRunStep::Done(response) => {
-                ctx.reset_custom_status();
+                if let Some((prompt, command_id)) = take_steering(&ctx).await {
+                    if let Some(command_id) = command_id {
+                        last_steering_id = Some(command_id);
+                    }
+                    set_status(
+                        &ctx,
+                        serde_json::json!({"phase":"steering_accepted"}),
+                        last_steering_id.as_deref(),
+                    );
+                    let history = agent.full_history();
+                    prompt_index = prompt_index.checked_add(1).ok_or("prompt index overflow")?;
+                    agent = AgentRun::new(prompt)
+                        .with_history(history)
+                        .max_turns(config.max_turns);
+                    if let Some(tool_choice) = config.completion.tool_choice.clone() {
+                        agent = agent.with_tool_choice(tool_choice);
+                    }
+                    model_turn = 0;
+                    if should_checkpoint(&agent, operations, &config) {
+                        return checkpoint(
+                            &ctx,
+                            agent,
+                            generation,
+                            model_turn,
+                            prompt_index,
+                            &config,
+                            last_steering_id.as_deref(),
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+                set_status(
+                    &ctx,
+                    serde_json::json!({"phase":"completed"}),
+                    last_steering_id.as_deref(),
+                );
                 return Ok(response);
             }
         }
@@ -161,7 +234,11 @@ fn apply_streamed_turn(
     };
     let mut assembler = StreamedTurnAssembler::new(executable, allowed);
     let mut usage = None;
+    let mut final_response = None;
     for wire_item in &transcript.items {
+        if let crate::streaming::StreamItem::Final { response } = wire_item {
+            final_response = Some(response.clone());
+        }
         let item = wire_item.as_rig();
         for event in assembler.ingest(&item).map_err(|error| error.to_string())? {
             match event {
@@ -191,10 +268,24 @@ fn apply_streamed_turn(
     if let Some(error) = assembler.pending_delta_error() {
         return Err(error.to_string());
     }
+    let final_response = final_response.ok_or("stream transcript ended before Final")?;
+    let message_id = transcript
+        .message_id
+        .clone()
+        .or_else(|| final_response.message_id.clone());
     agent
-        .record_streamed_completion_call(usage.unwrap_or_default())
+        .record_streamed_completion_call(
+            final_response.usage,
+            ResponseIdentity {
+                message_id: message_id.clone(),
+                response_id: final_response.response_id.clone(),
+                provider_request_id: final_response.provider_request_id.clone(),
+            },
+            final_response.finish_reason,
+            final_response.raw,
+        )
         .map_err(|error| error.to_string())?;
-    let turn = assembler.finish(transcript.message_id, &transcript.final_choice);
+    let turn = assembler.finish(message_id, &transcript.final_choice);
     agent.streamed_turn(turn).map_err(|error| error.to_string())
 }
 
@@ -210,20 +301,49 @@ fn should_checkpoint(agent: &AgentRun, operations: u32, config: &DurableAgentCon
     !matches!(agent.clone().next_step(), Ok(AgentRunStep::Done(_)))
 }
 
+async fn take_steering(
+    ctx: &OrchestrationContext,
+) -> Option<(rig::completion::Message, Option<String>)> {
+    loop {
+        match ctx
+            .select2(
+                ctx.dequeue_event(STEERING_QUEUE_NAME),
+                ctx.schedule_timer(Duration::ZERO),
+            )
+            .await
+        {
+            Either2::First(message) => {
+                if let Ok(command) = serde_json::from_str::<SteeringCommand>(&message) {
+                    return Some((command.message, Some(command.command_id)));
+                }
+                match serde_json::from_str(&message) {
+                    Ok(message) => return Some((message, None)),
+                    Err(_) => continue,
+                }
+            }
+            Either2::Second(()) => return None,
+        }
+    }
+}
+
 async fn checkpoint(
     ctx: &OrchestrationContext,
     agent: AgentRun,
     generation: u32,
     model_turn: usize,
+    prompt_index: u64,
     config: &DurableAgentConfig,
+    last_steering_id: Option<&str>,
 ) -> Result<PromptResponse, String> {
     let generation = generation
         .checked_add(1)
         .ok_or("checkpoint generation overflow")?;
-    ctx.set_custom_status(
-        serde_json::json!({"phase":"checkpoint","generation":generation}).to_string(),
+    set_status(
+        ctx,
+        serde_json::json!({"phase":"checkpoint","generation":generation}),
+        last_steering_id,
     );
-    let input = AgentInput::resume(agent, generation, 0, model_turn);
+    let input = AgentInput::resume(agent, generation, 0, model_turn, prompt_index);
     let payload = serde_json::to_string(&input).map_err(|error| error.to_string())?;
     let raw = match &config.checkpoint.target_version {
         Some(version) => ctx.continue_as_new_versioned(version, payload).await?,
@@ -234,8 +354,9 @@ async fn checkpoint(
 
 async fn resolve_approval(
     ctx: &OrchestrationContext,
-    mut pending: PendingToolCall,
+    pending: PendingToolCall,
     config: &DurableAgentConfig,
+    prompt_index: u64,
     turn: usize,
     call_index: usize,
 ) -> Result<PendingToolCall, String> {
@@ -257,17 +378,16 @@ async fn resolve_approval(
         ));
     }
 
-    let arguments = call.function.arguments.clone();
-    let argument_bytes = serde_json::to_vec(&arguments).map_err(|error| error.to_string())?;
-    let digest = Sha256::digest(argument_bytes);
-    let request = ApprovalRequest {
-        approval_id: format!("turn-{turn}-call-{call_index}-{}-{:x}", call.id, digest),
-        tool_name: call.function.name.clone(),
-        arguments,
-        tool_call_id: call.id.clone(),
-        call_id: call.call_id.clone(),
-    };
-    let status = serde_json::json!({"phase":"approval","request":request}).to_string();
+    let request = driver::approval_request(call, prompt_index, turn, call_index)?;
+    let mut status = serde_json::json!({"phase":"approval","request":request});
+    if let Some(last_steering_id) = ctx
+        .get_custom_status()
+        .as_deref()
+        .and_then(last_steering_id_from_status)
+    {
+        status["last_steering_id"] = last_steering_id.into();
+    }
+    let status = status.to_string();
     if status.len() > 256 * 1024 {
         return Err("approval request exceeds Duroxide's custom status limit".into());
     }
@@ -283,24 +403,28 @@ async fn resolve_approval(
         }
         return match decision {
             ApprovalDecision::Approve { .. } => Ok(pending),
-            ApprovalDecision::Deny { reason, .. } => {
-                let call = pending.tool_call;
-                let content = OneOrMany::one(ToolResultContent::text(format!(
-                    "Tool execution denied by human approval{}",
-                    reason.map(|value| format!(": {value}")).unwrap_or_default()
-                )));
-                let result = match call.call_id.clone() {
-                    Some(call_id) => {
-                        UserContent::tool_result_with_call_id(call.id.clone(), call_id, content)
-                    }
-                    None => UserContent::tool_result(call.id.clone(), content),
-                };
-                pending.tool_call = call;
-                pending.preresolved_result = Some(result);
-                Ok(pending)
-            }
+            ApprovalDecision::Deny { reason, .. } => Ok(driver::deny_tool(pending, reason)),
         };
     }
+}
+
+fn set_status(
+    ctx: &OrchestrationContext,
+    mut status: serde_json::Value,
+    last_steering_id: Option<&str>,
+) {
+    if let Some(last_steering_id) = last_steering_id {
+        status["last_steering_id"] = last_steering_id.into();
+    }
+    ctx.set_custom_status(status.to_string());
+}
+
+fn last_steering_id_from_status(status: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(status)
+        .ok()?
+        .get("last_steering_id")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 async fn execute_tool_call(
@@ -308,6 +432,9 @@ async fn execute_tool_call(
     pending: PendingToolCall,
     config: &DurableAgentConfig,
     names: &RuntimeNames,
+    prompt_index: u64,
+    turn: usize,
+    call_index: usize,
 ) -> Result<UserContent, String> {
     if let Some(result) = pending.preresolved_result {
         return Ok(result);
@@ -324,6 +451,12 @@ async fn execute_tool_call(
             let payload = serde_json::to_string(&ToolActivityInput {
                 name: call.function.name.clone(),
                 arguments,
+                invocation: ToolInvocation {
+                    execution_id: format!("{}:{}", ctx.instance_id(), ctx.execution_id()),
+                    prompt_index,
+                    turn,
+                    call_index,
+                },
             })
             .map_err(|e| e.to_string())?;
             let raw = schedule_with_retry(
@@ -350,7 +483,7 @@ async fn execute_tool_call(
             let content = serde_json::from_str(&raw)
                 .map(ToolResultContent::json)
                 .unwrap_or_else(|_| ToolResultContent::text(raw));
-            OneOrMany::one(content)
+            vec![content]
         }
         ToolRoute::SubOrchestration {
             orchestration_name,
@@ -384,7 +517,7 @@ async fn execute_tool_call(
             let content = serde_json::from_str(&raw)
                 .map(ToolResultContent::json)
                 .unwrap_or_else(|_| ToolResultContent::text(raw));
-            OneOrMany::one(content)
+            vec![content]
         }
         ToolRoute::DurableAgent {
             orchestration_name,
@@ -412,14 +545,11 @@ async fn execute_tool_call(
                 .await?;
             let response: PromptResponse =
                 serde_json::from_str(&raw).map_err(|error| error.to_string())?;
-            OneOrMany::one(ToolResultContent::text(response.output))
+            vec![ToolResultContent::text(response.output)]
         }
     };
 
-    Ok(match call.call_id {
-        Some(call_id) => UserContent::tool_result_with_call_id(call.id, call_id, content),
-        None => UserContent::tool_result(call.id, content),
-    })
+    Ok(driver::tool_result(&call, content))
 }
 
 async fn schedule_with_retry(

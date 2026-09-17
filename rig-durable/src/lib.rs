@@ -4,36 +4,59 @@
 //! persisted: deploy catalog and orchestration changes under a new orchestration
 //! version, and keep old versions registered while instances can replay.
 
+#[cfg(any(feature = "duroxide", feature = "temporal"))]
 pub mod activities;
+#[cfg(any(feature = "duroxide", feature = "temporal"))]
 pub mod activity_types;
 pub mod approval;
+#[cfg(feature = "duroxide")]
 pub mod config;
+#[cfg(any(feature = "duroxide", feature = "temporal"))]
+mod driver;
+#[cfg(feature = "duroxide")]
 mod facade;
+#[cfg(feature = "duroxide")]
 pub mod names;
+#[cfg(feature = "duroxide")]
 pub mod orchestration;
+#[cfg(feature = "duroxide")]
 pub mod registry;
+#[cfg(feature = "duroxide")]
 pub mod streaming;
+#[cfg(feature = "temporal")]
+pub mod temporal;
+#[cfg(feature = "duroxide")]
 pub mod tools;
+#[cfg(feature = "duroxide")]
 pub mod types;
 
-pub use activity_types::{StreamingCompletionOutput, ToolActivityInput, ToolActivityOutput};
+#[cfg(feature = "duroxide")]
+pub use activity_types::StreamingCompletionOutput;
+#[cfg(any(feature = "duroxide", feature = "temporal"))]
+pub use activity_types::{ToolActivityInput, ToolActivityOutput, ToolInvocation};
 pub use approval::{ApprovalDecision, ApprovalRequest};
+#[cfg(feature = "duroxide")]
 pub use config::{
     ApprovalConfig, CheckpointConfig, CheckpointPolicy, CompletionMode, CompletionSettings,
     DEFAULT_APPROVAL_QUEUE, DurableAgentConfig,
 };
+#[cfg(feature = "duroxide")]
 pub use facade::{
     AgentDefinition, AgentOrchestrator, AgentOrchestratorBuilder, AgentOrchestratorError,
     DurableAgent, DurableAgentBuilder, DurableRun, ToolOptions,
 };
+#[cfg(feature = "duroxide")]
 pub use registry::{activity_registry, orchestration_registry};
+#[cfg(feature = "duroxide")]
 pub use streaming::{StreamItem, StreamTranscript};
+#[cfg(feature = "duroxide")]
 pub use tools::{
     ToolCatalog, ToolEntry, ToolRoute, activity_tool, catalog_from_toolset, sub_orchestration_tool,
 };
+#[cfg(feature = "duroxide")]
 pub use types::AgentInput;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "duroxide"))]
 mod tests {
     use std::{
         convert::Infallible,
@@ -295,7 +318,7 @@ mod tests {
             .await
             .unwrap();
         let digest = Sha256::digest(serde_json::to_vec(&arguments).unwrap());
-        let approval_id = format!("turn-1-call-0-call-early-{digest:x}");
+        let approval_id = format!("prompt-0-turn-1-call-0-call-early-{digest:x}");
         client
             .enqueue_event_typed(
                 "early",

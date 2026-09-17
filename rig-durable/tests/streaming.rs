@@ -1,12 +1,15 @@
+#![cfg(feature = "duroxide")]
+
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use duroxide::{Client, RetryPolicy, providers::sqlite::SqliteProvider, runtime};
 use rig::{
     agent::PromptResponse,
-    test_utils::{MockAddTool, MockCompletionModel, MockStreamEvent},
+    completion::Usage,
+    test_utils::{MockAddTool, MockCompletionModel, MockStreamEvent, mock_final},
     tool::ToolSet,
 };
-use rig_duroxide::{
+use rig_durable::{
     AgentInput, CheckpointConfig, CheckpointPolicy, CompletionMode, DurableAgentConfig, StreamItem,
     activity_registry, catalog_from_toolset, names::ORCHESTRATION, orchestration_registry,
 };
@@ -65,6 +68,33 @@ async fn text_deltas_produce_output_and_usage() {
 }
 
 #[tokio::test]
+async fn explicit_message_id_takes_precedence_over_the_terminal_id() {
+    let model = MockCompletionModel::from_stream_turns([[
+        MockStreamEvent::message_id("message-event"),
+        MockStreamEvent::text("done"),
+        MockStreamEvent::FinalResponse(
+            mock_final(Usage::new()).with_message_id("terminal-message"),
+        ),
+    ]]);
+    let response = run(
+        model,
+        ToolSet::default(),
+        RetryPolicy::new(1),
+        "stream-message-id",
+    )
+    .await
+    .0
+    .unwrap();
+    assert_eq!(
+        response.completion_calls[0].message_id.as_deref(),
+        Some("message-event")
+    );
+    let messages = serde_json::to_string(&response.messages).unwrap();
+    assert!(messages.contains("message-event"));
+    assert!(!messages.contains("terminal-message"));
+}
+
+#[tokio::test]
 async fn complete_tool_call_executes_and_stream_continues() {
     let model = MockCompletionModel::from_stream_turns([
         vec![
@@ -98,8 +128,8 @@ async fn complete_tool_call_executes_and_stream_continues() {
 async fn tool_call_deltas_assemble_and_missing_name_fails() {
     let valid = MockCompletionModel::from_stream_turns([
         vec![
-            MockStreamEvent::tool_call_name_delta("id", "internal", "add"),
-            MockStreamEvent::tool_call_arguments_delta("id", "internal", r#"{"x":4,"y":5}"#),
+            MockStreamEvent::tool_call_name_delta("id", "add"),
+            MockStreamEvent::tool_call_arguments_delta("id", r#"{"x":4,"y":5}"#),
             MockStreamEvent::tool_call("id", "add", serde_json::json!({"x": 4, "y": 5})),
             MockStreamEvent::final_response_with_default_usage(),
         ],
@@ -123,7 +153,7 @@ async fn tool_call_deltas_assemble_and_missing_name_fails() {
     );
 
     let invalid = MockCompletionModel::from_stream_turns([[
-        MockStreamEvent::tool_call_arguments_delta("id", "internal", "{}"),
+        MockStreamEvent::tool_call_arguments_delta("id", "{}"),
         MockStreamEvent::final_response_with_default_usage(),
     ]]);
     let error = run(
@@ -141,9 +171,10 @@ async fn tool_call_deltas_assemble_and_missing_name_fails() {
 #[tokio::test]
 async fn unknown_and_reasoning_are_durable_but_unknown_is_not_history() {
     let model = MockCompletionModel::from_stream_turns([[
-        MockStreamEvent::reasoning_delta(Some("r"), "think"),
+        MockStreamEvent::reasoning_delta_with_id("r", "think"),
         MockStreamEvent::unknown(serde_json::json!({"native": true})),
         MockStreamEvent::text("ok"),
+        MockStreamEvent::final_response_with_default_usage(),
     ]]);
     let response = run(
         model,
@@ -158,6 +189,31 @@ async fn unknown_and_reasoning_are_durable_but_unknown_is_not_history() {
     assert!(history.contains("think"));
     assert!(!history.contains("native"));
     assert_eq!(response.usage.total_tokens, 0);
+}
+
+#[tokio::test]
+async fn truncated_streams_retry_without_committing_content_or_tools() {
+    let model = MockCompletionModel::from_stream_turns([
+        vec![MockStreamEvent::tool_call(
+            "id",
+            "add",
+            serde_json::json!({"x": 4, "y": 5}),
+        )],
+        vec![
+            MockStreamEvent::text("recovered"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+    ]);
+    let (response, requests) = run(
+        model,
+        ToolSet::from_tools(vec![MockAddTool]),
+        RetryPolicy::new(2),
+        "stream-truncated",
+    )
+    .await;
+
+    assert_eq!(response.unwrap().output, "recovered");
+    assert_eq!(requests, 2);
 }
 
 #[tokio::test]
@@ -179,11 +235,10 @@ async fn provider_errors_retry_and_unknown_tools_fail_closed() {
     assert_eq!(response.unwrap().output, "recovered");
     assert_eq!(requests, 2);
 
-    let unknown = MockCompletionModel::from_stream_turns([[MockStreamEvent::tool_call(
-        "id",
-        "not_registered",
-        serde_json::json!({}),
-    )]]);
+    let unknown = MockCompletionModel::from_stream_turns([[
+        MockStreamEvent::tool_call("id", "not_registered", serde_json::json!({})),
+        MockStreamEvent::final_response_with_default_usage(),
+    ]]);
     let error = run(
         unknown,
         ToolSet::default(),

@@ -6,32 +6,39 @@ license.workspace = true
 
 [[example]]
 name = "durable_agent"
-required-features = []
+required-features = ["duroxide", "sqlite"]
 
 [[example]]
 name = "human_approval"
-required-features = []
+required-features = ["duroxide", "sqlite"]
 
 [[example]]
 name = "sub_orchestration_tool"
-required-features = []
+required-features = ["duroxide", "sqlite"]
 
 [[example]]
 name = "checkpointed_agent"
-required-features = []
+required-features = ["duroxide", "sqlite"]
 
 [[example]]
 name = "streaming_agent"
-required-features = []
+required-features = ["duroxide", "sqlite"]
+
+[[example]]
+name = "temporal_retrying_tool"
+required-features = ["temporal"]
 
 [dependencies]
-duroxide.workspace = true
+duroxide = { workspace = true, optional = true }
 futures = "0.3"
 rig.workspace = true
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+temporalio-common = { workspace = true, optional = true }
+temporalio-sdk = { workspace = true, optional = true }
+temporalio-workflow = { workspace = true, optional = true }
 thiserror = "2"
 tokio = { version = "1", features = ["time"] }
 uuid = { version = "1", features = ["v4"] }
@@ -39,8 +46,15 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 duroxide = { workspace = true, features = ["sqlite"] }
 rig = { workspace = true, features = ["test-utils"] }
+temporalio-client.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 
 [features]
-default = ["sqlite"]
-sqlite = ["duroxide/sqlite"]
+default = ["duroxide", "sqlite"]
+duroxide = ["dep:duroxide"]
+sqlite = ["duroxide", "duroxide/sqlite"]
+temporal = [
+  "dep:temporalio-common",
+  "dep:temporalio-sdk",
+  "dep:temporalio-workflow",
+]

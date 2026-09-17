@@ -1,16 +1,12 @@
 use rig::test_utils::{MockAddTool, MockCompletionModel, MockStreamEvent};
-use rig_duroxide::{AgentOrchestrator, CompletionMode, DurableAgent};
+use rig_durable::{AgentOrchestrator, CompletionMode, DurableAgent};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = MockCompletionModel::from_stream_turns([
         vec![
-            MockStreamEvent::tool_call_name_delta("call-1", "internal-1", "add"),
-            MockStreamEvent::tool_call_arguments_delta(
-                "call-1",
-                "internal-1",
-                r#"{"x":20,"y":22}"#,
-            ),
+            MockStreamEvent::tool_call_name_delta("call-1", "add"),
+            MockStreamEvent::tool_call_arguments_delta("call-1", r#"{"x":20,"y":22}"#),
             MockStreamEvent::tool_call("call-1", "add", serde_json::json!({"x": 20, "y": 22})),
             MockStreamEvent::final_response_with_default_usage(),
         ],

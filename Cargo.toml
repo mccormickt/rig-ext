@@ -11,4 +11,8 @@ license = "MIT"
 
 [workspace.dependencies]
 duroxide = "0.1.30"
-rig = "=0.41.0"
+rig = "=0.42.0"
+temporalio-client = "1.0.0"
+temporalio-common = "1.0.0"
+temporalio-sdk = "1.0.0"
+temporalio-workflow = "1.0.0"

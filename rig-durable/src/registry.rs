@@ -26,19 +26,20 @@ pub(crate) fn activity_registry_with_names<M>(
 where
     M: CompletionModel + Send + Sync + 'static,
 {
-    let completion_model = model.clone();
+    let model = Arc::new(model);
+    let completion_model = Arc::clone(&model);
     let tools = Arc::new(tools);
     let completion_activity = names.completion_activity.clone();
     let streaming_completion_activity = names.streaming_completion_activity.clone();
     let tool_activity = names.tool_activity.clone();
     ActivityRegistry::builder()
         .register_typed(completion_activity, move |_ctx, request| {
-            let model = completion_model.clone();
-            async move { activities::completion::complete(&model, request).await }
+            let model = Arc::clone(&completion_model);
+            async move { activities::completion::complete(model.as_ref(), request).await }
         })
         .register_typed(streaming_completion_activity, move |_ctx, request| {
-            let model = model.clone();
-            async move { activities::completion::stream(&model, request).await }
+            let model = Arc::clone(&model);
+            async move { activities::completion::stream(model.as_ref(), request).await }
         })
         .register_typed(tool_activity, move |_ctx, input: ToolActivityInput| {
             let tools = Arc::clone(&tools);

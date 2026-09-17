@@ -22,6 +22,8 @@ enum ContinuationEnvelope {
         generation: u32,
         operations: u32,
         last_model_turn: usize,
+        #[serde(default)]
+        prompt_index: u64,
         agent_run: AgentRun,
     },
 }
@@ -39,12 +41,13 @@ impl AgentInput {
         self.continuation.is_some()
     }
 
-    pub(crate) fn into_run(self, max_turns: usize) -> Result<(AgentRun, u32, usize), String> {
+    pub(crate) fn into_run(self, max_turns: usize) -> Result<(AgentRun, u32, usize, u64), String> {
         match self.continuation {
             None => Ok((
                 AgentRun::new(self.prompt)
                     .with_history(self.history)
                     .max_turns(max_turns),
+                0,
                 0,
                 0,
             )),
@@ -53,9 +56,10 @@ impl AgentInput {
                 generation,
                 operations: _,
                 last_model_turn,
+                prompt_index,
                 agent_run,
             }) if format_version == CONTINUATION_FORMAT_VERSION => {
-                Ok((agent_run, generation, last_model_turn))
+                Ok((agent_run, generation, last_model_turn, prompt_index))
             }
             Some(_) => Err("unsupported agent continuation format version".into()),
         }
@@ -66,6 +70,7 @@ impl AgentInput {
         generation: u32,
         operations: u32,
         last_model_turn: usize,
+        prompt_index: u64,
     ) -> Self {
         Self {
             // Start-only fields are retained for a stable, human-readable wire shape.
@@ -76,6 +81,7 @@ impl AgentInput {
                 generation,
                 operations,
                 last_model_turn,
+                prompt_index,
                 agent_run,
             }),
         }

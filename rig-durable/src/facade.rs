@@ -25,6 +25,7 @@ use crate::{
     AgentInput, ApprovalDecision, ApprovalRequest, CheckpointConfig, CompletionMode,
     CompletionSettings, DurableAgentConfig,
     names::RuntimeNames,
+    orchestration::{STEERING_QUEUE_NAME, SteeringCommand},
     registry::{activity_registry_with_names, orchestration_registry_with_names},
     tools::{ToolCatalog, ToolEntry, durable_agent_tool},
 };
@@ -65,6 +66,8 @@ pub enum AgentOrchestratorError {
     ApprovalNotRequested(String),
     #[error("agent run `{0}` does not exist")]
     RunNotFound(String),
+    #[error("agent run `{0}` completed before accepting steering")]
+    SteeringNotAccepted(String),
     #[cfg(feature = "sqlite")]
     #[error("failed to open SQLite provider: {0}")]
     Sqlite(String),
@@ -686,6 +689,45 @@ impl DurableRun {
         .await
     }
 
+    /// Queue a message as the next agent turn after the active turn finishes.
+    pub async fn steer(&self, message: impl Into<Message>) -> Result<(), AgentOrchestratorError> {
+        let command_id = uuid::Uuid::new_v4().to_string();
+        self.client
+            .enqueue_event_typed(
+                &self.instance_id,
+                STEERING_QUEUE_NAME,
+                &SteeringCommand {
+                    command_id: command_id.clone(),
+                    message: message.into(),
+                },
+            )
+            .await?;
+        let deadline = tokio::time::Instant::now() + DEFAULT_WAIT_TIMEOUT;
+        loop {
+            let status = self
+                .client
+                .get_orchestration_status(&self.instance_id)
+                .await?;
+            if orchestration_status_value_is(&status, "last_steering_id", &command_id) {
+                return Ok(());
+            }
+            match status {
+                OrchestrationStatus::Completed { .. } | OrchestrationStatus::Failed { .. } => {
+                    return Err(AgentOrchestratorError::SteeringNotAccepted(
+                        self.run_id.clone(),
+                    ));
+                }
+                OrchestrationStatus::NotFound | OrchestrationStatus::Running { .. } => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AgentOrchestratorError::SteeringNotAccepted(
+                    self.run_id.clone(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     async fn send_decision(
         &self,
         decision: ApprovalDecision,
@@ -709,4 +751,25 @@ impl DurableRun {
             .get_orchestration_status(&self.instance_id)
             .await?)
     }
+}
+
+fn orchestration_status_value_is(status: &OrchestrationStatus, key: &str, expected: &str) -> bool {
+    let custom_status = match status {
+        OrchestrationStatus::Running { custom_status, .. }
+        | OrchestrationStatus::Completed { custom_status, .. }
+        | OrchestrationStatus::Failed { custom_status, .. } => custom_status.as_deref(),
+        OrchestrationStatus::NotFound => None,
+    };
+    let Some(custom_status) = custom_status else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(custom_status)
+        .ok()
+        .and_then(|status| {
+            status
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|value| value == expected)
 }

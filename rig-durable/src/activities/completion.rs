@@ -1,13 +1,16 @@
 use std::collections::BTreeSet;
 
+#[cfg(feature = "duroxide")]
 use futures::StreamExt;
+#[cfg(feature = "duroxide")]
+use rig::streaming::StreamedAssistantContent;
 use rig::{
     agent::ModelTurn,
-    completion::{CompletionModel, CompletionRequest, GetTokenUsage},
+    completion::{CompletionModel, CompletionRequest},
     message::ToolChoice,
-    streaming::StreamedAssistantContent,
 };
 
+#[cfg(feature = "duroxide")]
 use crate::streaming::{StreamItem, StreamTranscript};
 
 /// Execute a provider request and retain the exact tool authorization sets
@@ -30,17 +33,23 @@ pub async fn complete<M: CompletionModel>(
         .completion(request)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(ModelTurn::new(
+    let finish_reason = response.finish_reason();
+    let turn = ModelTurn::new(
         response.message_id,
         response.choice,
         response.usage,
         executable,
         allowed,
-    ))
+    )
+    .with_identity(response.response_id, response.provider_request_id)
+    .with_finish_reason(finish_reason)
+    .with_raw(response.raw);
+    Ok(turn)
 }
 
 /// Consume the provider stream to EOF inside one activity. The transcript is
 /// not visible to orchestration until this activity completes.
+#[cfg(feature = "duroxide")]
 pub async fn stream<M: CompletionModel>(
     model: &M,
     request: CompletionRequest,
@@ -66,30 +75,39 @@ pub async fn stream<M: CompletionModel>(
                 internal_call_id,
             },
             StreamedAssistantContent::ToolCallDelta {
-                id,
                 internal_call_id,
                 content,
             } => StreamItem::ToolCallDelta {
-                id,
                 internal_call_id,
                 content,
             },
-            StreamedAssistantContent::Reasoning(reasoning) => StreamItem::Reasoning { reasoning },
-            StreamedAssistantContent::ReasoningDelta { id, reasoning } => {
-                StreamItem::ReasoningDelta { id, reasoning }
+            StreamedAssistantContent::Reasoning { reasoning, id } => {
+                StreamItem::Reasoning { reasoning, id }
             }
+            StreamedAssistantContent::ReasoningDelta {
+                id,
+                provider_id,
+                reasoning,
+            } => StreamItem::ReasoningDelta {
+                id,
+                provider_id,
+                reasoning,
+            },
             StreamedAssistantContent::Final(response) => {
                 if saw_final {
                     return Err("provider emitted multiple Final events".into());
                 }
                 saw_final = true;
-                StreamItem::FinalUsage {
-                    usage: response.token_usage(),
-                }
+                StreamItem::Final { response }
             }
-            StreamedAssistantContent::Unknown(value) => StreamItem::Unknown { value },
+            StreamedAssistantContent::Unknown(value) => StreamItem::Unknown {
+                value: value.value().clone(),
+            },
         };
         items.push(normalized);
+    }
+    if !saw_final {
+        return Err("provider stream ended before Final".into());
     }
     Ok(StreamTranscript {
         items,

@@ -1,3 +1,5 @@
+#![cfg(feature = "duroxide")]
+
 use std::{
     convert::Infallible,
     num::NonZeroU32,
@@ -13,7 +15,7 @@ use rig::{
     test_utils::{MockAddTool, MockCompletionModel, MockStreamEvent, MockTurn},
     tool::{Tool, ToolContext},
 };
-use rig_duroxide::{
+use rig_durable::{
     AgentOrchestrator, AgentOrchestratorError, CheckpointConfig, CheckpointPolicy, CompletionMode,
     DurableAgent, ToolOptions,
 };
@@ -135,6 +137,114 @@ async fn approval_is_managed_through_the_run_handle() {
     assert_eq!(replayed_request.approval_id, request.approval_id);
     run.approve(&replayed_request).await.unwrap();
     assert_eq!(run.wait().await.unwrap().output, "approved");
+    orchestrator.shutdown(None).await;
+}
+
+#[tokio::test]
+async fn steering_runs_as_a_follow_up_turn_before_completion() {
+    let definition = DurableAgent::builder(
+        "steerable",
+        MockCompletionModel::new([
+            MockTurn::text("initial answer"),
+            MockTurn::text("steered answer"),
+        ]),
+    )
+    .build()
+    .unwrap();
+    let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+    let orchestrator = AgentOrchestrator::builder(store)
+        .register(definition)
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let run = orchestrator
+        .agent("steerable")
+        .unwrap()
+        .start_with_id("steered-run", "initial prompt")
+        .await
+        .unwrap();
+
+    run.steer("change direction").await.unwrap();
+    let response = run.wait().await.unwrap();
+
+    assert_eq!(response.output, "steered answer");
+    assert_eq!(response.messages.unwrap().len(), 2);
+    orchestrator.shutdown(None).await;
+}
+
+#[tokio::test]
+async fn checkpoint_policy_applies_before_a_steered_turn() {
+    let definition = DurableAgent::builder(
+        "checkpointed-steering",
+        MockCompletionModel::new([
+            MockTurn::text("initial answer"),
+            MockTurn::text("steered answer"),
+        ]),
+    )
+    .checkpoint(CheckpointConfig {
+        policy: CheckpointPolicy::Every(NonZeroU32::new(1).unwrap()),
+        target_version: None,
+    })
+    .build()
+    .unwrap();
+    let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+    let orchestrator = AgentOrchestrator::builder(store)
+        .register(definition)
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let run = orchestrator
+        .agent("checkpointed-steering")
+        .unwrap()
+        .start_with_id("checkpointed-steering-run", "initial prompt")
+        .await
+        .unwrap();
+
+    run.steer("change direction").await.unwrap();
+    let response = run.wait().await.unwrap();
+
+    assert_eq!(response.output, "steered answer");
+    assert_eq!(response.messages.unwrap().len(), 2);
+    assert_eq!(
+        orchestrator
+            .client()
+            .list_executions(run.instance_id())
+            .await
+            .unwrap(),
+        [1, 2]
+    );
+    orchestrator.shutdown(None).await;
+}
+
+#[tokio::test]
+async fn steering_rejects_a_completed_run() {
+    let definition = DurableAgent::builder(
+        "completed-steering",
+        MockCompletionModel::new([MockTurn::text("done")]),
+    )
+    .build()
+    .unwrap();
+    let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+    let orchestrator = AgentOrchestrator::builder(store)
+        .register(definition)
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let run = orchestrator
+        .agent("completed-steering")
+        .unwrap()
+        .start("initial prompt")
+        .await
+        .unwrap();
+    assert_eq!(run.wait().await.unwrap().output, "done");
+
+    assert!(matches!(
+        run.steer("too late").await,
+        Err(AgentOrchestratorError::SteeringNotAccepted(_))
+    ));
     orchestrator.shutdown(None).await;
 }
 

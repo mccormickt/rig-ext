@@ -1,3 +1,5 @@
+#![cfg(feature = "duroxide")]
+
 use std::{future::Future, sync::Arc, time::Duration};
 
 use duroxide::{
@@ -11,7 +13,7 @@ use rig::{
     test_utils::{MockCompletionModel, MockTurn},
     tool::ToolSet,
 };
-use rig_duroxide::{
+use rig_durable::{
     AgentInput, DurableAgentConfig, ToolCatalog, activity_registry, orchestration_registry,
     sub_orchestration_tool,
 };
@@ -26,7 +28,7 @@ fn definition() -> ToolDefinition {
 
 async fn run_child_tool<F, Fut>(
     child: F,
-    entry: rig_duroxide::ToolEntry,
+    entry: rig_durable::ToolEntry,
 ) -> (Result<PromptResponse, String>, MockCompletionModel)
 where
     F: Fn(OrchestrationContext, String) -> Fut + Send + Sync + 'static,
@@ -57,7 +59,7 @@ where
     client
         .start_orchestration_typed(
             "parent",
-            rig_duroxide::names::ORCHESTRATION,
+            rig_durable::names::ORCHESTRATION,
             AgentInput::new("run"),
         )
         .await

@@ -1,3 +1,5 @@
+#![cfg(feature = "duroxide")]
+
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use duroxide::{Client, RetryPolicy, providers::sqlite::SqliteProvider, runtime};
@@ -6,7 +8,7 @@ use rig::{
     test_utils::{MockAddTool, MockCompletionModel, MockTurn},
     tool::ToolSet,
 };
-use rig_duroxide::{
+use rig_durable::{
     AgentInput, CheckpointConfig, CheckpointPolicy, DurableAgentConfig, activity_registry,
     catalog_from_toolset, names::ORCHESTRATION, orchestration_registry,
 };

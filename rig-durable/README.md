@@ -1,6 +1,144 @@
-# rig-duroxide
+# rig-durable
 
-Drive Rig 0.41's serializable `AgentRun` state machine inside a Duroxide 0.1
+`rig-durable` supports two independent durable execution backends:
+
+| Cargo feature | Backend | Default |
+|---|---|---|
+| `duroxide` | Duroxide orchestration and activities | yes |
+| `sqlite` | Duroxide SQLite provider | yes |
+| `temporal` | Temporal workflows and activities | no |
+
+Use only Temporal with `default-features = false, features = ["temporal"]`.
+Use both backends with `features = ["temporal"]`.
+
+## Temporal
+
+The Temporal integration runs Rig's `AgentRun` state machine as a workflow.
+Each model request and each tool call is a Temporal activity. Tool calls from
+one model turn are scheduled concurrently and their results retain model
+emission order. Activity retries and timeouts use Temporal policies. Human
+approval uses the generated `TemporalAgentWorkflow::approval` signal, and
+current state is available from the `TemporalAgentWorkflow::status` query.
+
+For a long-lived agent, start `TemporalAgentSessionWorkflow`. Each `prompt`
+update runs a durable agent turn against workflow-owned conversation history.
+The workflow rejects concurrent prompt updates. A `steer` signal received while
+a turn is active is queued as the next prompt and runs before that update
+returns. A steer signal received while the session is idle starts a new turn.
+Steering does not cancel a model or tool activity that is already in flight.
+Send `close` when the session is no longer needed; the workflow drains messages
+accepted before the close and waits for active handlers before it completes.
+An activity or agent failure closes the session. Completed turns commit history
+before the next queued turn starts, so a later failure does not discard them.
+
+Temporal sessions continue as new at an idle boundary when the service suggests
+it. Conversation history, queued steering, and the next prompt identity are
+carried into the new run. `session_history_max_bytes` limits the serialized
+conversation payload (1 MB by default); prompts that exceed it are rejected and
+a completed turn that crosses it fails the session.
+
+```rust,ignore
+use rig_durable::temporal::{TemporalAgent, TemporalAgentSessionWorkflow};
+use temporalio_client::{
+    WorkflowExecuteUpdateOptions, WorkflowSignalOptions, WorkflowStartOptions,
+};
+
+let input = agent.session_input(Vec::new());
+let handle = client.start_workflow(
+    TemporalAgentSessionWorkflow::run,
+    input,
+    WorkflowStartOptions::new("rig-agents", "calculator-session-1").build(),
+).await?;
+let response = handle.execute_update(
+    TemporalAgentSessionWorkflow::prompt,
+    "What is 20 + 22?".into(),
+    WorkflowExecuteUpdateOptions::default(),
+).await?;
+handle.signal(
+    TemporalAgentSessionWorkflow::close,
+    (),
+    WorkflowSignalOptions::default(),
+).await?;
+```
+
+```rust,ignore
+use rig_durable::temporal::{TemporalAgent, TemporalAgentWorkflow};
+use temporalio_client::{
+    WorkflowGetResultOptions, WorkflowStartOptions,
+};
+use temporalio_sdk::WorkerOptions;
+
+let agent = TemporalAgent::new(model)
+    .preamble("Use the calculator tool for arithmetic.")
+    .tool(Add);
+let input = agent.input("What is 20 + 22?");
+
+let mut worker_options = WorkerOptions::new("rig-agents").build();
+agent.register(&mut worker_options)?;
+
+// Create and run a Temporal Worker with worker_options, then start the agent:
+let handle = client.start_workflow(
+    TemporalAgentWorkflow::run,
+    input,
+    WorkflowStartOptions::new("rig-agents", "calculator-run-1").build(),
+).await?;
+let response = handle
+    .get_result(WorkflowGetResultOptions::default())
+    .await?;
+```
+
+Register one `TemporalAgent` per worker task queue. The model and `ToolSet` stay
+inside the activity worker and are not serialized into workflow history. The
+serializable agent configuration is part of workflow input, so replay sees the
+same preamble, tool schemas, model settings, timeout, and retry limit after a
+deployment. Activities are at-least-once. Rig tools can read
+`ToolInvocation` from `ToolContext` and use its stable execution, turn, and
+call identity as an idempotency key. `prompt_index` distinguishes tool calls
+from separate prompts in one long-lived session while retries retain the same
+complete identity.
+
+`temporal_retrying_tool` demonstrates a tool activity that reports a retryable
+provider failure on its first attempt and succeeds on its second:
+
+```bash
+cargo run -p rig-durable --no-default-features --features temporal \
+  --example temporal_retrying_tool
+```
+
+The ignored live suite covers happy-path model and tool activities, retries,
+stable invocation identity, exhausted retries, approval and denial, long-lived
+history, idle steering, closing, and payload limits. Configure a server with
+the standard Temporal environment variables before running it:
+
+```bash
+TEMPORAL_ADDRESS=temporal.example.com:443 TEMPORAL_TLS=true \
+  cargo test -p rig-durable --no-default-features --features temporal \
+  --test temporal -- --ignored --test-threads=1
+```
+
+An approval tool pauses before any tool activity is scheduled:
+
+```rust,ignore
+let agent = TemporalAgent::new(model).approval_tool(DeleteAccount);
+
+let request = match handle.query(
+    TemporalAgentWorkflow::status,
+    (),
+    Default::default(),
+).await? {
+    TemporalAgentStatus::Approval { request } => request,
+    status => panic!("expected approval, got {status:?}"),
+};
+handle.signal(
+    TemporalAgentWorkflow::approval,
+    ApprovalDecision::Approve { approval_id: request.approval_id },
+    Default::default(),
+).await?;
+```
+
+## Duroxide
+
+Drive Rig 0.42's serializable `AgentRun` state machine inside a Duroxide 0.1
 orchestration. The orchestration performs no provider or tool I/O; all such work
 is registered as activities.
 
@@ -25,6 +163,15 @@ let answer = orchestrator
     .prompt("What is 20 + 22?")
     .await?;
 ```
+
+`start` returns a `DurableRun` handle for approvals, status, cancellation, and
+steering. `run.steer(message)` queues a follow-up turn. As with Temporal, it
+does not cancel model or tool work that is already in flight; the queued turn
+runs before the orchestration completes. The call returns only after the
+orchestration durably acknowledges that exact steering command. It returns
+`SteeringNotAccepted` if the run completes first. The acknowledgement survives
+checkpoints in custom status, and checkpoint policy also applies before a
+steered text-only turn starts.
 
 ```text
 Orchestration (deterministic, zero IO)          Activities (all IO)
@@ -51,14 +198,13 @@ and reconnection; for one scoped ID, the first submitted input wins. The provide
 client, raw registry merge methods, `ToolCatalog`, and route constructors remain
 available for advanced integration with existing Duroxide applications.
 
-Rig 0.41 does not expose enough state to convert an already-built `rig::Agent`.
+Rig 0.42 does not expose enough state to convert an already-built `rig::Agent`.
 The durable builder therefore captures the model and tools before Rig makes
 them private. It currently covers preambles, completion settings, history,
 tools, tool choice, maximum turns, streaming, approvals, checkpoints, and child
-agents. Rig memory, retrieval, hooks, structured output, and custom per-run
-`ToolContext` values are not yet mirrored. Activity-backed Rig tools currently
-receive an empty `ToolContext`; context-dependent tools need an explicit
-activity route.
+agents. Rig memory, retrieval, hooks, structured output, and arbitrary per-run
+`ToolContext` values are not yet mirrored. Activity-backed Rig tools receive a
+durable `ToolInvocation` in their context.
 
 Configuration and retry policies are captured at registration time rather than
 serialized. Tool calls are checked against the exact advertised and
@@ -66,7 +212,8 @@ serialized. Tool calls are checked against the exact advertised and
 definitions, routing, prompts, retry policy, or control flow as orchestration
 version changes. Keep every version needed by live histories registered; replay
 must observe the same configuration and activity names. Activities themselves
-must be idempotent because retries can repeat I/O.
+must be idempotent because retries can repeat I/O. Use `ToolInvocation` as the
+idempotency key for side effects.
 
 Timeouts add durable timer events, and worker tags are part of an activity's
 event identity. Adding or changing either for a live orchestration version will
@@ -79,7 +226,7 @@ with the number of turns.
 `CompletionMode::Streaming` selects a separate stable streaming activity;
 blocking completion remains the compatibility default. The activity consumes
 `CompletionModel::stream` to EOF and returns a provider-neutral, serde-tagged
-transcript. Orchestration deterministically replays it through Rig 0.41's
+transcript. Orchestration deterministically replays it through Rig 0.42's
 `StreamedTurnAssembler` and `AgentRun::streamed_turn`. The transcript preserves
 text, reasoning, complete and delta tool calls, internal and provider IDs,
 unknown items, final usage, message ID, and Rig's final aggregate. Invalid tools
@@ -91,6 +238,31 @@ visible to orchestration only after the model activity completes; this does not
 provide exactly-once live token delivery. Live at-least-once side channels are
 out of scope. See `examples/streaming_agent.rs` for an API-key-free SQLite
 example.
+
+## Architecture
+
+The backend-neutral driver owns Rig policy: completion request construction,
+`AgentRun` transitions, prompt-scoped approval identities and denials, and
+tool-result correlation. Both adapters use the same follow-up-turn steering
+semantics. Backend adapters only schedule activities, wait for durable control
+messages, expose status, and apply backend retry and checkpoint rules.
+
+```text
+Rig model + ToolSet
+        │
+        ▼
+shared durable driver ── AgentRun + pure policy
+        │
+        ├── Duroxide adapter ── orchestration, events, timers, continue-as-new
+        │
+        └── Temporal adapter ── workflow, signals, queries, activity policies
+```
+
+This boundary keeps the public API Rig-first and avoids a generic async runtime
+trait. Hooks that perform durable control belong at this driver boundary. Rig's
+current high-level `AgentRunner` hooks are not replayed because both adapters
+drive `AgentRun` directly. A future Rig effect API can replace this narrow seam
+without changing backend scheduling.
 
 ## Checkpointing
 

@@ -1,5 +1,5 @@
 use rig::test_utils::{MockCompletionModel, MockTurn};
-use rig_duroxide::{AgentOrchestrator, DurableAgent};
+use rig_durable::{AgentOrchestrator, DurableAgent};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
