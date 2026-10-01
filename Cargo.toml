@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+  "rig-a2a",
   "rig-durable",
 ]
 
@@ -16,3 +17,11 @@ temporalio-client = "1.0.0"
 temporalio-common = "1.0.0"
 temporalio-sdk = "1.0.0"
 temporalio-workflow = "1.0.0"
+
+[workspace.lints.clippy]
+dbg_macro = "forbid"
+expect_used = "deny"
+panic = "deny"
+todo = "forbid"
+unimplemented = "forbid"
+unwrap_used = "deny"
