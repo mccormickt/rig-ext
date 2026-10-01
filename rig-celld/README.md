@@ -30,25 +30,23 @@ Construct the index inside that object:
 
 ```rust,ignore
 let sql = self.state.storage().sql();
-let model = openai_client.embedding_model_with_ndims(
-    openai::TEXT_EMBEDDING_3_SMALL,
-    512,
-);
+let model = client.embedding(openai::TEXT_EMBEDDING_3_SMALL, Some(512));
 let index = SqliteVecIndex::new(sql, model)?;
 
 index.upsert_text("turn-42", &memory, &memory_text).await?;
 
-let agent = openai_client
-    .agent(openai::GPT_4O_MINI)
+let agent = AgentBuilder::new(client.completion(openai::GPT_4O_MINI))
     .dynamic_context(5, index)
     .build();
 ```
 
 `SqliteVecIndex::named` selects another SQL table prefix and the JSON field that Rig's generic `InsertDocuments` implementation reads as the document ID.
 
+The index accepts any Rig embedding `Model` or `DynModel<Embedding>` through the `EmbedText` trait. Implement `EmbedText` directly for other embedding backends.
+
 ## Storage contract
 
-- Vectors have a fixed width from `EmbeddingModel::ndims()` and are stored as little-endian `f32` BLOBs.
+- Vectors have a fixed width from `EmbedText::ndims()`, which reads the model's `Capabilities::ndims` for Rig models and are stored as little-endian `f32` BLOBs.
 - The supported width is 1 through 8192 dimensions, matching celld's embedded sqlite-vec 0.1.9.
 - Search uses cosine distance. Rig receives `1 - distance` as its similarity score.
 - Equal scores are sorted by logical document ID in ascending order.

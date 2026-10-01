@@ -2,8 +2,7 @@ use std::{collections::BTreeSet, future::Future, pin::Pin, time::Duration};
 
 use duroxide::{Either2, OrchestrationContext, RetryPolicy};
 use rig::{
-    agent::run::{StreamedTurnAssembler, StreamedTurnEvent},
-    agent::{AgentRun, AgentRunStep, InvalidToolCallAction, PendingToolCall, PromptResponse},
+    agent::{AgentRun, AgentRunStep, PendingToolCall, PromptResponse, run::StreamedTurn},
     completion::{CompletionRequest, ResponseIdentity},
     message::{ToolResultContent, UserContent},
 };
@@ -232,60 +231,44 @@ fn apply_streamed_turn(
             executable.clone()
         }
     };
-    let mut assembler = StreamedTurnAssembler::new(executable, allowed);
-    let mut usage = None;
-    let mut final_response = None;
-    for wire_item in &transcript.items {
-        if let crate::streaming::StreamItem::Final { response } = wire_item {
-            final_response = Some(response.clone());
-        }
-        let item = wire_item.as_rig();
-        for event in assembler.ingest(&item).map_err(|error| error.to_string())? {
-            match event {
-                StreamedTurnEvent::EmitIngested | StreamedTurnEvent::EmitToolCallDelta { .. } => {}
-                StreamedTurnEvent::Completed {
-                    usage: event_usage, ..
-                } => {
-                    if usage.replace(event_usage).is_some() {
-                        return Err("stream transcript contains multiple FinalUsage events".into());
-                    }
-                }
-                StreamedTurnEvent::InvalidToolCall(invalid) => {
-                    let partial = assembler.partial_turn(transcript.message_id.clone());
-                    let _context = agent.streamed_invalid_tool_call_context(&partial, &invalid);
-                    let resolution = agent
-                        .resolve_streamed_invalid_tool_call(
-                            &partial,
-                            &invalid,
-                            InvalidToolCallAction::fail(),
-                        )
-                        .map_err(|error| error.to_string())?;
-                    assembler.resolve_pending_invalid(&resolution);
-                }
+    // A provider may emit tool calls this run cannot execute: a name that is
+    // not registered, or one `tool_choice` does not authorize. Fail the run
+    // rather than silently dropping the call.
+    for content in &transcript.response.choice {
+        if let rig::completion::AssistantContent::ToolCall(call) = content {
+            let name = call.function.name.as_str();
+            if !executable.contains(name) {
+                return Err(format!(
+                    "provider streamed a call to tool `{name}`, which is not registered"
+                ));
+            }
+            if !allowed.contains(name) {
+                return Err(format!(
+                    "provider streamed a call to tool `{name}`, which `tool_choice` does not authorize"
+                ));
             }
         }
     }
-    if let Some(error) = assembler.pending_delta_error() {
-        return Err(error.to_string());
-    }
-    let final_response = final_response.ok_or("stream transcript ended before Final")?;
-    let message_id = transcript
-        .message_id
-        .clone()
-        .or_else(|| final_response.message_id.clone());
+    let response = &transcript.response;
     agent
         .record_streamed_completion_call(
-            final_response.usage,
+            response.usage,
             ResponseIdentity {
-                message_id: message_id.clone(),
-                response_id: final_response.response_id.clone(),
-                provider_request_id: final_response.provider_request_id.clone(),
+                message_id: response.message_id.clone(),
+                response_id: response.response_id.clone(),
+                provider_request_id: response.provider_request_id.clone(),
             },
-            final_response.finish_reason,
-            final_response.raw,
+            response.finish_reason(),
+            response.raw.clone(),
         )
         .map_err(|error| error.to_string())?;
-    let turn = assembler.finish(message_id, &transcript.final_choice);
+    let turn = StreamedTurn {
+        message_id: response.message_id.clone(),
+        choice: response.choice.clone(),
+        executable_tool_names: executable,
+        allowed_tool_names: allowed,
+        finish_reason: response.finish_reason(),
+    };
     agent.streamed_turn(turn).map_err(|error| error.to_string())
 }
 
@@ -449,7 +432,7 @@ async fn execute_tool_call(
     let content = match &entry.route {
         ToolRoute::RigTool => {
             let payload = serde_json::to_string(&ToolActivityInput {
-                name: call.function.name.clone(),
+                name: call.function.name.to_string(),
                 arguments,
                 invocation: ToolInvocation {
                     execution_id: format!("{}:{}", ctx.instance_id(), ctx.execution_id()),

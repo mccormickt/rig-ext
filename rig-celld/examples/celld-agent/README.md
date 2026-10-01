@@ -17,7 +17,7 @@ cargo install worker-build
 curl -fsSL https://celld.dev/install.sh | sh
 ```
 
-The workspace pins workers-rs 0.8.3 because it shares the `wasm-streams` 0.5 ABI used by Rig 0.42 and reqwest 0.13. See the [workspace constraints](../../../README.md#constraints).
+The workspace pins workers-rs 0.8.3 because it shares the `wasm-streams` 0.5 ABI used by Rig 0.43 and reqwest 0.13. See the [workspace constraints](../../../README.md#constraints).
 
 ## Build
 

@@ -6,6 +6,7 @@ use duroxide::{Client, RetryPolicy, providers::sqlite::SqliteProvider, runtime};
 use rig::{
     agent::PromptResponse,
     completion::Usage,
+    operation::Finish,
     test_utils::{MockAddTool, MockCompletionModel, MockStreamEvent, mock_final},
     tool::ToolSet,
 };
@@ -63,7 +64,7 @@ async fn text_deltas_produce_output_and_usage() {
     .await;
     let response = result.unwrap();
     assert_eq!(response.output, "hello");
-    assert_eq!(response.usage.total_tokens, 7);
+    assert_eq!(response.usage.total_tokens, Some(7));
     assert_eq!(count, 1);
 }
 
@@ -72,9 +73,10 @@ async fn explicit_message_id_takes_precedence_over_the_terminal_id() {
     let model = MockCompletionModel::from_stream_turns([[
         MockStreamEvent::message_id("message-event"),
         MockStreamEvent::text("done"),
-        MockStreamEvent::FinalResponse(
-            mock_final(Usage::new()).with_message_id("terminal-message"),
-        ),
+        MockStreamEvent::FinalResponse(Finish {
+            message_id: Some("terminal-message".into()),
+            ..mock_final(Usage::default())
+        }),
     ]]);
     let response = run(
         model,
@@ -125,7 +127,7 @@ async fn complete_tool_call_executes_and_stream_continues() {
 }
 
 #[tokio::test]
-async fn tool_call_deltas_assemble_and_missing_name_fails() {
+async fn tool_call_deltas_assemble_and_nameless_call_is_dropped() {
     let valid = MockCompletionModel::from_stream_turns([
         vec![
             MockStreamEvent::tool_call_name_delta("id", "add"),
@@ -156,16 +158,18 @@ async fn tool_call_deltas_assemble_and_missing_name_fails() {
         MockStreamEvent::tool_call_arguments_delta("id", "{}"),
         MockStreamEvent::final_response_with_default_usage(),
     ]]);
-    let error = run(
+    // Rig drops a streamed call that never received a name, so the turn
+    // has no tool call to execute.
+    let (result, count) = run(
         invalid,
         ToolSet::from_tools(vec![MockAddTool]),
         RetryPolicy::new(1),
         "stream-bad-delta",
     )
-    .await
-    .0
-    .unwrap_err();
-    assert!(error.contains("validated tool name"), "{error}");
+    .await;
+    let response = result.unwrap();
+    assert_eq!(response.output, "");
+    assert_eq!(count, 1);
 }
 
 #[tokio::test]
@@ -188,7 +192,7 @@ async fn unknown_and_reasoning_are_durable_but_unknown_is_not_history() {
     let history = serde_json::to_string(&response.messages).unwrap();
     assert!(history.contains("think"));
     assert!(!history.contains("native"));
-    assert_eq!(response.usage.total_tokens, 0);
+    assert_eq!(response.usage.total_tokens, None);
 }
 
 #[tokio::test]
@@ -303,7 +307,7 @@ async fn checkpointing_streamed_turns_does_not_repeat_provider_calls() {
         .unwrap();
 
     assert_eq!(response.output, "42");
-    assert_eq!(response.usage.total_tokens, 3);
+    assert_eq!(response.usage.total_tokens, Some(3));
     assert_eq!(model.request_count(), 2);
     assert_eq!(
         client.list_executions("stream-checkpoint").await.unwrap(),

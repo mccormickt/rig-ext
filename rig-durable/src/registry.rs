@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use duroxide::runtime::registry::{ActivityRegistry, OrchestrationRegistry};
-use rig::{completion::CompletionModel, tool::ToolSet};
+use rig::{DynModel, operation::Completion, tool::ToolSet};
 
 use crate::{
     activities,
@@ -11,21 +11,18 @@ use crate::{
     types::AgentInput,
 };
 
-pub fn activity_registry<M>(model: M, tools: ToolSet) -> ActivityRegistry
-where
-    M: CompletionModel + Send + Sync + 'static,
-{
-    activity_registry_with_names(model, tools, &RuntimeNames::legacy())
+pub fn activity_registry(
+    model: impl Into<DynModel<Completion>>,
+    tools: ToolSet,
+) -> ActivityRegistry {
+    activity_registry_with_names(model.into(), tools, &RuntimeNames::legacy())
 }
 
-pub(crate) fn activity_registry_with_names<M>(
-    model: M,
+pub(crate) fn activity_registry_with_names(
+    model: DynModel<Completion>,
     tools: ToolSet,
     names: &RuntimeNames,
-) -> ActivityRegistry
-where
-    M: CompletionModel + Send + Sync + 'static,
-{
+) -> ActivityRegistry {
     let model = Arc::new(model);
     let completion_model = Arc::clone(&model);
     let tools = Arc::new(tools);

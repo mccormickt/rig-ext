@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new(connection, client_options)?;
     let attempts = Arc::new(AtomicUsize::new(0));
     let invocations = Arc::new(Mutex::new(Vec::new()));
-    let agent = TemporalAgent::new(MockCompletionModel::new([
+    let agent = TemporalAgent::new(MockCompletionModel::from_turns([
         MockTurn::tool_call("lookup-1", "lookup", serde_json::json!({"key": "service"})),
         MockTurn::text("The service is available."),
     ]))

@@ -6,16 +6,13 @@
 //! # async fn run(client: rig_a2a::A2AClient) -> anyhow::Result<()> {
 //! let agent = client.agent().build();
 //! agent
-//!     .runner("what did we decide?")
+//!     .prompt("what did we decide?")
 //!     .a2a_conversation("user-42")
-//!     .run()
 //!     .await?;
 //! # Ok(()) }
 //! ```
 
-use rig_agent::agent::{
-    AgentBuilder, AgentRunner, PromptRequest, PromptType, StreamingPromptRequest,
-};
+use rig_agent::agent::{AgentBuilder, AgentRunner};
 use serde_json::{Map, Value, json};
 
 use crate::model::THREAD_PARAMS_KEY;
@@ -45,25 +42,6 @@ impl<ToolState> A2AConversationExt for AgentBuilder<ToolState> {
 }
 
 impl A2AConversationExt for AgentRunner {
-    fn a2a_conversation(self, id: impl Into<String>) -> Self {
-        let id = id.into();
-        self.conversation(id.clone())
-            .merge_additional_params(conversation_params(id))
-    }
-}
-
-impl<S> A2AConversationExt for PromptRequest<S>
-where
-    S: PromptType,
-{
-    fn a2a_conversation(self, id: impl Into<String>) -> Self {
-        let id = id.into();
-        self.conversation(id.clone())
-            .merge_additional_params(conversation_params(id))
-    }
-}
-
-impl A2AConversationExt for StreamingPromptRequest {
     fn a2a_conversation(self, id: impl Into<String>) -> Self {
         let id = id.into();
         self.conversation(id.clone())

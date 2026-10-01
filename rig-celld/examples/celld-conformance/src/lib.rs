@@ -1,9 +1,10 @@
 use rig_celld::{
-    BackendKind, BackendMaturity, MemoryBackend, MemoryRecord, SearchKind, SqliteVecIndex,
-    StoredMemory, TieBreak, ZeroVectorPolicy,
+    BackendKind, BackendMaturity, EmbedText, MemoryBackend, MemoryRecord, SearchKind,
+    SqliteVecIndex, StoredMemory, TieBreak, ZeroVectorPolicy,
 };
 use rig_core::{
-    embeddings::{Embedding, EmbeddingError, EmbeddingModel},
+    embeddings::Embedding,
+    error::ProviderError,
     vector_store::{VectorSearchRequest, VectorStoreIndex, request::Filter},
 };
 use serde::Deserialize;
@@ -16,42 +17,27 @@ const CONCURRENT_ID: &str = "concurrent";
 #[derive(Clone, Debug)]
 struct FixtureEmbeddingModel;
 
-impl EmbeddingModel for FixtureEmbeddingModel {
-    const MAX_DOCUMENTS: usize = 128;
-    type Client = ();
-
-    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-        Self
-    }
-
+impl EmbedText for FixtureEmbeddingModel {
     fn ndims(&self) -> usize {
         2
     }
 
-    async fn embed_texts(
-        &self,
-        texts: impl IntoIterator<Item = String> + rig_core::wasm_compat::WasmCompatSend,
-    ) -> Result<Vec<Embedding>, EmbeddingError> {
-        texts
-            .into_iter()
-            .map(|document| {
-                let vector = if document.contains("alpha") {
-                    vec![1.0, 0.0]
-                } else if document.contains("beta") {
-                    vec![0.0, 1.0]
-                } else if document.contains("diagonal") {
-                    vec![1.0, 1.0]
-                } else {
-                    return Err(EmbeddingError::ProviderError(format!(
-                        "fixture has no vector for '{document}'"
-                    )));
-                };
-                Ok(Embedding {
-                    document,
-                    vec: vector,
-                })
-            })
-            .collect()
+    async fn embed_text(&self, text: &str) -> std::result::Result<Embedding, ProviderError> {
+        let vector = if text.contains("alpha") {
+            vec![1.0, 0.0]
+        } else if text.contains("beta") {
+            vec![0.0, 1.0]
+        } else if text.contains("diagonal") {
+            vec![1.0, 1.0]
+        } else {
+            return Err(ProviderError::Provider(format!(
+                "fixture has no vector for '{text}'"
+            )));
+        };
+        Ok(Embedding {
+            document: text.to_owned(),
+            vec: vector,
+        })
     }
 }
 

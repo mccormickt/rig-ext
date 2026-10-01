@@ -12,9 +12,8 @@
 //! ```
 
 use rig_a2a::{A2AClient, A2AConversationExt};
-use rig_agent::{client::AgentClientExt, completion::Prompt};
-use rig_core::client::ProviderClient;
-use rig_core::providers::openai;
+use rig_agent::agent::AgentBuilder;
+use rig_core::providers::openai::{self, OpenAI};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -44,9 +43,8 @@ async fn main() -> anyhow::Result<()> {
         .a2a_conversation("demo-conversation")
         .build()
         .into_tool();
-    let openai_client = openai::Client::from_env()?;
-    let orchestrator = openai_client
-        .agent(openai::GPT_4O_MINI)
+    let openai = OpenAI::from_env()?;
+    let orchestrator = AgentBuilder::new(openai.completion(openai::GPT_4O_MINI))
         .preamble("Use the remote agent tool to answer, then relay its reply.")
         .dynamic_tool(remote_tool)
         .build();

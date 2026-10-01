@@ -128,7 +128,7 @@ async fn live_client() -> (Runtime, Client) {
 
 #[test]
 fn temporal_agent_builds_reusable_inputs_and_registers_a_worker() {
-    let agent = TemporalAgent::new(MockCompletionModel::new([MockTurn::text("done")]))
+    let agent = TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::text("done")]))
         .preamble("Use tools when needed.")
         .tool(MockAddTool);
 
@@ -152,7 +152,7 @@ fn temporal_agent_builds_reusable_inputs_and_registers_a_worker() {
 #[ignore = "requires a live Temporal server configured with TEMPORAL_* variables"]
 async fn temporal_session_accepts_multiple_prompts_and_closes() {
     let (runtime, client) = live_client().await;
-    let agent = TemporalAgent::new(MockCompletionModel::new([
+    let agent = TemporalAgent::new(MockCompletionModel::from_turns([
         MockTurn::text("first answer"),
         MockTurn::text("second answer"),
     ]));
@@ -216,7 +216,7 @@ async fn temporal_session_accepts_multiple_prompts_and_closes() {
 
 #[test]
 fn temporal_approval_is_opt_in_per_tool() {
-    let agent = TemporalAgent::new(MockCompletionModel::new([MockTurn::text("done")]))
+    let agent = TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::text("done")]))
         .approval_tool(MockAddTool);
 
     let input = agent.input("add");
@@ -227,7 +227,7 @@ fn temporal_approval_is_opt_in_per_tool() {
 #[ignore = "requires a live Temporal server configured with TEMPORAL_* variables"]
 async fn temporal_server_executes_model_and_tool_activities() {
     let (runtime, client) = live_client().await;
-    let agent = TemporalAgent::new(MockCompletionModel::new([
+    let agent = TemporalAgent::new(MockCompletionModel::from_turns([
         MockTurn::tool_call("call-1", "add", serde_json::json!({"x": 20, "y": 22})),
         MockTurn::text("The answer is 42."),
     ]))
@@ -269,7 +269,7 @@ async fn temporal_retries_tools_with_stable_invocation_identity() {
     let (runtime, client) = live_client().await;
     let attempts = Arc::new(AtomicUsize::new(0));
     let invocations = Arc::new(Mutex::new(Vec::new()));
-    let agent = TemporalAgent::new(MockCompletionModel::new([
+    let agent = TemporalAgent::new(MockCompletionModel::from_turns([
         MockTurn::tool_call("lookup-1", "lookup", serde_json::json!({"key": "service"})),
         MockTurn::text("available"),
     ]))
@@ -320,7 +320,7 @@ async fn temporal_retries_tools_with_stable_invocation_identity() {
 async fn temporal_fails_after_tool_retries_are_exhausted() {
     let (runtime, client) = live_client().await;
     let attempts = Arc::new(AtomicUsize::new(0));
-    let agent = TemporalAgent::new(MockCompletionModel::new([MockTurn::tool_call(
+    let agent = TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::tool_call(
         "lookup-1",
         "lookup",
         serde_json::json!({"key": "service"}),
@@ -366,7 +366,7 @@ async fn temporal_fails_after_tool_retries_are_exhausted() {
 async fn temporal_approval_executes_only_approved_tools() {
     let (runtime, client) = live_client().await;
     let attempts = Arc::new(AtomicUsize::new(0));
-    let agent = TemporalAgent::new(MockCompletionModel::new([
+    let agent = TemporalAgent::new(MockCompletionModel::from_turns([
         MockTurn::tool_call(
             "approved-call",
             "lookup",
@@ -490,7 +490,9 @@ async fn temporal_approval_executes_only_approved_tools() {
 #[ignore = "requires a live Temporal server configured with TEMPORAL_* variables"]
 async fn temporal_session_consumes_idle_steering_before_close() {
     let (runtime, client) = live_client().await;
-    let agent = TemporalAgent::new(MockCompletionModel::new([MockTurn::text("steered answer")]));
+    let agent = TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::text(
+        "steered answer",
+    )]));
     let input = agent.session_input(Vec::new());
     let task_queue = format!("rig-temporal-idle-steer-test-{}", uuid::Uuid::new_v4());
     let mut options = WorkerOptions::new(task_queue.clone()).build();
@@ -563,7 +565,7 @@ async fn temporal_session_serializes_updates_and_drains_active_steering_on_close
     let (runtime, client) = live_client().await;
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
-    let agent = TemporalAgent::new(MockCompletionModel::new([
+    let agent = TemporalAgent::new(MockCompletionModel::from_turns([
         MockTurn::tool_call(
             "blocking-call",
             "blocking_lookup",
@@ -651,7 +653,7 @@ async fn temporal_session_serializes_updates_and_drains_active_steering_on_close
 #[ignore = "requires a live Temporal server configured with TEMPORAL_* variables"]
 async fn temporal_session_rejects_oversized_prompts_and_can_close() {
     let (runtime, client) = live_client().await;
-    let agent = TemporalAgent::new(MockCompletionModel::new([MockTurn::text("unused")]))
+    let agent = TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::text("unused")]))
         .session_history_max_bytes(8);
     let input = agent.session_input(Vec::new());
     let task_queue = format!("rig-temporal-size-test-{}", uuid::Uuid::new_v4());

@@ -1,4 +1,6 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// Rig's model wire requires `ProviderError` as its error type.
+#![allow(clippy::result_large_err)]
 #![cfg_attr(
     test,
     allow(

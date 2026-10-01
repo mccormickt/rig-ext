@@ -5,13 +5,13 @@ use rig_durable::{AgentOrchestrator, DurableAgent};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let child = DurableAgent::builder(
         "weather-researcher",
-        MockCompletionModel::new([MockTurn::text("Oslo: clear")]),
+        MockCompletionModel::from_turns([MockTurn::text("Oslo: clear")]),
     )
     .description("Research weather through a durable child agent")
     .build()?;
     let parent = DurableAgent::builder(
         "travel-assistant",
-        MockCompletionModel::new([
+        MockCompletionModel::from_turns([
             MockTurn::tool_call(
                 "weather-call",
                 "research_weather",

@@ -22,6 +22,6 @@ Each crate README lists its examples and any extra build requirements.
 
 ## Constraints
 
-- The workspace pins `worker` to 0.8.3. Rig 0.42 uses `wasm-streams` 0.5. workers-rs 0.8.4 and later use `wasm-streams` 0.6. Both versions in one Worker make duplicate WASM symbols.
+- The workspace pins `worker` to 0.8.3. Rig 0.43 uses `wasm-streams` 0.5. workers-rs 0.8.4 and later use `wasm-streams` 0.6. Both versions in one Worker make duplicate WASM symbols.
 - `rig-a2a` supports native targets only.
 - The encrypted Turso backend is not available. celld cannot yet prove atomic multi-chunk writes. See the [`rig-celld` notes](rig-celld/README.md).

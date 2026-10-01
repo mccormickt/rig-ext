@@ -25,7 +25,7 @@ use serde::Deserialize;
 async fn rig_first_prompt_tools_streaming_and_versions() {
     let v1 = DurableAgent::builder(
         "calculator",
-        MockCompletionModel::new([MockTurn::text("v1")]),
+        MockCompletionModel::from_turns([MockTurn::text("v1")]),
     )
     .version("1.0.0")
     .unwrap()
@@ -84,7 +84,7 @@ async fn rig_first_prompt_tools_streaming_and_versions() {
 async fn approval_is_managed_through_the_run_handle() {
     let definition = DurableAgent::builder(
         "approved-calculator",
-        MockCompletionModel::new([
+        MockCompletionModel::from_turns([
             MockTurn::tool_call("call", "add", serde_json::json!({"x": 20, "y": 22})),
             MockTurn::text("approved"),
         ]),
@@ -113,7 +113,7 @@ async fn approval_is_managed_through_the_run_handle() {
 
     let recovered = DurableAgent::builder(
         "approved-calculator",
-        MockCompletionModel::new([MockTurn::text("approved")]),
+        MockCompletionModel::from_turns([MockTurn::text("approved")]),
     )
     .tool_with(
         MockAddTool,
@@ -144,7 +144,7 @@ async fn approval_is_managed_through_the_run_handle() {
 async fn steering_runs_as_a_follow_up_turn_before_completion() {
     let definition = DurableAgent::builder(
         "steerable",
-        MockCompletionModel::new([
+        MockCompletionModel::from_turns([
             MockTurn::text("initial answer"),
             MockTurn::text("steered answer"),
         ]),
@@ -177,7 +177,7 @@ async fn steering_runs_as_a_follow_up_turn_before_completion() {
 async fn checkpoint_policy_applies_before_a_steered_turn() {
     let definition = DurableAgent::builder(
         "checkpointed-steering",
-        MockCompletionModel::new([
+        MockCompletionModel::from_turns([
             MockTurn::text("initial answer"),
             MockTurn::text("steered answer"),
         ]),
@@ -222,7 +222,7 @@ async fn checkpoint_policy_applies_before_a_steered_turn() {
 async fn steering_rejects_a_completed_run() {
     let definition = DurableAgent::builder(
         "completed-steering",
-        MockCompletionModel::new([MockTurn::text("done")]),
+        MockCompletionModel::from_turns([MockTurn::text("done")]),
     )
     .build()
     .unwrap();
@@ -252,14 +252,14 @@ async fn steering_rejects_a_completed_run() {
 async fn durable_sub_agent_is_registered_and_called_as_a_tool() {
     let child = DurableAgent::builder(
         "researcher",
-        MockCompletionModel::new([MockTurn::text("child report")]),
+        MockCompletionModel::from_turns([MockTurn::text("child report")]),
     )
     .description("Research a prompt in a durable child agent")
     .build()
     .unwrap();
     let parent = DurableAgent::builder(
         "assistant",
-        MockCompletionModel::new([
+        MockCompletionModel::from_turns([
             MockTurn::tool_call(
                 "research-call",
                 "research",
@@ -297,13 +297,13 @@ async fn durable_sub_agent_is_registered_and_called_as_a_tool() {
 async fn caller_run_ids_are_scoped_by_agent_and_version() {
     let first = DurableAgent::builder(
         "first",
-        MockCompletionModel::new([MockTurn::text("first output")]),
+        MockCompletionModel::from_turns([MockTurn::text("first output")]),
     )
     .build()
     .unwrap();
     let second = DurableAgent::builder(
         "second",
-        MockCompletionModel::new([MockTurn::text("second output")]),
+        MockCompletionModel::from_turns([MockTurn::text("second output")]),
     )
     .build()
     .unwrap();
@@ -339,7 +339,7 @@ async fn caller_run_ids_are_scoped_by_agent_and_version() {
 async fn invalid_version_compositions_fail_before_runtime_start() {
     let approval_v1 = DurableAgent::builder(
         "approval-versioned",
-        MockCompletionModel::new([MockTurn::text("v1")]),
+        MockCompletionModel::from_turns([MockTurn::text("v1")]),
     )
     .version("1.0.0")
     .unwrap()
@@ -348,7 +348,7 @@ async fn invalid_version_compositions_fail_before_runtime_start() {
     .unwrap();
     let approval_v2 = DurableAgent::builder(
         "approval-versioned",
-        MockCompletionModel::new([MockTurn::text("v2")]),
+        MockCompletionModel::from_turns([MockTurn::text("v2")]),
     )
     .version("2.0.0")
     .unwrap()
@@ -366,7 +366,7 @@ async fn invalid_version_compositions_fail_before_runtime_start() {
 
     let missing_target = DurableAgent::builder(
         "checkpoint-versioned",
-        MockCompletionModel::new([MockTurn::text("v1")]),
+        MockCompletionModel::from_turns([MockTurn::text("v1")]),
     )
     .checkpoint(CheckpointConfig {
         policy: CheckpointPolicy::Every(NonZeroU32::new(1).unwrap()),
@@ -389,7 +389,7 @@ async fn invalid_version_compositions_fail_before_runtime_start() {
 async fn checkpoint_can_move_a_run_to_a_registered_agent_version() {
     let v1 = DurableAgent::builder(
         "migrating-calculator",
-        MockCompletionModel::new([MockTurn::tool_call(
+        MockCompletionModel::from_turns([MockTurn::tool_call(
             "call",
             "add",
             serde_json::json!({"x":20,"y":22}),
@@ -406,7 +406,7 @@ async fn checkpoint_can_move_a_run_to_a_registered_agent_version() {
     .unwrap();
     let v2 = DurableAgent::builder(
         "migrating-calculator",
-        MockCompletionModel::new([MockTurn::text("migrated answer")]),
+        MockCompletionModel::from_turns([MockTurn::text("migrated answer")]),
     )
     .version("2.0.0")
     .unwrap()
@@ -440,14 +440,14 @@ async fn checkpoint_can_move_a_run_to_a_registered_agent_version() {
 fn approval_enabled_agents_are_rejected_as_sub_agents() {
     let child = DurableAgent::builder(
         "approved-child",
-        MockCompletionModel::new([MockTurn::text("child")]),
+        MockCompletionModel::from_turns([MockTurn::text("child")]),
     )
     .tool_with(MockAddTool, ToolOptions::default().require_approval())
     .build()
     .unwrap();
     let result = DurableAgent::builder(
         "parent",
-        MockCompletionModel::new([MockTurn::text("parent")]),
+        MockCompletionModel::from_turns([MockTurn::text("parent")]),
     )
     .sub_agent("child", child);
     assert!(matches!(
@@ -500,7 +500,7 @@ async fn reconnects_to_a_run_after_runtime_restart_without_recalling_the_model_t
     let entered = Arc::new(tokio::sync::Notify::new());
     let first = DurableAgent::builder(
         "restartable",
-        MockCompletionModel::new([MockTurn::tool_call(
+        MockCompletionModel::from_turns([MockTurn::tool_call(
             "call",
             "interruptible",
             serde_json::json!({}),
@@ -542,7 +542,7 @@ async fn reconnects_to_a_run_after_runtime_restart_without_recalling_the_model_t
     let recovered_calls = Arc::new(AtomicUsize::new(0));
     let recovered = DurableAgent::builder(
         "restartable",
-        MockCompletionModel::new([MockTurn::text("finished after restart")]),
+        MockCompletionModel::from_turns([MockTurn::text("finished after restart")]),
     )
     .tool_with(
         InterruptedTool {

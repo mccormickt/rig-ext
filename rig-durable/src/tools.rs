@@ -61,7 +61,7 @@ impl ToolCatalog {
 pub async fn catalog_from_toolset(toolset: &ToolSet, retry: RetryPolicy) -> ToolCatalog {
     ToolCatalog(
         toolset
-            .get_tool_definitions()
+            .tool_definitions()
             .into_iter()
             .map(|definition| {
                 let name = definition.name.clone();

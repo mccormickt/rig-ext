@@ -14,7 +14,7 @@ use rig_durable::{
 };
 
 async fn run(checkpoint: CheckpointPolicy, instance: &str) -> (PromptResponse, Vec<u64>, usize) {
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("call", "add", serde_json::json!({"x":20,"y":22})),
         MockTurn::text("42"),
     ]);

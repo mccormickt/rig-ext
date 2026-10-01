@@ -143,7 +143,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_run_executes_model_and_tool_as_activities() {
-        let model = MockCompletionModel::new([
+        let model = MockCompletionModel::from_turns([
             MockTurn::tool_call("call-1", "add", serde_json::json!({"x": 20, "y": 22})),
             MockTurn::text("The answer is 42."),
         ]);
@@ -188,7 +188,7 @@ mod tests {
             approval: approval_config(),
             ..Default::default()
         };
-        let model = MockCompletionModel::new([
+        let model = MockCompletionModel::from_turns([
             MockTurn::tool_call("call-approved", "add", serde_json::json!({"x": 2, "y": 3})),
             MockTurn::text("done"),
         ]);
@@ -237,7 +237,7 @@ mod tests {
             approval: approval_config(),
             ..Default::default()
         };
-        let model = MockCompletionModel::new([
+        let model = MockCompletionModel::from_turns([
             MockTurn::tool_call("call-denied", "add", serde_json::json!({"x": 2, "y": 3})),
             MockTurn::text("recovered from denial"),
         ]);
@@ -287,7 +287,7 @@ mod tests {
             approval: approval_config(),
             ..Default::default()
         };
-        let model = MockCompletionModel::new([
+        let model = MockCompletionModel::from_turns([
             MockTurn::tool_call("call-early", "add", arguments.clone()),
             MockTurn::text("early approved"),
         ]);

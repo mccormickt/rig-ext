@@ -27,7 +27,6 @@ pub(crate) fn completion_request(
     history.push(prompt);
     CompletionRequest {
         model: None,
-        preamble: None,
         chat_history: history,
         documents: Vec::new(),
         tools: options.tools,
@@ -67,10 +66,10 @@ pub(crate) fn approval_request(
             "prompt-{prompt_index}-turn-{turn}-call-{call_index}-{}-{digest:x}",
             call.id
         ),
-        tool_name: call.function.name.clone(),
+        tool_name: call.function.name.to_string(),
         arguments,
         tool_call_id: call.id.to_string(),
-        call_id: call.provider.as_ref().map(|id| id.call_id.clone()),
+        call_id: call.id.provider().map(|id| id.call_id.clone()),
     })
 }
 
@@ -84,10 +83,5 @@ pub(crate) fn deny_tool(mut pending: PendingToolCall, reason: Option<String>) ->
 }
 
 pub(crate) fn tool_result(call: &ToolCall, content: Vec<ToolResultContent>) -> UserContent {
-    UserContent::tool_result_for(
-        call.id.clone(),
-        call.provider.clone(),
-        call.function.name.clone(),
-        content,
-    )
+    UserContent::tool_result(call.id.clone(), call.function.name.clone(), content)
 }

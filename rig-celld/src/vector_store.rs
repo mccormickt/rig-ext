@@ -1,12 +1,20 @@
+// Rig's `VectorStoreError` and `ProviderError` are large error types that this
+// module must return.
+#![allow(clippy::result_large_err)]
+
 use std::collections::BTreeMap;
 
 use rig_core::{
-    Embed,
-    embeddings::{Embedding, EmbeddingError, EmbeddingModel},
+    DynModel, Embed,
+    driver::{Model, Transport},
+    embeddings::Embedding,
+    error::ProviderError,
+    operation,
     vector_store::{
         InsertDocuments, VectorSearchRequest, VectorStoreError, VectorStoreIndex, request::Filter,
     },
-    wasm_compat::WasmCompatSend,
+    wasm_compat::{WasmCompatSend, WasmCompatSync},
+    wire::Wire,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -101,7 +109,7 @@ pub enum SqliteVecError {
     Vector(#[from] VectorError),
     /// The embedding provider failed.
     #[error(transparent)]
-    Embedding(#[from] EmbeddingError),
+    Embedding(#[from] ProviderError),
     /// JSON serialization or deserialization failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -113,6 +121,46 @@ pub enum SqliteVecError {
 impl From<worker::Error> for SqliteVecError {
     fn from(error: worker::Error) -> Self {
         Self::Worker(error.to_string())
+    }
+}
+
+/// An embedding model that [`SqliteVecIndex`] can use.
+///
+/// Rig models embedding generators as `Model<W, T>` or `DynModel<Embedding>`
+/// over `operation::Embedding`. Blanket implementations cover both. Other
+/// embedding backends implement this trait directly.
+pub trait EmbedText: WasmCompatSend + WasmCompatSync {
+    /// The fixed vector width of the model. Zero means unknown.
+    fn ndims(&self) -> usize;
+
+    /// Embed `text` into one vector.
+    fn embed_text(
+        &self,
+        text: &str,
+    ) -> impl std::future::Future<Output = Result<Embedding, ProviderError>> + WasmCompatSend;
+}
+
+impl<W, T> EmbedText for Model<W, T>
+where
+    W: Wire<Op = operation::Embedding>,
+    T: Transport<W>,
+{
+    fn ndims(&self) -> usize {
+        self.wire.describe().capabilities.ndims
+    }
+
+    async fn embed_text(&self, text: &str) -> Result<Embedding, ProviderError> {
+        Model::embed_text(self, text).await
+    }
+}
+
+impl EmbedText for DynModel<operation::Embedding> {
+    fn ndims(&self) -> usize {
+        self.capabilities().ndims
+    }
+
+    async fn embed_text(&self, text: &str) -> Result<Embedding, ProviderError> {
+        DynModel::embed_text(self, text).await
     }
 }
 
@@ -134,7 +182,7 @@ pub struct SqliteVecIndex<M> {
 
 impl<M> SqliteVecIndex<M>
 where
-    M: EmbeddingModel,
+    M: EmbedText,
 {
     /// Create an index named `rig_vectors` and read generic document IDs from `id`.
     pub fn new(sql: SqlStorage, model: M) -> Result<Self, SqliteVecError> {
@@ -637,7 +685,7 @@ where
 
 impl<M> VectorStoreIndex for SqliteVecIndex<M>
 where
-    M: EmbeddingModel,
+    M: EmbedText,
 {
     type Filter = Filter<Value>;
 
@@ -671,7 +719,7 @@ where
 
 impl<M> InsertDocuments for SqliteVecIndex<M>
 where
-    M: EmbeddingModel,
+    M: EmbedText,
 {
     async fn insert_documents<Doc: Serialize + Embed + WasmCompatSend>(
         &self,
@@ -698,7 +746,7 @@ where
 
 impl<M> MemoryBackend for SqliteVecIndex<M>
 where
-    M: EmbeddingModel,
+    M: EmbedText,
 {
     type Error = SqliteVecError;
 

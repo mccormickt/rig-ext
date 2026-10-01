@@ -230,24 +230,22 @@ impl A2AClient {
         &self.agent_name
     }
 
-    /// The remote agent as a Rig [`CompletionModel`], unbound to any
+    /// The remote agent as a Rig completion model, unbound to any
     /// conversation.
     ///
     /// Each completion is an independent exchange. Use
     /// [`Self::model_for_conversation`] to thread them.
     ///
-    /// [`CompletionModel`]: rig_core::completion::CompletionModel
     pub fn model(&self) -> A2AModel {
         self.model_with(None)
     }
 
-    /// The remote agent as a Rig [`CompletionModel`] bound to one conversation.
+    /// The remote agent as a Rig completion model bound to one conversation.
     ///
     /// Completions under this model continue a single remote conversation, and
     /// share their `contextId` with every model and agent built from this client
     /// under the same [`ConversationId`].
     ///
-    /// [`CompletionModel`]: rig_core::completion::CompletionModel
     pub fn model_for_conversation(&self, id: impl Into<ConversationId>) -> A2AModel {
         self.model_with(Some(id.into()))
     }
@@ -277,8 +275,6 @@ impl A2AClient {
     /// remote threads.
     ///
     /// ```no_run
-    /// use rig_agent::completion::Prompt;
-    ///
     /// # async fn run(client: rig_a2a::A2AClient) -> anyhow::Result<()> {
     /// use rig_a2a::A2AConversationExt;
     ///
@@ -316,7 +312,7 @@ impl A2AClient {
     fn agent_with(&self, model: A2AModel) -> AgentBuilder<NoToolConfig> {
         AgentBuilder::new(model)
             .name(&self.agent_name)
-            .description(&describe_card(&self.card))
+            .description(describe_card(&self.card))
     }
 
     /// Start a request to the remote agent. Chain [`A2ARequest::context`]

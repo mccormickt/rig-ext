@@ -4,7 +4,7 @@ use rig_durable::{AgentOrchestrator, DurableAgent, ToolOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call(
             "approved-call",
             "add",

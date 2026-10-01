@@ -21,6 +21,10 @@ pub struct ToolInvocation {
     pub call_index: usize,
 }
 
+impl rig::tool::ContextValue for ToolInvocation {
+    const KEY: &'static str = "rig_durable.invocation";
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolActivityOutput {
     pub content: Vec<ToolResultContent>,

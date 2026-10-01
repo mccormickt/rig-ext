@@ -5,11 +5,12 @@
 
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
-use futures::{FutureExt, future::BoxFuture};
 use rig::{
+    DynModel,
     agent::{AgentRun, AgentRunStep, PromptResponse},
-    completion::{CompletionModel, CompletionRequest, Message, ToolDefinition},
+    completion::{CompletionRequest, Message, ToolDefinition},
     message::{ToolChoice, UserContent},
+    operation::Completion,
     tool::{Tool, ToolSet},
 };
 use serde::{Deserialize, Serialize};
@@ -426,27 +427,8 @@ fn history_payload_too_large(config: &TemporalAgentConfig, history: &[Message]) 
         .unwrap_or(true)
 }
 
-trait CompletionActivity: Send + Sync {
-    fn complete(
-        &self,
-        request: CompletionRequest,
-    ) -> BoxFuture<'_, Result<rig::agent::ModelTurn, String>>;
-}
-
-impl<M> CompletionActivity for M
-where
-    M: CompletionModel + Send + Sync + 'static,
-{
-    fn complete(
-        &self,
-        request: CompletionRequest,
-    ) -> BoxFuture<'_, Result<rig::agent::ModelTurn, String>> {
-        activities::completion::complete(self, request).boxed()
-    }
-}
-
 struct TemporalActivities {
-    model: Arc<dyn CompletionActivity>,
+    model: DynModel<Completion>,
     tools: Arc<ToolSet>,
 }
 
@@ -458,7 +440,9 @@ impl TemporalActivities {
         _ctx: ActivityContext,
         request: CompletionRequest,
     ) -> Result<rig::agent::ModelTurn, ActivityError> {
-        self.model.complete(request).await.map_err(activity_error)
+        activities::completion::complete(&self.model, request)
+            .await
+            .map_err(activity_error)
     }
 
     #[activity(name = "RigTemporalToolExecutionV1")]
@@ -478,19 +462,16 @@ fn activity_error(message: String) -> ActivityError {
 }
 
 /// A worker-side Temporal agent definition.
-pub struct TemporalAgent<M> {
-    model: M,
+pub struct TemporalAgent {
+    model: DynModel<Completion>,
     tools: Arc<ToolSet>,
     config: TemporalAgentConfig,
 }
 
-impl<M> TemporalAgent<M>
-where
-    M: CompletionModel + Send + Sync + 'static,
-{
-    pub fn new(model: M) -> Self {
+impl TemporalAgent {
+    pub fn new(model: impl Into<DynModel<Completion>>) -> Self {
         Self {
-            model,
+            model: model.into(),
             tools: Arc::new(ToolSet::default()),
             config: TemporalAgentConfig::default(),
         }
@@ -559,7 +540,7 @@ where
         let name = tools.add_tool(tool);
         let definition = self
             .tools
-            .get_tool_definitions()
+            .tool_definitions()
             .into_iter()
             .find(|definition| definition.name == name)
             .expect("newly added tool has a definition");
@@ -618,7 +599,7 @@ where
         options.register_workflow::<TemporalAgentWorkflow>()?;
         options.register_workflow::<TemporalAgentSessionWorkflow>()?;
         options.register_activities(TemporalActivities {
-            model: Arc::new(self.model),
+            model: self.model,
             tools: self.tools,
         });
         Ok(())
@@ -829,7 +810,7 @@ async fn execute_tool<W>(
         .execute_activity(
             TemporalActivities::execute_tool,
             ToolActivityInput {
-                name: call.function.name.clone(),
+                name: call.function.name.to_string(),
                 arguments: serde_json::to_string(&call.function.arguments)
                     .map_err(workflow_error)?,
                 invocation: ToolInvocation {

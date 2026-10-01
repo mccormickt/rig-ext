@@ -5,7 +5,7 @@ use rig_durable::{AgentOrchestrator, CheckpointConfig, CheckpointPolicy, Durable
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("first", "add", serde_json::json!({"x":20,"y":22})),
         MockTurn::tool_call("second", "add", serde_json::json!({"x":42,"y":1})),
         MockTurn::text("The final answer is 43."),

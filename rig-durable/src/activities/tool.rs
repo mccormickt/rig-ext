@@ -7,7 +7,9 @@ pub async fn execute(
     input: ToolActivityInput,
 ) -> Result<ToolActivityOutput, String> {
     let mut context = ToolContext::new();
-    context.insert(input.invocation);
+    context
+        .insert(input.invocation)
+        .map_err(|error| error.to_string())?;
     let result = toolset
         .execute(&input.name, input.arguments, &mut context)
         .await;

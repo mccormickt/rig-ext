@@ -1,7 +1,7 @@
 use rig::{
-    completion::{Chat, Message},
-    prelude::{AgentClientExt, EmbeddingsClient},
-    providers::openai,
+    AgentBuilder,
+    completion::Message,
+    providers::openai::{self, OpenAI},
 };
 use rig_celld::SqliteVecIndex;
 use serde::{Deserialize, Serialize};
@@ -81,13 +81,11 @@ impl DurableObject for AgentCell {
         .parse::<usize>()
         .map_err(to_worker_error)?;
 
-        let client = openai::Client::new(api_key).map_err(to_worker_error)?;
-        let embedding_model =
-            client.embedding_model_with_ndims(embedding_model, embedding_dimensions);
+        let client = OpenAI::new(api_key);
+        let embedding_model = client.embedding(embedding_model, Some(embedding_dimensions));
         let index = SqliteVecIndex::new(sql.clone(), embedding_model).map_err(to_worker_error)?;
         let memory_index = index.clone();
-        let agent = client
-            .agent(completion_model)
+        let agent = AgentBuilder::new(client.completion(completion_model))
             .preamble(
                 "You are a durable assistant. Use the retrieved memories when they are relevant. \
                  Do not claim that a memory is current when the user has corrected it.",
@@ -98,7 +96,8 @@ impl DurableObject for AgentCell {
         let answer = agent
             .chat(input.prompt.clone(), &mut history)
             .await
-            .map_err(to_worker_error)?;
+            .map_err(to_worker_error)?
+            .output;
         let turn = insert_turn(&sql, &input.prompt, &answer)?;
         let memory = Memory {
             id: turn.to_string(),

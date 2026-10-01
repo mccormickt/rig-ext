@@ -32,9 +32,8 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use rig_a2a::{A2AClient, A2AConversationExt, SendMessageResponse};
 use rig_agent::agent::AgentBuilder;
-use rig_agent::completion::Prompt;
 use rig_agent::test_utils::{MockCompletionModel, MockTurn};
-use rig_core::completion::{CompletionModel, CompletionRequest, ToolDefinition};
+use rig_core::completion::{CompletionRequest, ToolDefinition};
 use rig_core::message::{Message as RigMessage, ToolResultContent, UserContent};
 
 /// What the stub executor replies to a `message/send`.
@@ -449,7 +448,7 @@ async fn agent_calls_remote_agent(binding: StubBinding) {
     let agent_name = remote.agent_name().to_string();
     let remote_tool = remote.agent().build().into_tool();
 
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call(
             "tool_call_1",
             &agent_name,
@@ -467,7 +466,7 @@ async fn agent_calls_remote_agent(binding: StubBinding) {
         .max_turns(3)
         .await
         .expect("agent run should succeed");
-    assert_eq!(out, "done");
+    assert_eq!(out.to_string(), "done");
 
     let messages = recorded.lock().unwrap();
     assert_eq!(messages.len(), 1, "stub should have seen one message");
@@ -556,7 +555,6 @@ async fn request_context_threads_to_remote_and_response() {
 fn text_request(prompt: &str) -> CompletionRequest {
     CompletionRequest {
         model: None,
-        preamble: None,
         chat_history: vec![RigMessage::user(prompt)],
         documents: vec![],
         tools: vec![],
@@ -605,14 +603,16 @@ async fn threaded_turns_send_standing_context_once() {
     let model = remote.model_for_conversation("user-42");
 
     let mut turn = text_request("turn 1");
-    turn.preamble = Some("You are terse.".to_string());
+    turn.chat_history
+        .insert(0, rig_core::message::Message::system("You are terse."));
     turn.documents = vec![document("handbook", "the standing handbook")];
     model.completion(turn).await.expect("turn 1 should succeed");
 
     // Turn 2 repeats the same preamble and document, as Rig rebuilds them for
     // every request, and additionally retrieves one new document.
     let mut turn = text_request("turn 2");
-    turn.preamble = Some("You are terse.".to_string());
+    turn.chat_history
+        .insert(0, rig_core::message::Message::system("You are terse."));
     turn.documents = vec![
         document("handbook", "the standing handbook"),
         document("retrieved", "freshly retrieved passage"),
@@ -764,11 +764,7 @@ async fn a_completed_task_with_no_output_is_an_empty_turn() {
         .completion(text_request("file the ticket"))
         .await
         .expect("a silent completion is not a failure");
-    let text = match response.choice.first() {
-        Some(rig_core::completion::AssistantContent::Text(text)) => text.text.clone(),
-        other => panic!("expected text, got {other:?}"),
-    };
-    assert_eq!(text, "");
+    assert_eq!(response.text(), "");
 
     server.abort();
 }
@@ -830,7 +826,7 @@ async fn model_completes_against_the_remote_agent() {
     };
     assert_eq!(text, "remote answer");
     // A2A has no token accounting; zero usage is Rig's documented sentinel.
-    assert!(!response.usage.has_values());
+    assert_eq!(response.usage, rig_core::completion::Usage::default());
 
     let messages = recorded.lock().unwrap();
     assert_eq!(messages.len(), 1);
@@ -892,8 +888,14 @@ async fn agent_backed_by_a2a_threads_a_conversation() {
     let agent = remote.agent_for_conversation("user-42").build();
     assert_eq!(agent.name(), Some("modelled"));
 
-    assert_eq!(agent.prompt("turn 1").await.expect("turn 1"), "first");
-    assert_eq!(agent.prompt("turn 2").await.expect("turn 2"), "second");
+    assert_eq!(
+        agent.prompt("turn 1").await.expect("turn 1").to_string(),
+        "first"
+    );
+    assert_eq!(
+        agent.prompt("turn 2").await.expect("turn 2").to_string(),
+        "second"
+    );
 
     let messages = recorded.lock().unwrap();
     assert_eq!(messages.len(), 2);
@@ -996,15 +998,16 @@ async fn agent_backed_by_a2a_streams() {
     let mut stream = remote
         .model()
         .stream(text_request("stream me"))
-        .await
         .expect("stream should open");
 
     let mut text = String::new();
     while let Some(chunk) = stream.next().await {
-        if let rig_core::streaming::StreamedAssistantContent::Text(delta) =
-            chunk.expect("stream item")
+        if let rig_core::streaming::Item::Event(rig_core::streaming::StreamEvent::Text {
+            text: delta,
+            ..
+        }) = chunk.expect("stream item")
         {
-            text.push_str(&delta.text);
+            text.push_str(&delta);
         }
     }
     assert!(
@@ -1028,7 +1031,6 @@ async fn model_stream_surfaces_remote_failure() {
     let mut stream = remote
         .model()
         .stream(text_request("stream me"))
-        .await
         .expect("stream should open");
 
     let mut error = None;
@@ -1069,14 +1071,15 @@ async fn model_stream_yields_status_message_text() {
     let mut stream = remote
         .model()
         .stream(text_request("stream me"))
-        .await
         .expect("stream should open");
     let mut text = String::new();
     while let Some(chunk) = stream.next().await {
-        if let rig_core::streaming::StreamedAssistantContent::Text(delta) =
-            chunk.expect("stream item")
+        if let rig_core::streaming::Item::Event(rig_core::streaming::StreamEvent::Text {
+            text: delta,
+            ..
+        }) = chunk.expect("stream item")
         {
-            text.push_str(&delta.text);
+            text.push_str(&delta);
         }
     }
     assert_eq!(text, "partial answer final answer");
@@ -1127,7 +1130,6 @@ async fn artifact_after_a_pause_keeps_the_resumable_task_id() {
 
     let mut stream = model
         .stream(text_request("turn 1"))
-        .await
         .expect("stream should open");
     while let Some(chunk) = stream.next().await {
         chunk.expect("stream item");
@@ -1167,7 +1169,7 @@ async fn a2a_backed_agent_becomes_a_sub_agent_tool() {
     // A2A-backed agent through Rig's standard sub-agent bridge.
     let sub_agent = remote.agent().a2a_conversation("user-42").build();
 
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call(
             "call_1",
             "researcher",
@@ -1189,7 +1191,7 @@ async fn a2a_backed_agent_becomes_a_sub_agent_tool() {
         .max_turns(4)
         .await
         .expect("orchestrator run");
-    assert_eq!(out, "relayed");
+    assert_eq!(out.to_string(), "relayed");
 
     let results = tool_result_texts(&model);
     assert!(

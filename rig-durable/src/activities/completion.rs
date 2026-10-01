@@ -1,24 +1,18 @@
 use std::collections::BTreeSet;
 
-#[cfg(feature = "duroxide")]
-use futures::StreamExt;
-#[cfg(feature = "duroxide")]
-use rig::streaming::StreamedAssistantContent;
-use rig::{
-    agent::ModelTurn,
-    completion::{CompletionModel, CompletionRequest},
-    message::ToolChoice,
-};
+use rig::{DynModel, completion::CompletionRequest, message::ToolChoice, operation::Completion};
 
 #[cfg(feature = "duroxide")]
 use crate::streaming::{StreamItem, StreamTranscript};
+#[cfg(feature = "duroxide")]
+use futures::StreamExt;
 
 /// Execute a provider request and retain the exact tool authorization sets
 /// used to validate the resulting turn.
-pub async fn complete<M: CompletionModel>(
-    model: &M,
+pub async fn complete(
+    model: &DynModel<Completion>,
     request: CompletionRequest,
-) -> Result<ModelTurn, String> {
+) -> Result<rig::agent::ModelTurn, String> {
     let executable: BTreeSet<_> = request.tools.iter().map(|tool| tool.name.clone()).collect();
     let allowed = match request.tool_choice.as_ref() {
         Some(ToolChoice::None) => BTreeSet::new(),
@@ -30,88 +24,72 @@ pub async fn complete<M: CompletionModel>(
         Some(ToolChoice::Auto | ToolChoice::Required) | None => executable.clone(),
     };
     let response = model
-        .completion(request)
+        .call(request)
         .await
         .map_err(|error| error.to_string())?;
-    let finish_reason = response.finish_reason();
-    let turn = ModelTurn::new(
-        response.message_id,
-        response.choice,
+    let turn = rig::agent::ModelTurn::new(
+        response.message_id.clone(),
+        response.choice.clone(),
         response.usage,
         executable,
         allowed,
+        response.raw.clone(),
     )
-    .with_identity(response.response_id, response.provider_request_id)
-    .with_finish_reason(finish_reason)
-    .with_raw(response.raw);
+    .with_identity(
+        response.response_id.clone(),
+        response.provider_request_id.clone(),
+    )
+    .with_finish_reason(response.finish_reason());
     Ok(turn)
 }
 
 /// Consume the provider stream to EOF inside one activity. The transcript is
 /// not visible to orchestration until this activity completes.
 #[cfg(feature = "duroxide")]
-pub async fn stream<M: CompletionModel>(
-    model: &M,
+pub async fn stream(
+    model: &DynModel<Completion>,
     request: CompletionRequest,
 ) -> Result<StreamTranscript, String> {
-    let mut stream = model
-        .stream(request)
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut stream = model.stream(request).map_err(|error| error.to_string())?;
     let mut items = Vec::new();
-    let mut saw_final = false;
     while let Some(item) = stream.next().await {
         let item = item.map_err(|error| error.to_string())?;
-        if saw_final {
-            return Err("provider emitted stream content after Final".into());
-        }
-        let normalized = match item {
-            StreamedAssistantContent::Text(text) => StreamItem::Text { text },
-            StreamedAssistantContent::ToolCall {
-                tool_call,
-                internal_call_id,
-            } => StreamItem::ToolCall {
-                tool_call,
-                internal_call_id,
-            },
-            StreamedAssistantContent::ToolCallDelta {
-                internal_call_id,
-                content,
-            } => StreamItem::ToolCallDelta {
-                internal_call_id,
-                content,
-            },
-            StreamedAssistantContent::Reasoning { reasoning, id } => {
-                StreamItem::Reasoning { reasoning, id }
+        let event = match item {
+            rig::streaming::Item::Event(event) => event,
+            rig::streaming::Item::Unknown(payload) => {
+                items.push(StreamItem::Unknown {
+                    value: payload.value().clone(),
+                });
+                continue;
             }
-            StreamedAssistantContent::ReasoningDelta {
-                id,
-                provider_id,
-                reasoning,
-            } => StreamItem::ReasoningDelta {
-                id,
-                provider_id,
-                reasoning,
+        };
+        let stored = match event {
+            rig::streaming::StreamEvent::Start { part, kind } => StreamItem::Start {
+                part: part.index() as u32,
+                kind,
             },
-            StreamedAssistantContent::Final(response) => {
-                if saw_final {
-                    return Err("provider emitted multiple Final events".into());
-                }
-                saw_final = true;
-                StreamItem::Final { response }
-            }
-            StreamedAssistantContent::Unknown(value) => StreamItem::Unknown {
-                value: value.value().clone(),
+            rig::streaming::StreamEvent::Text { part, text } => StreamItem::Text {
+                part: part.index() as u32,
+                text,
+            },
+            rig::streaming::StreamEvent::Reasoning { part, text } => StreamItem::Reasoning {
+                part: part.index() as u32,
+                text,
+            },
+            rig::streaming::StreamEvent::Arguments { part, json } => StreamItem::Arguments {
+                part: part.index() as u32,
+                json,
+            },
+            rig::streaming::StreamEvent::End { part, content } => StreamItem::End {
+                part: part.index() as u32,
+                content,
             },
         };
-        items.push(normalized);
+        items.push(stored);
     }
-    if !saw_final {
-        return Err("provider stream ended before Final".into());
-    }
-    Ok(StreamTranscript {
-        items,
-        message_id: stream.message_id.clone(),
-        final_choice: stream.choice.clone(),
-    })
+    let response = stream.finish().await.map_err(|error| error.to_string())?;
+    items.push(StreamItem::Final {
+        response: response.clone(),
+    });
+    Ok(StreamTranscript { items, response })
 }

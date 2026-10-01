@@ -1,4 +1,4 @@
-//! A remote A2A agent as a Rig [`CompletionModel`].
+//! A remote A2A agent as a Rig completion model.
 //!
 //! [`A2AModel`] lets a remote agent back a Rig [`Agent`], so `prompt`, `chat`,
 //! streaming, hooks, and conversation memory all work against it, and
@@ -70,13 +70,14 @@ use a2a::{Message as A2AMessage, Part, Role, SendMessageRequest, SendMessageResp
 use a2a_client::{A2AClient as InnerClient, Transport};
 use futures::StreamExt;
 use rig_core::completion::{
-    AssistantContent, CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
-    FinishReason, Usage,
+    AssistantContent, CompletionRequest, CompletionResponse, FinishReason, Usage,
 };
+use rig_core::driver::{Exchange, Model, Opened, Opening};
+use rig_core::error::{EncodeError, ProviderError};
 use rig_core::message::{Message as RigMessage, ToolChoice, UserContent};
-use rig_core::streaming::{
-    RawStreamingChoice, StreamFinal, StreamingCompletionResponse, StreamingResult,
-};
+use rig_core::operation::{Completion, Finish, TextPart};
+use rig_core::streaming::Streamed;
+use rig_core::wire::{Decoder, Descriptor, Flow, Mode, Out, Wire, WireEvent};
 
 use crate::error::A2AError;
 use crate::parts::{
@@ -87,7 +88,7 @@ use crate::thread::{A2AThreadInfo, ConversationId, ThreadStore};
 /// Provider name reported on responses and streams from this model.
 pub const PROVIDER: &str = "a2a";
 
-/// A remote A2A agent, usable wherever Rig expects a [`CompletionModel`].
+/// A remote A2A agent, usable wherever Rig expects a completion model.
 ///
 /// Build one with [`A2AClient::model`](crate::A2AClient::model) or
 /// [`A2AClient::model_for_conversation`](crate::A2AClient::model_for_conversation).
@@ -146,6 +147,26 @@ impl A2AModel {
         self
     }
 
+    fn driver(&self) -> Model<Self, A2ATransport> {
+        Model::new(self.clone(), A2ATransport)
+    }
+
+    /// Complete one request against the remote agent.
+    pub async fn completion(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, ProviderError> {
+        self.driver().call(request).await
+    }
+
+    /// Open a streaming completion against the remote agent.
+    pub fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<Streamed<Completion>, ProviderError> {
+        self.driver().stream(request)
+    }
+
     /// Build the outbound A2A request for a Rig completion request.
     fn build_request(&self, request: CompletionRequest) -> Result<Outbound, A2AError> {
         reject_unsupported(&request)?;
@@ -197,8 +218,8 @@ impl A2AModel {
             parts.push(Part::text(text));
         };
 
-        if let Some(preamble) = request.preamble.as_ref() {
-            push_standing_context(preamble.clone());
+        if let Some(preamble) = request.system_instructions() {
+            push_standing_context(preamble.to_owned());
         }
         for document in &request.documents {
             push_standing_context(document.to_string());
@@ -265,7 +286,6 @@ struct Outbound {
 /// [`CompletionRequest::additional_params`].
 ///
 /// ```no_run
-/// # use rig_agent::completion::Prompt;
 /// # use serde_json::json;
 /// # async fn run(agent: rig_agent::agent::Agent, context_id: String) -> anyhow::Result<()> {
 /// let reply = agent
@@ -371,83 +391,178 @@ fn fingerprint(text: &str) -> u64 {
     hasher.finish()
 }
 
-impl CompletionModel for A2AModel {
-    async fn completion(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse, CompletionError> {
-        let outbound = self.build_request(request)?;
-        let response = self
-            .inner
-            .send_message(&outbound.request)
-            .await
-            .map_err(A2AError::Protocol)?;
+#[doc(hidden)]
+pub struct A2APayload {
+    outbound: Outbound,
+    client: Arc<InnerClient<Box<dyn Transport>>>,
+    mode: Mode,
+}
 
-        let info = A2AThreadInfo::from_response(&response);
-        let conversation = outbound.conversation.as_ref();
-        self.record(conversation, &info);
-        self.record_sent_context(conversation, &outbound.context_fingerprints);
+#[doc(hidden)]
+pub enum A2AFrame {
+    Unary(SendMessageResponse, Option<ConversationId>, Vec<u64>),
+    Stream(a2a::StreamResponse, Option<ConversationId>),
+}
 
-        let (text, message_id) = match &response {
-            SendMessageResponse::Task(task) => {
-                if let Some(error) = task_failure(&response) {
-                    return Err(error);
+#[derive(Clone, Copy)]
+struct A2ATransport;
+
+impl rig_core::driver::Transport<A2AModel> for A2ATransport {
+    fn send(&self, payload: A2APayload, _exchange: Exchange) -> Opening<A2AFrame> {
+        Opening::new(async move {
+            let conversation = payload.outbound.conversation.clone();
+            match payload.mode {
+                Mode::Unary => {
+                    let response = payload
+                        .client
+                        .send_message(&payload.outbound.request)
+                        .await
+                        .map_err(|e| ProviderError::from(A2AError::Protocol(e)))?;
+                    let frame = A2AFrame::Unary(
+                        response,
+                        conversation,
+                        payload.outbound.context_fingerprints,
+                    );
+                    Ok(Opened::new(futures::stream::once(async { Ok(frame) })))
                 }
-                let body = task_body_limited(task, DEFAULT_TEXT_LIMIT)?;
-                (task_text(&task.status.state, body)?, None)
-            }
-            SendMessageResponse::Message(message) => {
-                let body = message_body_limited(message, DEFAULT_TEXT_LIMIT)?;
-                if body.is_empty() {
-                    return Err(CompletionError::ResponseError(
-                        "remote A2A agent replied with a message carrying no text".to_string(),
-                    ));
+                Mode::Streaming => {
+                    let upstream = payload
+                        .client
+                        .send_streaming_message(&payload.outbound.request)
+                        .await
+                        .map_err(|e| ProviderError::from(A2AError::Protocol(e)))?;
+                    Ok(Opened::new(upstream.map(move |event| {
+                        event
+                            .map(|event| A2AFrame::Stream(event, conversation.clone()))
+                            .map_err(|e| ProviderError::from(A2AError::Protocol(e)))
+                    })))
                 }
-                (body, Some(message.message_id.clone()))
             }
-        };
-
-        Ok(
-            CompletionResponse::new(text_choice(text), Usage::new(), PROVIDER)
-                .with_model(self.agent_name.clone())
-                .with_optional_message_id(message_id)
-                // Response-scoped, so the task id rather than the conversation's
-                // `contextId`, which is identical on every turn of a thread.
-                .with_optional_response_id(info.task_id.clone())
-                .with_finish_reason(finish_reason(&info)),
-        )
+        })
     }
+}
 
-    async fn stream(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<StreamingCompletionResponse, CompletionError> {
-        let outbound = self.build_request(request)?;
-        let upstream = self
-            .inner
-            .send_streaming_message(&outbound.request)
-            .await
-            .map_err(A2AError::Protocol)?;
+impl Wire for A2AModel {
+    type Op = Completion;
+    type Payload = A2APayload;
+    type Frame = A2AFrame;
+    type Decoder<'id> = A2ADecoder<'id>;
 
-        // The request is on the wire by the time the transport hands back a
-        // stream, so its standing context has reached the remote whatever the
-        // stream goes on to yield.
-        self.record_sent_context(
-            outbound.conversation.as_ref(),
-            &outbound.context_fingerprints,
-        );
+    fn describe(&self) -> Descriptor<'_> {
+        Descriptor::new(PROVIDER).model(self.agent_name.as_str())
+    }
+    fn encode(&self, request: CompletionRequest, mode: Mode) -> Result<A2APayload, EncodeError> {
+        let outbound = self.build_request(request).map_err(EncodeError::request)?;
+        if mode == Mode::Streaming {
+            self.record_sent_context(
+                outbound.conversation.as_ref(),
+                &outbound.context_fingerprints,
+            );
+        }
+        Ok(A2APayload {
+            outbound,
+            client: self.inner.clone(),
+            mode,
+        })
+    }
+    fn decoder<'id>(&self) -> A2ADecoder<'id> {
+        A2ADecoder {
+            model: self.clone(),
+            text: None,
+            last: None,
+            unary: false,
+        }
+    }
+}
 
-        let threads = self.threads.clone();
-        let conversation = outbound.conversation;
-        let model = self.agent_name.clone();
+impl From<A2AModel> for rig_core::driver::DynModel<Completion> {
+    fn from(model: A2AModel) -> Self {
+        model.driver().erase()
+    }
+}
 
-        let stream: StreamingResult = Box::pin(async_stream_events(upstream, model, move |info| {
-            if let Some(conversation) = &conversation {
-                threads.record(conversation, info);
+#[doc(hidden)]
+pub struct A2ADecoder<'id> {
+    model: A2AModel,
+    text: Option<TextPart<'id>>,
+    last: Option<A2AThreadInfo>,
+    unary: bool,
+}
+
+impl<'id> A2ADecoder<'id> {
+    fn emit(&mut self, text: String, out: &mut Out<'id, Completion>) {
+        let part = self.text.get_or_insert_with(|| out.text());
+        out.push_text(part, &text);
+    }
+    fn finish(&mut self, out: Out<'id, Completion>, message_id: Option<String>) -> Flow {
+        out.end(Finish {
+            usage: Usage::default(),
+            reason: Some(self.last.as_ref().map_or(FinishReason::Stop, finish_reason)),
+            message_id,
+            response_id: self.last.as_ref().and_then(|i| i.task_id.clone()),
+            model: Some(self.model.agent_name.clone()),
+        })
+    }
+}
+
+impl<'id> Decoder<'id, Completion, A2AFrame> for A2ADecoder<'id> {
+    type Event = A2AFrame;
+    fn classify(&self, frame: A2AFrame) -> WireEvent<A2AFrame> {
+        WireEvent::Known(frame)
+    }
+    fn decode(
+        &mut self,
+        event: A2AFrame,
+        mut out: Out<'id, Completion>,
+    ) -> Result<Flow, ProviderError> {
+        match event {
+            A2AFrame::Unary(response, conversation, fingerprints) => {
+                self.unary = true;
+                let info = A2AThreadInfo::from_response(&response);
+                self.model.record(conversation.as_ref(), &info);
+                self.model
+                    .record_sent_context(conversation.as_ref(), &fingerprints);
+                self.last = Some(info);
+                let (text, id) = match &response {
+                    SendMessageResponse::Task(task) => {
+                        if let Some(error) = task_failure(&response) {
+                            return Err(error);
+                        }
+                        (
+                            task_text(
+                                &task.status.state,
+                                task_body_limited(task, DEFAULT_TEXT_LIMIT)?,
+                            )?,
+                            None,
+                        )
+                    }
+                    SendMessageResponse::Message(message) => {
+                        let body = message_body_limited(message, DEFAULT_TEXT_LIMIT)?;
+                        if body.is_empty() {
+                            return Err(ProviderError::Response(
+                                "remote A2A agent replied with a message carrying no text".into(),
+                            ));
+                        }
+                        (body, Some(message.message_id.clone()))
+                    }
+                };
+                self.emit(text, &mut out);
+                Ok(self.finish(out, id))
             }
-        }));
-
-        Ok(StreamingCompletionResponse::stream(PROVIDER, stream))
+            A2AFrame::Stream(event, conversation) => {
+                let (info, text) = stream_event(event, self.last.as_ref())?;
+                self.model.record(conversation.as_ref(), &info);
+                self.last = Some(info);
+                self.emit(text, &mut out);
+                Ok(Flow::More)
+            }
+        }
+    }
+    fn eof(&mut self, out: Out<'id, Completion>) -> Result<Flow, ProviderError> {
+        if self.unary {
+            return Err(ProviderError::Truncated);
+        }
+        Ok(self.finish(out, None))
     }
 }
 
@@ -457,144 +572,65 @@ impl CompletionModel for A2AModel {
 /// emitted when the upstream stream ends, carrying the finish reason implied by
 /// the last observed task state. A failure state ends the stream with an error
 /// rather than a terminal record, matching the non-streaming surface.
-fn async_stream_events(
-    upstream: futures::stream::BoxStream<'static, Result<a2a::StreamResponse, a2a::A2AError>>,
-    model: String,
-    mut record: impl FnMut(&A2AThreadInfo) + Send + 'static,
-) -> impl futures::Stream<Item = Result<RawStreamingChoice<StreamFinal>, CompletionError>> + Send {
-    async_stream::stream! {
-        let mut upstream = upstream;
-        let mut last: Option<A2AThreadInfo> = None;
-
-        while let Some(event) = upstream.next().await {
-            let event = match event {
-                Ok(event) => event,
-                Err(error) => {
-                    yield Err(CompletionError::from(A2AError::Protocol(error)));
-                    return;
-                }
-            };
-
-            match event {
-                a2a::StreamResponse::Task(task) => {
-                    let info = A2AThreadInfo::for_task(
-                        &task.context_id,
-                        &task.id,
-                        &task.status.state,
-                    );
-                    record(&info);
-                    last = Some(info);
-
-                    if let Some(error) = failure_for(&task.status.state, || {
-                        status_text_limited(&task, DEFAULT_TEXT_LIMIT)
-                    }) {
-                        yield Err(error);
-                        return;
-                    }
-                    match task_body_limited(&task, DEFAULT_TEXT_LIMIT) {
-                        Ok(text) if !text.is_empty() => {
-                            yield Ok(RawStreamingChoice::Message(text));
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            yield Err(CompletionError::from(error));
-                            return;
-                        }
-                    }
-                }
-                a2a::StreamResponse::Message(message) => {
-                    let info = A2AThreadInfo {
-                        context_id: message.context_id.clone(),
-                        task_id: message.task_id.clone(),
-                        state: None,
-                        resumable: false,
-                    };
-                    record(&info);
-                    last = Some(info);
-                    match message_body_limited(&message, DEFAULT_TEXT_LIMIT) {
-                        Ok(text) if !text.is_empty() => {
-                            yield Ok(RawStreamingChoice::Message(text));
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            yield Err(CompletionError::from(error));
-                            return;
-                        }
-                    }
-                }
-                a2a::StreamResponse::StatusUpdate(update) => {
-                    let info = A2AThreadInfo::for_task(
-                        &update.context_id,
-                        &update.task_id,
-                        &update.status.state,
-                    );
-                    record(&info);
-                    last = Some(info);
-
-                    // A status update's message is where many A2A agents put
-                    // their answer, so project it once and use it both to
-                    // explain a failure and as streamed text.
-                    let status = match update.status.message.as_ref() {
-                        Some(message) => match crate::parts::parts_to_text_limited(
-                            &message.parts,
-                            DEFAULT_TEXT_LIMIT,
-                            "stream status",
-                        ) {
-                            Ok(text) => text,
-                            Err(error) => {
-                                yield Err(CompletionError::from(error));
-                                return;
-                            }
-                        },
-                        None => String::new(),
-                    };
-
-                    if let Some(error) =
-                        failure_for(&update.status.state, || Ok(status.clone()))
-                    {
-                        yield Err(error);
-                        return;
-                    }
-                    if !status.is_empty() {
-                        yield Ok(RawStreamingChoice::Message(status));
-                    }
-                }
-                a2a::StreamResponse::ArtifactUpdate(update) => {
-                    // An artifact belongs to a task without reporting its state,
-                    // so it must not disturb the resumability the last status
-                    // update established — clearing a paused task's id here
-                    // would strand the conversation.
-                    let info = A2AThreadInfo {
-                        context_id: Some(update.context_id.clone()),
-                        task_id: Some(update.task_id.clone()),
-                        state: last.as_ref().and_then(|info| info.state.clone()),
-                        resumable: last.as_ref().is_some_and(|info| info.resumable),
-                    };
-                    record(&info);
-                    match crate::parts::parts_to_text_limited(
-                        &update.artifact.parts,
-                        DEFAULT_TEXT_LIMIT,
-                        "stream artifact",
-                    ) {
-                        Ok(text) if !text.is_empty() => {
-                            yield Ok(RawStreamingChoice::Message(text));
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            yield Err(CompletionError::from(error));
-                            return;
-                        }
-                    }
-                }
+fn stream_event(
+    event: a2a::StreamResponse,
+    last: Option<&A2AThreadInfo>,
+) -> Result<(A2AThreadInfo, String), ProviderError> {
+    let (info, text) = match event {
+        a2a::StreamResponse::Task(task) => {
+            if let Some(error) = failure_for(&task.status.state, || {
+                status_text_limited(&task, DEFAULT_TEXT_LIMIT)
+            }) {
+                return Err(error);
             }
+            (
+                A2AThreadInfo::for_task(&task.context_id, &task.id, &task.status.state),
+                task_body_limited(&task, DEFAULT_TEXT_LIMIT)?,
+            )
         }
-
-        let final_record = StreamFinal::new(PROVIDER, Usage::new())
-            .with_model(model)
-            .with_optional_response_id(last.as_ref().and_then(|info| info.task_id.clone()))
-            .with_finish_reason(last.as_ref().map_or(FinishReason::Stop, finish_reason));
-        yield Ok(RawStreamingChoice::FinalResponse(final_record));
-    }
+        a2a::StreamResponse::Message(message) => (
+            A2AThreadInfo {
+                context_id: message.context_id.clone(),
+                task_id: message.task_id.clone(),
+                state: None,
+                resumable: false,
+            },
+            message_body_limited(&message, DEFAULT_TEXT_LIMIT)?,
+        ),
+        a2a::StreamResponse::StatusUpdate(update) => {
+            let text = update.status.message.as_ref().map_or_else(
+                || Ok(String::new()),
+                |m| {
+                    crate::parts::parts_to_text_limited(
+                        &m.parts,
+                        DEFAULT_TEXT_LIMIT,
+                        "stream status",
+                    )
+                },
+            )?;
+            if let Some(error) = failure_for(&update.status.state, || Ok(text.clone())) {
+                return Err(error);
+            }
+            (
+                A2AThreadInfo::for_task(&update.context_id, &update.task_id, &update.status.state),
+                text,
+            )
+        }
+        a2a::StreamResponse::ArtifactUpdate(update) => (
+            A2AThreadInfo {
+                context_id: Some(update.context_id.clone()),
+                task_id: Some(update.task_id.clone()),
+                state: last.and_then(|i| i.state.clone()),
+                resumable: last.is_some_and(|i| i.resumable),
+            },
+            crate::parts::parts_to_text_limited(
+                &update.artifact.parts,
+                DEFAULT_TEXT_LIMIT,
+                "stream artifact",
+            )?,
+        ),
+    };
+    Ok((info, text))
 }
 
 /// Refuse request fields whose absence would silently change the result.
@@ -723,21 +759,17 @@ fn log_dropped_content(kind: &'static str) {
     );
 }
 
-fn text_choice(text: String) -> Vec<AssistantContent> {
-    vec![AssistantContent::text(text)]
-}
-
 /// A task's assistant text, or the error a content-free reply deserves.
 ///
 /// Rig's providers normalize a *legitimate* empty turn to empty text — the
 /// Anthropic provider does this for a documented empty `end_turn` — and report
-/// any other content-free response as a [`CompletionError::ResponseError`].
+/// any other content-free response as a [`ProviderError::Response`].
 /// A2A's legitimate empty turn is a completed task with no artifacts and no
 /// closing status message: a task whose result was an action rather than text.
 /// Any other state answering with nothing has neither produced a result nor
 /// finished, so the caller has nothing to act on and is told so.
 ///
-fn task_text(state: &a2a::TaskState, body: String) -> Result<String, CompletionError> {
+fn task_text(state: &a2a::TaskState, body: String) -> Result<String, ProviderError> {
     if !body.is_empty() {
         return Ok(body);
     }
@@ -748,7 +780,7 @@ fn task_text(state: &a2a::TaskState, body: String) -> Result<String, CompletionE
         );
         return Ok(body);
     }
-    Err(CompletionError::ResponseError(format!(
+    Err(ProviderError::Response(format!(
         "remote A2A agent returned no content and its task is {}",
         state_label(state)
     )))
@@ -763,7 +795,7 @@ fn finish_reason(info: &A2AThreadInfo) -> FinishReason {
     }
 }
 
-fn task_failure(response: &SendMessageResponse) -> Option<CompletionError> {
+fn task_failure(response: &SendMessageResponse) -> Option<ProviderError> {
     let SendMessageResponse::Task(task) = response else {
         return None;
     };
@@ -779,7 +811,7 @@ fn task_failure(response: &SendMessageResponse) -> Option<CompletionError> {
 fn failure_for(
     state: &a2a::TaskState,
     status: impl FnOnce() -> Result<String, A2AError>,
-) -> Option<CompletionError> {
+) -> Option<ProviderError> {
     use a2a::TaskState::{AuthRequired, Canceled, Failed, Rejected};
     if !matches!(state, Failed | Rejected | Canceled | AuthRequired) {
         return None;
@@ -791,24 +823,19 @@ fn failure_for(
             } else {
                 text
             };
-            CompletionError::ProviderError(format!(
-                "remote A2A agent {}: {text}",
-                state_label(state)
-            ))
+            ProviderError::Provider(format!("remote A2A agent {}: {text}", state_label(state)))
         }
-        Err(error) => CompletionError::from(error),
+        Err(error) => ProviderError::from(error),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rig_core::completion::CompletionRequestBuilder;
 
     fn request() -> CompletionRequest {
         CompletionRequest {
             model: None,
-            preamble: None,
             chat_history: vec![RigMessage::user("hello")],
             documents: vec![],
             tools: vec![],
@@ -974,14 +1001,5 @@ mod tests {
         }
         assert!(failure_for(&a2a::TaskState::Completed, || Ok(String::new())).is_none());
         assert!(failure_for(&a2a::TaskState::InputRequired, || Ok(String::new())).is_none());
-    }
-
-    /// `completion_request` gates on `Self: Clone`, and agent construction
-    /// erases through `CompletionModel + 'static`; keep both paths compiling.
-    #[allow(dead_code)]
-    fn model_satisfies_the_rig_model_bounds(model: A2AModel) -> CompletionRequestBuilder<A2AModel> {
-        fn erasable<M: CompletionModel + 'static>(_: &M) {}
-        erasable(&model);
-        model.completion_request("hi")
     }
 }

@@ -1,6 +1,6 @@
 //! Back a Rig agent with a remote A2A agent instead of an LLM provider.
 //!
-//! [`A2AModel`](rig_a2a::A2AModel) implements `CompletionModel` over A2A's
+//! [`A2AModel`](rig_a2a::A2AModel) implements Rig's model wire over A2A's
 //! `message/send` and `message/stream`, so `A2AClient::agent` returns an
 //! ordinary Rig [`Agent`]: it prompts, it streams, and it composes as a
 //! sub-agent tool on an orchestrator.
@@ -19,10 +19,8 @@
 use futures::StreamExt;
 use rig_a2a::{A2AClient, A2AConversationExt};
 use rig_agent::agent::AgentBuilder;
-use rig_agent::completion::Prompt;
 use rig_agent::test_utils::{MockCompletionModel, MockTurn};
-use rig_core::completion::CompletionModel;
-use rig_core::streaming::StreamedAssistantContent;
+use rig_core::streaming::{Item, StreamEvent};
 
 #[path = "./fixtures/lib.rs"]
 mod fixture;
@@ -59,15 +57,12 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Stream directly from the A2A completion model.
-    let request = remote
-        .model()
-        .completion_request("Stream me a reply.")
-        .build();
-    let mut stream = remote.model().stream(request).await?;
+    let request = rig_core::completion::CompletionRequest::new("Stream me a reply.");
+    let mut stream = remote.model().stream(request)?;
     print!("streamed: ");
     while let Some(chunk) = stream.next().await {
-        if let StreamedAssistantContent::Text(delta) = chunk? {
-            print!("{}", delta.text);
+        if let Item::Event(StreamEvent::Text { text, .. }) = chunk? {
+            print!("{text}");
         }
     }
     println!("\n");
@@ -75,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
     // Composition: an A2A-backed agent is an ordinary agent, so the sub-agent
     // bridge applies. Here a local orchestrator delegates to it.
     let researcher = remote.agent().a2a_conversation("research").build();
-    let model = MockCompletionModel::new([
+    let model = MockCompletionModel::from_turns([
         MockTurn::tool_call(
             "call_1",
             "librarian",
@@ -98,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
     // A2A hides the remote's tools by design, so a remote agent never returns a
     // tool call. Registering local tools would advertise tools that can never
     // be invoked, so the request is refused instead.
-    let mut with_tools = remote.model().completion_request("hi").build();
+    let mut with_tools = rig_core::completion::CompletionRequest::new("hi");
     with_tools.tools.push(rig_core::completion::ToolDefinition {
         name: "add".to_string(),
         description: "adds two numbers".to_string(),

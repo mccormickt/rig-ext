@@ -34,9 +34,8 @@ where
     F: Fn(OrchestrationContext, String) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, String>> + Send + 'static,
 {
-    let model = MockCompletionModel::new([
-        MockTurn::tool_call("rig-id", "child", serde_json::json!({"value":7}))
-            .with_call_id("provider-id"),
+    let model = MockCompletionModel::from_turns([
+        MockTurn::tool_call("provider-id", "child", serde_json::json!({"value":7})),
         MockTurn::text("done"),
     ]);
     let mut catalog = ToolCatalog::default();
@@ -86,7 +85,6 @@ async fn json_output_and_correlations_reach_the_model() {
     let request = serde_json::to_value(&model.requests()[1])
         .unwrap()
         .to_string();
-    assert!(request.contains("rig-id"));
     assert!(request.contains("provider-id"));
     assert!(request.contains("answer"));
 }

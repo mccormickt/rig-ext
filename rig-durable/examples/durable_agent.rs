@@ -1,8 +1,7 @@
 use std::convert::Infallible;
 
 use rig::{
-    client::{CompletionClient, ProviderClient},
-    providers::openai,
+    providers::openai::{self, OpenAI},
     tool::{Tool, ToolContext},
 };
 use rig_durable::{AgentOrchestrator, DurableAgent};
@@ -42,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let model = openai::Client::from_env()?.completion_model(openai::GPT_4O_MINI);
+    let model = OpenAI::from_env()?.completion(openai::GPT_4O_MINI);
     let definition = DurableAgent::builder("calculator", model)
         .preamble("Use the calculator tool for arithmetic.")
         .tool(Add)

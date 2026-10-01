@@ -13,8 +13,10 @@ use duroxide::{
     },
 };
 use rig::{
+    DynModel,
     agent::PromptResponse,
-    completion::{CompletionModel, Message, ToolDefinition},
+    completion::{Message, ToolDefinition},
+    operation::Completion,
     tool::{Tool, ToolSet},
 };
 use semver::Version;
@@ -125,14 +127,11 @@ impl AgentDefinition {
     }
 }
 
-pub struct DurableAgentBuilder<M>
-where
-    M: CompletionModel + Send + Sync + 'static,
-{
+pub struct DurableAgentBuilder {
     name: String,
     version: Version,
     description: Option<String>,
-    model: M,
+    model: DynModel<Completion>,
     tools: ToolSet,
     tool_options: HashMap<String, ToolOptions>,
     routed_tools: ToolCatalog,
@@ -140,11 +139,8 @@ where
     config: DurableAgentConfig,
 }
 
-impl<M> DurableAgentBuilder<M>
-where
-    M: CompletionModel + Send + Sync + 'static,
-{
-    fn new(name: impl Into<String>, model: M) -> Self {
+impl DurableAgentBuilder {
+    fn new(name: impl Into<String>, model: DynModel<Completion>) -> Self {
         Self {
             name: name.into(),
             version: Version::parse(DEFAULT_VERSION).expect("default version is valid semver"),
@@ -274,7 +270,7 @@ where
     }
 
     pub fn build(mut self) -> Result<AgentDefinition, AgentOrchestratorError> {
-        for definition in self.tools.get_tool_definitions() {
+        for definition in self.tools.tool_definitions() {
             if self.routed_tools.get(&definition.name).is_some() {
                 return Err(AgentOrchestratorError::DuplicateTool(definition.name));
             }
@@ -520,11 +516,11 @@ pub struct DurableAgent {
 }
 
 impl DurableAgent {
-    pub fn builder<M>(name: impl Into<String>, model: M) -> DurableAgentBuilder<M>
-    where
-        M: CompletionModel + Send + Sync + 'static,
-    {
-        DurableAgentBuilder::new(name, model)
+    pub fn builder(
+        name: impl Into<String>,
+        model: impl Into<DynModel<Completion>>,
+    ) -> DurableAgentBuilder {
+        DurableAgentBuilder::new(name, model.into())
     }
 
     pub fn name(&self) -> &str {

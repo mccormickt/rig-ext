@@ -1,6 +1,6 @@
 //! Error types for `rig-a2a` operations.
 
-use rig_core::completion::CompletionError;
+use rig_core::error::ProviderError;
 
 /// Errors that occur while resolving or validating a remote
 /// [`AgentCard`](a2a::AgentCard).
@@ -103,7 +103,7 @@ pub enum A2AError {
     Url(#[from] url::ParseError),
 }
 
-impl From<A2AError> for CompletionError {
+impl From<A2AError> for ProviderError {
     fn from(err: A2AError) -> Self {
         match err {
             // A request Rig built but A2A cannot express is a request-side
@@ -112,8 +112,8 @@ impl From<A2AError> for CompletionError {
             | A2AError::EmptyRequest
             | A2AError::InvalidThreadParams { .. }
             | A2AError::InvalidContextId
-            | A2AError::InvalidTaskId) => CompletionError::RequestError(Box::new(err)),
-            err => CompletionError::ProviderError(err.to_string()),
+            | A2AError::InvalidTaskId) => ProviderError::request(err),
+            err => ProviderError::Provider(err.to_string()),
         }
     }
 }

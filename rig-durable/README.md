@@ -138,7 +138,7 @@ handle.signal(
 
 ## Duroxide
 
-Drive Rig 0.42's serializable `AgentRun` state machine inside a Duroxide 0.1
+Drive Rig 0.43's serializable `AgentRun` state machine inside a Duroxide 0.1
 orchestration. The orchestration performs no provider or tool I/O; all such work
 is registered as activities.
 
@@ -198,7 +198,7 @@ and reconnection; for one scoped ID, the first submitted input wins. The provide
 client, raw registry merge methods, `ToolCatalog`, and route constructors remain
 available for advanced integration with existing Duroxide applications.
 
-Rig 0.42 does not expose enough state to convert an already-built `rig::Agent`.
+Rig 0.43 does not expose enough state to convert an already-built `rig::Agent`.
 The durable builder therefore captures the model and tools before Rig makes
 them private. It currently covers preambles, completion settings, history,
 tools, tool choice, maximum turns, streaming, approvals, checkpoints, and child
@@ -225,13 +225,14 @@ with the number of turns.
 
 `CompletionMode::Streaming` selects a separate stable streaming activity;
 blocking completion remains the compatibility default. The activity consumes
-`CompletionModel::stream` to EOF and returns a provider-neutral, serde-tagged
-transcript. Orchestration deterministically replays it through Rig 0.42's
-`StreamedTurnAssembler` and `AgentRun::streamed_turn`. The transcript preserves
-text, reasoning, complete and delta tool calls, internal and provider IDs,
-unknown items, final usage, message ID, and Rig's final aggregate. Invalid tools
-fail closed, malformed deltas fail, absent usage uses Rig's zero sentinel, and
-a streamed completion counts as one checkpoint operation.
+the model's `stream` to EOF and returns a provider-neutral, serde-tagged
+transcript. The transcript records each Rig 0.43 part event (start, text,
+reasoning, arguments, end, and unknown items) and ends with the
+`CompletionResponse` that Rig folds from the stream. Orchestration applies that
+response deterministically through `AgentRun::streamed_turn`. Calls to tools
+that are not registered or not allowed by `ToolChoice` fail closed. Rig drops a
+streamed call that never receives a name. A streamed completion counts as one
+checkpoint operation.
 
 Duroxide 0.1.30 activities return one final result. Tokens become durably
 visible to orchestration only after the model activity completes; this does not

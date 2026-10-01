@@ -13,8 +13,8 @@ host-side.
 ```toml
 [dependencies]
 rig-a2a = "0.1"
-rig-agent = "0.42"
-rig-core = "0.42"
+rig-agent = "0.43"
+rig-core = "0.43"
 ```
 
 The default feature uses Rustls. To use native TLS instead:
@@ -55,20 +55,19 @@ model or agent should bind its remote thread for its whole lifetime.
 
 ```rust,no_run
 use rig_a2a::{A2AClient, A2AConversationExt};
-use rig_agent::client::AgentClientExt;
-use rig_core::{client::ProviderClient, providers::openai};
+use rig_agent::agent::AgentBuilder;
+use rig_core::providers::openai::{self, OpenAI};
 
 # async fn run() -> anyhow::Result<()> {
 let remote = A2AClient::from_url("http://localhost:8080").await?;
-let openai = openai::Client::from_env()?;
+let openai = OpenAI::from_env()?;
 
 let remote_tool = remote
     .agent()
     .a2a_conversation("project-42")
     .build()
     .into_tool();
-let agent = openai
-    .agent(openai::GPT_4O_MINI)
+let agent = AgentBuilder::new(openai.completion(openai::GPT_4O_MINI))
     .dynamic_tool(remote_tool)
     .build();
 # let _ = agent;
@@ -81,7 +80,7 @@ agent, and Rig's `Agent::into_tool` performs the standard sub-agent conversion.
 Use `a2a_conversation` on the agent builder before conversion when repeated
 calls must continue one remote A2A thread.
 
-Rig 0.42 does not expose a run's conversation ID to completion hooks and does
+Rig 0.43 does not expose a run's conversation ID to completion hooks and does
 not copy it from an outer agent into a sub-agent run. Therefore, a converted
 sub-agent cannot infer the outer conversation automatically. Bind the
 conversation when constructing the sub-agent, or create one orchestrator tool

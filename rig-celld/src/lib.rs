@@ -22,6 +22,6 @@ pub use vector::VectorError;
 
 #[cfg(feature = "sqlite-vec")]
 pub use vector_store::{
-    MAX_DIMENSIONS, MAX_EMBEDDINGS_PER_DOCUMENT, MAX_GENERATION, MAX_LIST_LIMIT, SCHEMA_VERSION,
-    SqliteVecError, SqliteVecIndex,
+    EmbedText, MAX_DIMENSIONS, MAX_EMBEDDINGS_PER_DOCUMENT, MAX_GENERATION, MAX_LIST_LIMIT,
+    SCHEMA_VERSION, SqliteVecError, SqliteVecIndex,
 };
