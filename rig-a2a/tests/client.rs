@@ -1151,6 +1151,139 @@ async fn artifact_after_a_pause_keeps_the_resumable_task_id() {
     server.abort();
 }
 
+/// The leading system message is standing context. It goes out once, not a
+/// second time as rendered history.
+#[tokio::test]
+async fn system_instructions_are_sent_once() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let (addr, recorded, server) =
+        serve_stub("preamble", &["chat"], StubReply::CompletedText("ok".into())).await;
+    let remote = A2AClient::from_url(format!("http://{addr}"))
+        .await
+        .expect("client should fetch card");
+
+    for model in [remote.model(), remote.model_for_conversation("user-42")] {
+        let mut turn = text_request("hello");
+        turn.chat_history
+            .insert(0, rig_core::message::Message::system("You are terse."));
+        model.completion(turn).await.expect("completion succeeds");
+    }
+
+    for turn in 0..2 {
+        let texts = recorded_texts(&recorded, turn);
+        let copies = texts
+            .iter()
+            .filter(|text| text.contains("You are terse."))
+            .count();
+        assert_eq!(copies, 1, "turn {turn}: {texts:?}");
+        assert!(texts.iter().any(|text| text.contains("hello")), "{texts:?}");
+    }
+
+    server.abort();
+}
+
+/// Opening a stream sends nothing until it is polled. A stream dropped before
+/// that never reached the remote, so its standing context must go out again.
+#[tokio::test]
+async fn an_unpolled_stream_does_not_mark_context_delivered() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let (addr, recorded, server) =
+        serve_stub("lazy", &["chat"], StubReply::CompletedText("ok".into())).await;
+    let remote = A2AClient::from_url(format!("http://{addr}"))
+        .await
+        .expect("client should fetch card");
+    let model = remote.model_for_conversation("user-42");
+
+    model
+        .completion(text_request("turn 1"))
+        .await
+        .expect("turn 1 should succeed");
+
+    let mut turn = text_request("turn 2");
+    turn.documents = vec![document("retrieved", "freshly retrieved passage")];
+    drop(model.stream(turn.clone()).expect("stream should open"));
+    model.completion(turn).await.expect("turn 2 should succeed");
+
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+    let second = recorded_texts(&recorded, 1);
+    assert!(
+        second
+            .iter()
+            .any(|text| text.contains("freshly retrieved passage")),
+        "the dropped stream never delivered the document: {second:?}"
+    );
+
+    server.abort();
+}
+
+/// A streamed terminal failure still carries the remote's identifiers. The
+/// conversation keeps its context, and the failed task is not resumed.
+#[tokio::test]
+async fn a_streamed_failure_after_a_pause_keeps_context_and_drops_the_task() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let (addr, recorded, server) = serve_script(
+        "failer",
+        &["ask"],
+        [
+            StubReply::InputRequired {
+                prompt: "which file?".to_string(),
+            },
+            StubReply::failed("quota exceeded"),
+            StubReply::CompletedText("done".into()),
+        ],
+        StubBinding::JsonRpc,
+    )
+    .await;
+    let remote = A2AClient::from_url(format!("http://{addr}"))
+        .await
+        .expect("client should fetch card");
+    let model = remote.model_for_conversation("user-42");
+
+    model
+        .completion(text_request("turn 1"))
+        .await
+        .expect("turn 1 pauses for input");
+
+    let mut stream = model
+        .stream(text_request("README.md"))
+        .expect("stream should open");
+    let mut failed = false;
+    while let Some(chunk) = stream.next().await {
+        if chunk.is_err() {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed, "the failed task must end the stream with an error");
+
+    model
+        .completion(text_request("turn 3"))
+        .await
+        .expect("turn 3 should succeed");
+
+    let messages = recorded.lock().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert!(
+        messages[1].message.task_id.is_some(),
+        "turn 2 resumes the paused task"
+    );
+    assert!(messages[1].message.context_id.is_some());
+    assert_eq!(
+        messages[2].message.context_id, messages[1].message.context_id,
+        "the conversation keeps its context"
+    );
+    assert!(
+        messages[2].message.task_id.is_none(),
+        "the failed task must not be resumed"
+    );
+    drop(messages);
+
+    server.abort();
+}
+
 #[tokio::test]
 async fn a2a_backed_agent_becomes_a_sub_agent_tool() {
     let _ = tracing_subscriber::fmt::try_init();

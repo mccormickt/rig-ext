@@ -24,8 +24,8 @@
 //! | `additional_params` | Reads only the [`THREAD_PARAMS_KEY`] threading block; ignores other fields (logged at debug). |
 //! | `temperature`, `max_tokens`, `model` | Ignored (logged at debug). Sampling belongs to the remote agent. |
 //!
-//! `usage` is reported as zero, which is Rig's documented sentinel for "the
-//! provider supplied no metrics" — A2A has no token accounting.
+//! `usage` reports every counter as absent (`None`): A2A has no token
+//! accounting.
 //!
 //! # Conversation threading
 //!
@@ -218,14 +218,17 @@ impl A2AModel {
             parts.push(Part::text(text));
         };
 
-        if let Some(preamble) = request.system_instructions() {
-            push_standing_context(preamble.to_owned());
+        // The leading system message is the preamble. It is standing context,
+        // so it is removed from the history that is rendered below.
+        let mut history = request.chat_history.into_iter().collect::<Vec<_>>();
+        if let Some(RigMessage::System { content }) = history.first() {
+            push_standing_context(content.clone());
+            history.remove(0);
         }
         for document in &request.documents {
             push_standing_context(document.to_string());
         }
 
-        let history = request.chat_history.into_iter().collect::<Vec<_>>();
         let messages: &[RigMessage] = if threaded {
             history.last().map(std::slice::from_ref).unwrap_or_default()
         } else {
@@ -395,6 +398,7 @@ fn fingerprint(text: &str) -> u64 {
 pub struct A2APayload {
     outbound: Outbound,
     client: Arc<InnerClient<Box<dyn Transport>>>,
+    threads: ThreadStore,
     mode: Mode,
 }
 
@@ -431,6 +435,14 @@ impl rig_core::driver::Transport<A2AModel> for A2ATransport {
                         .send_streaming_message(&payload.outbound.request)
                         .await
                         .map_err(|e| ProviderError::from(A2AError::Protocol(e)))?;
+                    // The remote accepted the request, so it holds the
+                    // standing context this request carried.
+                    if let Some(conversation) = &conversation {
+                        payload.threads.record_sent_context(
+                            conversation,
+                            &payload.outbound.context_fingerprints,
+                        );
+                    }
                     Ok(Opened::new(upstream.map(move |event| {
                         event
                             .map(|event| A2AFrame::Stream(event, conversation.clone()))
@@ -453,15 +465,10 @@ impl Wire for A2AModel {
     }
     fn encode(&self, request: CompletionRequest, mode: Mode) -> Result<A2APayload, EncodeError> {
         let outbound = self.build_request(request).map_err(EncodeError::request)?;
-        if mode == Mode::Streaming {
-            self.record_sent_context(
-                outbound.conversation.as_ref(),
-                &outbound.context_fingerprints,
-            );
-        }
         Ok(A2APayload {
             outbound,
             client: self.inner.clone(),
+            threads: self.threads.clone(),
             mode,
         })
     }
@@ -550,10 +557,16 @@ impl<'id> Decoder<'id, Completion, A2AFrame> for A2ADecoder<'id> {
                 Ok(self.finish(out, id))
             }
             A2AFrame::Stream(event, conversation) => {
-                let (info, text) = stream_event(event, self.last.as_ref())?;
+                // Record the remote's identifiers before the event can fail,
+                // so a failed or oversized event still updates the
+                // conversation.
+                let info = stream_info(&event, self.last.as_ref());
                 self.model.record(conversation.as_ref(), &info);
                 self.last = Some(info);
-                self.emit(text, &mut out);
+                let text = stream_text(event)?;
+                if !text.is_empty() {
+                    self.emit(text, &mut out);
+                }
                 Ok(Flow::More)
             }
         }
@@ -566,38 +579,56 @@ impl<'id> Decoder<'id, Completion, A2AFrame> for A2ADecoder<'id> {
     }
 }
 
-/// Translate an A2A event stream into Rig streaming events.
+/// The conversation identifiers an A2A stream event carries.
+///
+/// An artifact update reports no task state, so it keeps the state and
+/// resumability of the last event. Clearing a paused task's id here would
+/// strand the conversation.
+fn stream_info(event: &a2a::StreamResponse, last: Option<&A2AThreadInfo>) -> A2AThreadInfo {
+    match event {
+        a2a::StreamResponse::Task(task) => {
+            A2AThreadInfo::for_task(&task.context_id, &task.id, &task.status.state)
+        }
+        a2a::StreamResponse::Message(message) => A2AThreadInfo {
+            context_id: message.context_id.clone(),
+            task_id: message.task_id.clone(),
+            state: None,
+            resumable: false,
+        },
+        a2a::StreamResponse::StatusUpdate(update) => {
+            A2AThreadInfo::for_task(&update.context_id, &update.task_id, &update.status.state)
+        }
+        a2a::StreamResponse::ArtifactUpdate(update) => A2AThreadInfo {
+            context_id: Some(update.context_id.clone()),
+            task_id: Some(update.task_id.clone()),
+            state: last.and_then(|i| i.state.clone()),
+            resumable: last.is_some_and(|i| i.resumable),
+        },
+    }
+}
+
+/// The text an A2A stream event carries.
 ///
 /// Text arrives as artifact deltas and status messages; the terminal record is
 /// emitted when the upstream stream ends, carrying the finish reason implied by
 /// the last observed task state. A failure state ends the stream with an error
 /// rather than a terminal record, matching the non-streaming surface.
-fn stream_event(
-    event: a2a::StreamResponse,
-    last: Option<&A2AThreadInfo>,
-) -> Result<(A2AThreadInfo, String), ProviderError> {
-    let (info, text) = match event {
+fn stream_text(event: a2a::StreamResponse) -> Result<String, ProviderError> {
+    match event {
         a2a::StreamResponse::Task(task) => {
             if let Some(error) = failure_for(&task.status.state, || {
                 status_text_limited(&task, DEFAULT_TEXT_LIMIT)
             }) {
                 return Err(error);
             }
-            (
-                A2AThreadInfo::for_task(&task.context_id, &task.id, &task.status.state),
-                task_body_limited(&task, DEFAULT_TEXT_LIMIT)?,
-            )
+            Ok(task_body_limited(&task, DEFAULT_TEXT_LIMIT)?)
         }
-        a2a::StreamResponse::Message(message) => (
-            A2AThreadInfo {
-                context_id: message.context_id.clone(),
-                task_id: message.task_id.clone(),
-                state: None,
-                resumable: false,
-            },
-            message_body_limited(&message, DEFAULT_TEXT_LIMIT)?,
-        ),
+        a2a::StreamResponse::Message(message) => {
+            Ok(message_body_limited(&message, DEFAULT_TEXT_LIMIT)?)
+        }
         a2a::StreamResponse::StatusUpdate(update) => {
+            // A status update's message is where many A2A agents put their
+            // answer, so it both explains a failure and streams as text.
             let text = update.status.message.as_ref().map_or_else(
                 || Ok(String::new()),
                 |m| {
@@ -611,26 +642,14 @@ fn stream_event(
             if let Some(error) = failure_for(&update.status.state, || Ok(text.clone())) {
                 return Err(error);
             }
-            (
-                A2AThreadInfo::for_task(&update.context_id, &update.task_id, &update.status.state),
-                text,
-            )
+            Ok(text)
         }
-        a2a::StreamResponse::ArtifactUpdate(update) => (
-            A2AThreadInfo {
-                context_id: Some(update.context_id.clone()),
-                task_id: Some(update.task_id.clone()),
-                state: last.and_then(|i| i.state.clone()),
-                resumable: last.is_some_and(|i| i.resumable),
-            },
-            crate::parts::parts_to_text_limited(
-                &update.artifact.parts,
-                DEFAULT_TEXT_LIMIT,
-                "stream artifact",
-            )?,
-        ),
-    };
-    Ok((info, text))
+        a2a::StreamResponse::ArtifactUpdate(update) => Ok(crate::parts::parts_to_text_limited(
+            &update.artifact.parts,
+            DEFAULT_TEXT_LIMIT,
+            "stream artifact",
+        )?),
+    }
 }
 
 /// Refuse request fields whose absence would silently change the result.
