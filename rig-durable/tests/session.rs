@@ -678,7 +678,7 @@ async fn single_run_exposes_ordered_dispositions_with_equal_content() {
     assert_eq!(detailed.output(), "done");
     assert_eq!(detailed.response.output, plain.output);
     assert_dispositions(&detailed.tool_outcomes);
-    assert_eq!(run.tool_outcomes().await.unwrap().tool_outcomes.len(), 3);
+    assert_dispositions(&run.result_detailed().await.unwrap().tool_outcomes);
 
     // Every tool result the model saw carried the same words.
     let last = model.requests().last().unwrap().chat_history.clone();

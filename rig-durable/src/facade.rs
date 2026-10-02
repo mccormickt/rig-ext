@@ -818,11 +818,6 @@ impl DurableRun {
         self.wait_detailed_timeout(Duration::ZERO).await
     }
 
-    /// Compatibility alias for [`Self::result_detailed`].
-    pub async fn tool_outcomes(&self) -> Result<DurableResponse, AgentOrchestratorError> {
-        self.result_detailed().await
-    }
-
     pub async fn next_approval(&self) -> Result<ApprovalRequest, AgentOrchestratorError> {
         let deadline = tokio::time::Instant::now() + DEFAULT_WAIT_TIMEOUT;
         loop {

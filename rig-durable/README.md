@@ -11,30 +11,10 @@
 Use only Temporal with `default-features = false, features = ["temporal"]`.
 Use both backends with `features = ["temporal"]`.
 
-## 0.2 source migration
-
-This is a **breaking Rust API release**, not an additive 0.1 update. Persisted
-Legacy activity payloads and names remain supported. Rig's `PromptResponse`
-and the ordinary prompt and wait return types do not change.
-
-- Replace `activities::tool::execute` with `ToolExecutor::new(Arc::new(tools))`
-  and its `execute` method. Supply registered policies and a shared guard when
-  required.
-- Use builders or `..Default::default()` where available. Public input,
-  configuration, tool, and continuation struct literals need the new policy,
-  snapshot, result, and compaction fields.
-- Handle `TemporalAgentError` from `TemporalAgent::register`, including policy
-  validation failures, rather than only `WorkflowRegistrationError`.
-- `DurableResponse::fit_within` returns `None` if the response cannot fit.
-  Compaction requests and application require the expected policy version.
-- Prefer `DurableRun::result_detailed` for a completed detailed response.
-  `tool_outcomes` remains a compatibility alias. Temporal queries named
-  `tool_outcomes` return only the outcome vector.
-
-The unreleased Logical contract and compaction payloads are not upgrade
-contracts for live histories from development snapshots. Drain those histories
-with their original workers. Keep Legacy workflow/orchestration versions
-registered for supported recorded histories.
+This crate is unreleased and remains at version `0.1.0`. Its Rust API can change
+before release. Legacy recorded-history replay is tested separately from Rust
+source compatibility. Keep the required workflow and orchestration versions
+registered while their recorded histories remain live.
 
 ## Temporal
 
