@@ -9,6 +9,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+futures = "0.3"
 rig-core.workspace = true
 rig-celld = { path = "../..", features = ["sqlite-vec"] }
 serde.workspace = true

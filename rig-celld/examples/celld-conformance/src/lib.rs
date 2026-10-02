@@ -1,17 +1,18 @@
 use rig_celld::{
-    BackendKind, BackendMaturity, EmbedText, MemoryBackend, MemoryRecord, SearchKind,
+    BackendKind, BackendMaturity, CellStorage, EmbedText, MemoryBackend, MemoryRecord, SearchKind,
     SqliteVecIndex, StoredMemory, TieBreak, ZeroVectorPolicy,
 };
 use rig_core::{
     embeddings::Embedding,
     error::ProviderError,
-    vector_store::{VectorSearchRequest, VectorStoreIndex, request::Filter},
+    vector_store::{InsertDocuments, VectorSearchRequest, VectorStoreIndex, request::Filter},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use worker::*;
 
 const TABLE: &str = "conformance_vectors";
+const RACE_TABLE: &str = "conformance_race_vectors";
 const CONCURRENT_ID: &str = "concurrent";
 
 #[derive(Clone, Debug)]
@@ -23,6 +24,10 @@ impl EmbedText for FixtureEmbeddingModel {
     }
 
     async fn embed_text(&self, text: &str) -> std::result::Result<Embedding, ProviderError> {
+        if text.contains("slow") {
+            // Lets another write run while a search waits for its embedding.
+            send::SendFuture::new(Delay::from(std::time::Duration::from_millis(50))).await;
+        }
         let vector = if text.contains("alpha") {
             vec![1.0, 0.0]
         } else if text.contains("beta") {
@@ -43,12 +48,14 @@ impl EmbedText for FixtureEmbeddingModel {
 
 #[durable_object(fetch)]
 pub struct ConformanceCell {
-    state: State,
+    storage: CellStorage,
 }
 
 impl DurableObject for ConformanceCell {
     fn new(state: State, _env: Env) -> Self {
-        Self { state }
+        Self {
+            storage: state.into(),
+        }
     }
 
     async fn fetch(&self, mut request: Request) -> Result<Response> {
@@ -70,18 +77,13 @@ impl DurableObject for ConformanceCell {
 
 impl ConformanceCell {
     fn index(&self) -> Result<SqliteVecIndex<FixtureEmbeddingModel>> {
-        SqliteVecIndex::named(
-            self.state.storage().sql(),
-            FixtureEmbeddingModel,
-            TABLE,
-            "id",
-        )
-        .map_err(worker_error)
+        SqliteVecIndex::named(self.storage.clone(), FixtureEmbeddingModel, TABLE, "id")
+            .map_err(worker_error)
     }
 
     async fn run_suite(&self) -> Result<Response> {
         let index = self.index()?;
-        let sql = self.state.storage().sql();
+        let sql = self.storage.sql();
         sql.exec(
             "DROP TRIGGER IF EXISTS conformance_vectors_test_abort",
             None,
@@ -192,6 +194,9 @@ impl ConformanceCell {
         )?;
 
         self.verify_atomic_catalog_rollback(&index).await?;
+        self.verify_nested_transactions(&index)?;
+        verify_atomic_batch(&index).await?;
+        self.verify_search_after_concurrent_write().await?;
 
         sql.exec(
             "INSERT INTO conformance_vectors(embedding, id, generation, embedding_index) \
@@ -236,8 +241,13 @@ impl ConformanceCell {
             None,
         )?;
         ensure(
-            SqliteVecIndex::named(sql.clone(), FixtureEmbeddingModel, "legacy_vectors", "id")
-                .is_err(),
+            SqliteVecIndex::named(
+                self.storage.clone(),
+                FixtureEmbeddingModel,
+                "legacy_vectors",
+                "id",
+            )
+            .is_err(),
             "legacy schema requires explicit migration",
         )?;
 
@@ -252,7 +262,7 @@ impl ConformanceCell {
         &self,
         index: &SqliteVecIndex<FixtureEmbeddingModel>,
     ) -> Result<()> {
-        let sql = self.state.storage().sql();
+        let sql = self.storage.sql();
         upsert(index, "atomic", "alpha before switch").await?;
         sql.exec(
             "INSERT INTO conformance_vectors(embedding, id, generation, embedding_index) \
@@ -264,6 +274,8 @@ impl ConformanceCell {
                 0_i64.into(),
             ],
         )?;
+        let orphan = atomic_orphans(&sql)?;
+        ensure(orphan.len() == 1, "failed generation fixture")?;
         sql.exec("DROP TRIGGER conformance_vectors_catalog_update_gc", None)?;
         sql.exec(
             "CREATE TRIGGER conformance_vectors_test_abort \
@@ -284,6 +296,10 @@ impl ConformanceCell {
             ],
         );
         ensure(failed_switch.is_err(), "forced catalog switch failure")?;
+        ensure(
+            upsert(index, "atomic", "beta after switch").await.is_err(),
+            "forced upsert failure",
+        )?;
 
         let visible = index
             .get_memory("atomic")
@@ -307,7 +323,10 @@ impl ConformanceCell {
                 .any(|(score, id, _)| id == "atomic" && *score > 0.5),
             "failed generation isolation",
         )?;
+        // Only the row inserted above remains. The failed upsert rolled back
+        // its leftover cleanup and its vec0 rows with its catalog switch.
         ensure(orphan_count(&sql)? == 1, "failed generation orphan")?;
+        ensure(atomic_orphans(&sql)? == orphan, "failed upsert rollback")?;
 
         sql.exec("DROP TRIGGER conformance_vectors_test_abort", None)?;
         let restored = self.index()?;
@@ -316,6 +335,129 @@ impl ConformanceCell {
         ensure(
             restored.delete_memory("atomic").map_err(worker_error)?,
             "atomic fixture cleanup",
+        )
+    }
+
+    fn verify_nested_transactions(
+        &self,
+        index: &SqliteVecIndex<FixtureEmbeddingModel>,
+    ) -> Result<()> {
+        let alpha = Embedding {
+            document: "alpha".to_owned(),
+            vec: vec![1.0, 0.0],
+        };
+        let rolled_back = self.storage.transaction_sync(|| {
+            index
+                .upsert_embedding("nested", &memory("nested", "alpha nested"), &alpha)
+                .map_err(worker_error)?;
+            Err::<(), _>(Error::RustError("forced outer rollback".to_owned()))
+        });
+        ensure(rolled_back.is_err(), "outer transaction failure")?;
+        ensure(
+            index.get_memory("nested").map_err(worker_error)?.is_none(),
+            "outer rollback discards a nested upsert",
+        )?;
+        ensure(
+            orphan_count(&self.storage.sql())? == 0,
+            "outer rollback discards nested vectors",
+        )?;
+
+        let generations = self.storage.transaction_sync(|| {
+            let first = index
+                .upsert_embedding("nested", &memory("nested", "alpha first"), &alpha)
+                .map_err(worker_error)?;
+            let second = index
+                .upsert_embedding("nested", &memory("nested", "alpha second"), &alpha)
+                .map_err(worker_error)?;
+            Ok::<_, Error>((first, second))
+        })?;
+        ensure(generations == (1, 2), "nested upsert generations")?;
+        let stored = index
+            .get_memory("nested")
+            .map_err(worker_error)?
+            .ok_or_else(|| Error::RustError("nested memory is missing".to_owned()))?;
+        ensure(
+            stored.generation == 2 && stored.document.content == "alpha second",
+            "outer commit keeps the last nested upsert",
+        )?;
+        ensure(
+            orphan_count(&self.storage.sql())? == 0,
+            "nested upserts replace earlier generations",
+        )?;
+        ensure(
+            index.delete_memory("nested").map_err(worker_error)?,
+            "nested fixture cleanup",
+        )?;
+
+        let inner_error = self.storage.transaction_sync(|| {
+            index
+                .upsert_embedding("outer-a", &memory("outer-a", "alpha"), &alpha)
+                .map_err(worker_error)?;
+            let inner = self.storage.transaction_sync(|| {
+                index
+                    .upsert_embedding("inner-b", &memory("inner-b", "alpha"), &alpha)
+                    .map_err(worker_error)?;
+                Err::<(), _>(Error::RustError("forced inner rollback".to_owned()))
+            });
+            let Err(Error::RustError(message)) = inner else {
+                return Err(Error::RustError(
+                    "inner transaction did not return its error".to_owned(),
+                ));
+            };
+            index
+                .upsert_embedding("outer-c", &memory("outer-c", "alpha"), &alpha)
+                .map_err(worker_error)?;
+            Ok::<_, Error>(message)
+        })?;
+        ensure(
+            inner_error == "forced inner rollback",
+            "inner transaction returns the original error",
+        )?;
+        ensure(
+            index.get_memory("inner-b").map_err(worker_error)?.is_none(),
+            "inner rollback discards its writes",
+        )?;
+        ensure(
+            orphan_count(&self.storage.sql())? == 0,
+            "inner rollback discards its vectors",
+        )?;
+        for id in ["outer-a", "outer-c"] {
+            ensure(
+                index.get_memory(id).map_err(worker_error)?.is_some(),
+                "outer transaction commits after an inner rollback",
+            )?;
+            ensure(
+                index.delete_memory(id).map_err(worker_error)?,
+                "inner rollback fixture cleanup",
+            )?;
+        }
+        Ok(())
+    }
+
+    async fn verify_search_after_concurrent_write(&self) -> Result<()> {
+        let index = SqliteVecIndex::named(
+            self.storage.clone(),
+            FixtureEmbeddingModel,
+            RACE_TABLE,
+            "id",
+        )
+        .map_err(worker_error)?;
+        self.storage
+            .sql()
+            .exec("DELETE FROM conformance_race_vectors_documents", None)?;
+        index.collect_garbage().map_err(worker_error)?;
+        upsert(&index, "race-beta", "beta").await?;
+
+        let (ranked, written) = futures::join!(search(&index, "slow alpha", 10), async {
+            for id in ["race-alpha-1", "race-alpha-2", "race-alpha-3"] {
+                upsert(&index, id, "alpha").await?;
+            }
+            Ok::<_, Error>(())
+        });
+        written?;
+        ensure(
+            ranked?.len() == 4,
+            "search sees writes made while it waits for its embedding",
         )
     }
 
@@ -410,6 +552,11 @@ struct CountRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct RowIdRow {
+    rowid: i64,
+}
+
+#[derive(Debug, Deserialize)]
 struct ConcurrencyCheck {
     expected_generation: i64,
 }
@@ -449,6 +596,45 @@ async fn search(
         .map_err(worker_error)
 }
 
+async fn verify_atomic_batch(index: &SqliteVecIndex<FixtureEmbeddingModel>) -> Result<()> {
+    let alpha = || {
+        vec![Embedding {
+            document: "alpha".to_owned(),
+            vec: vec![1.0, 0.0],
+        }]
+    };
+    let failed = index
+        .insert_documents(vec![
+            (json!({"id": "batch-a", "content": "alpha"}), alpha()),
+            (json!({"id": 7, "content": "alpha"}), alpha()),
+        ])
+        .await;
+    ensure(failed.is_err(), "batch with an invalid ID fails")?;
+    ensure(
+        index.get_memory("batch-a").map_err(worker_error)?.is_none(),
+        "failed batch rolls back earlier documents",
+    )?;
+
+    index
+        .insert_documents(vec![
+            (json!({"id": "batch-a", "content": "alpha"}), alpha()),
+            (json!({"id": "batch-b", "content": "alpha"}), alpha()),
+        ])
+        .await
+        .map_err(worker_error)?;
+    for id in ["batch-a", "batch-b"] {
+        ensure(
+            index.get_memory(id).map_err(worker_error)?.is_some(),
+            "batch commits every document",
+        )?;
+        ensure(
+            index.delete_memory(id).map_err(worker_error)?,
+            "batch fixture cleanup",
+        )?;
+    }
+    Ok(())
+}
+
 fn ids(memories: &[StoredMemory]) -> Vec<&str> {
     memories.iter().map(|memory| memory.id.as_str()).collect()
 }
@@ -465,6 +651,18 @@ fn orphan_count(sql: &SqlStorage) -> Result<i64> {
         )?
         .one::<CountRow>()?
         .count)
+}
+
+fn atomic_orphans(sql: &SqlStorage) -> Result<Vec<i64>> {
+    Ok(sql
+        .exec(
+            "SELECT rowid FROM conformance_vectors WHERE id = ? AND generation = ?",
+            vec!["atomic".into(), 2_i64.into()],
+        )?
+        .to_array::<RowIdRow>()?
+        .into_iter()
+        .map(|row| row.rowid)
+        .collect())
 }
 
 fn vector_blob(values: [f32; 2]) -> Vec<u8> {

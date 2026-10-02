@@ -982,6 +982,7 @@ dependencies = [
 name = "celld-conformance"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "rig-celld",
  "rig-core",
  "serde",

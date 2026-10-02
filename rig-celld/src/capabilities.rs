@@ -9,8 +9,6 @@ use serde::{Deserialize, Serialize};
 pub enum BackendKind {
     /// celld Durable Object SQLite with its embedded sqlite-vec extension.
     SqliteVec,
-    /// Encrypted Turso files stored through Durable Object SQLite.
-    EncryptedTurso,
 }
 
 /// Readiness level of a backend.
@@ -82,6 +80,4 @@ pub struct BackendCapabilities {
     pub supports_filters: bool,
     /// Whether replacing a logical ID is supported.
     pub supports_upsert: bool,
-    /// Whether the backend adds application-managed encryption at rest.
-    pub encrypted_at_rest: bool,
 }

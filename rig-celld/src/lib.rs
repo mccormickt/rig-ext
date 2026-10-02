@@ -9,6 +9,8 @@ mod memory;
 mod vector;
 
 #[cfg(feature = "sqlite-vec")]
+mod storage;
+#[cfg(feature = "sqlite-vec")]
 mod vector_store;
 
 pub use capabilities::{
@@ -20,6 +22,8 @@ pub use memory::{
 };
 pub use vector::VectorError;
 
+#[cfg(feature = "sqlite-vec")]
+pub use storage::CellStorage;
 #[cfg(feature = "sqlite-vec")]
 pub use vector_store::{
     EmbedText, MAX_DIMENSIONS, MAX_EMBEDDINGS_PER_DOCUMENT, MAX_GENERATION, MAX_LIST_LIMIT,

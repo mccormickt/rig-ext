@@ -21,9 +21,9 @@ use serde_json::Value;
 use worker::{SqlStorage, SqlStorageValue};
 
 use crate::{
-    BackendCapabilities, BackendKind, BackendMaturity, ListCursor, MemoryBackend, MemoryPage,
-    MemoryRecord, ScoreKind, SearchKind, StoredDocument, StoredMemory, TieBreak, VectorError,
-    ZeroVectorPolicy,
+    BackendCapabilities, BackendKind, BackendMaturity, CellStorage, ListCursor, MemoryBackend,
+    MemoryPage, MemoryRecord, ScoreKind, SearchKind, StoredDocument, StoredMemory, TieBreak,
+    VectorError, ZeroVectorPolicy,
     vector::{cosine_score, embedding_f32_le, validate_dimensions},
 };
 
@@ -55,7 +55,6 @@ const SQLITE_VEC_CAPABILITIES: BackendCapabilities = BackendCapabilities {
     max_dimensions: MAX_DIMENSIONS,
     supports_filters: false,
     supports_upsert: true,
-    encrypted_at_rest: false,
 };
 
 /// Errors produced by [`SqliteVecIndex`].
@@ -167,12 +166,14 @@ impl EmbedText for DynModel<operation::Embedding> {
 /// A Rig vector index backed by one Durable Object's sqlite-vec database.
 ///
 /// A regular SQLite catalog selects the active generation for each logical
-/// document. New vec0 rows are invisible until one catalog statement switches
-/// the generation. SQLite triggers remove superseded rows in that same
-/// statement. A failure before the switch can leave only an invisible orphan,
-/// which [`Self::collect_garbage`] removes idempotently.
+/// document. Each write runs in one `transactionSync()` call, so a new vec0
+/// generation, the catalog switch, and the SQLite triggers that remove
+/// superseded rows commit together or not at all. Reads join through the
+/// catalog, and [`Self::collect_garbage`] removes vec0 rows that the catalog
+/// does not select.
 #[derive(Clone, Debug)]
 pub struct SqliteVecIndex<M> {
+    storage: CellStorage,
     sql: SqlStorage,
     model: M,
     tables: TableNames,
@@ -185,8 +186,8 @@ where
     M: EmbedText,
 {
     /// Create an index named `rig_vectors` and read generic document IDs from `id`.
-    pub fn new(sql: SqlStorage, model: M) -> Result<Self, SqliteVecError> {
-        Self::named(sql, model, DEFAULT_TABLE, DEFAULT_ID_FIELD)
+    pub fn new(storage: CellStorage, model: M) -> Result<Self, SqliteVecError> {
+        Self::named(storage, model, DEFAULT_TABLE, DEFAULT_ID_FIELD)
     }
 
     /// Create a named index and select the JSON field used by [`InsertDocuments`].
@@ -195,7 +196,7 @@ where
     /// must not start with a digit. Existing append-only prototype tables must
     /// be migrated explicitly.
     pub fn named(
-        sql: SqlStorage,
+        storage: CellStorage,
         model: M,
         table: impl Into<String>,
         id_field: impl Into<String>,
@@ -205,13 +206,14 @@ where
         validate_dimensions(dimensions, MAX_DIMENSIONS)?;
 
         let index = Self {
-            sql,
+            sql: storage.sql(),
+            storage,
             model,
             tables,
             id_field: id_field.into(),
             dimensions,
         };
-        index.initialize()?;
+        index.storage.transaction_sync(|| index.initialize())?;
         Ok(index)
     }
 
@@ -248,9 +250,9 @@ where
 
     /// Replace a logical document and its complete set of embeddings.
     ///
-    /// Vec0 rows are prepared before one catalog statement makes the new
-    /// generation visible. The catalog switch and its garbage-collection
-    /// triggers are one SQLite statement transaction.
+    /// The new vec0 rows, the catalog switch, and its garbage-collection
+    /// triggers commit in one `transactionSync()` call. Inside an open
+    /// transaction, this call is a nested savepoint.
     pub fn upsert_embeddings<T: Serialize>(
         &self,
         id: impl AsRef<str>,
@@ -273,51 +275,51 @@ where
             .map(|embedding| embedding_f32_le(&embedding.vec, self.dimensions))
             .collect::<Result<Vec<_>, _>>()?;
         let document = serde_json::to_string(document)?;
-        let generation = self.next_generation(id)?;
-
-        // This generation is not active, so removing leftovers from an earlier
-        // failed attempt cannot affect readers.
-        self.sql.exec(
-            &format!(
-                "DELETE FROM {} WHERE id = ? AND generation = ?",
-                self.tables.vectors
-            ),
-            vec![id.into(), generation.into()],
-        )?;
-
-        let values = std::iter::repeat_n("(?, ?, ?, ?)", vectors.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let query = format!(
-            "INSERT INTO {}(embedding, id, generation, embedding_index) VALUES {values}",
+        let insert_vector = format!(
+            "INSERT INTO {}(embedding, id, generation, embedding_index) VALUES (?, ?, ?, ?)",
             self.tables.vectors
         );
-        let mut bindings = Vec::with_capacity(vectors.len() * 4);
-        for (index, vector) in vectors.into_iter().enumerate() {
-            let index = i64::try_from(index).map_err(|_| SqliteVecError::TooManyEmbeddings {
-                actual: embeddings.len(),
-            })?;
-            bindings.extend([
-                SqlStorageValue::Blob(vector),
-                SqlStorageValue::String(id.to_owned()),
-                SqlStorageValue::Integer(generation),
-                SqlStorageValue::Integer(index),
-            ]);
-        }
-        self.sql.exec(&query, bindings)?;
 
-        // This one host-SQL statement is the visibility boundary. Its INSERT
-        // or UPDATE trigger deletes all older generations atomically with it.
-        self.sql.exec(
-            &format!(
-                "INSERT INTO {}(id, generation, document) VALUES (?, ?, ?) \
-                 ON CONFLICT(id) DO UPDATE SET \
-                    generation = excluded.generation, document = excluded.document",
-                self.tables.documents
-            ),
-            vec![id.into(), generation.into(), document.into()],
-        )?;
-        Ok(generation)
+        self.storage.transaction_sync(|| {
+            let generation = self.next_generation(id)?;
+
+            // Rows that a write outside this index left at the new generation
+            // would become visible with the catalog switch. Remove them first.
+            self.sql.exec(
+                &format!(
+                    "DELETE FROM {} WHERE id = ? AND generation = ?",
+                    self.tables.vectors
+                ),
+                vec![id.into(), generation.into()],
+            )?;
+
+            // One fixed statement per vector keeps one entry in celld's
+            // compiled-statement cache. The transaction commits them together.
+            for (index, vector) in (0_i64..).zip(vectors) {
+                self.sql.exec(
+                    &insert_vector,
+                    vec![
+                        SqlStorageValue::Blob(vector),
+                        SqlStorageValue::String(id.to_owned()),
+                        SqlStorageValue::Integer(generation),
+                        SqlStorageValue::Integer(index),
+                    ],
+                )?;
+            }
+
+            // The INSERT or UPDATE trigger of the catalog deletes all older
+            // generations of this document.
+            self.sql.exec(
+                &format!(
+                    "INSERT INTO {}(id, generation, document) VALUES (?, ?, ?) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                        generation = excluded.generation, document = excluded.document",
+                    self.tables.documents
+                ),
+                vec![id.into(), generation.into(), document.into()],
+            )?;
+            Ok(generation)
+        })
     }
 
     /// Compatibility alias whose behavior is now upsert, not append.
@@ -436,6 +438,8 @@ where
 
     /// Delete every vec0 row not selected by the logical document catalog.
     ///
+    /// Index writes do not leave such rows. They can come from writes outside
+    /// this index or from data that an earlier non-transactional layout wrote.
     /// Repeating this operation has no additional effect.
     pub fn collect_garbage(&self) -> Result<(), SqliteVecError> {
         self.sql.exec(
@@ -577,6 +581,15 @@ where
             .ok_or_else(|| SqliteVecError::GenerationExhausted(id.to_owned()))
     }
 
+    fn count(&self, query: &str) -> Result<i64, VectorStoreError> {
+        self.sql
+            .exec(query, None)
+            .and_then(|cursor| cursor.one::<CountRow>())
+            .map(|row| row.count)
+            .map_err(SqliteVecError::from)
+            .map_err(VectorStoreError::datastore)
+    }
+
     async fn search(
         &self,
         request: VectorSearchRequest<Filter<Value>>,
@@ -601,28 +614,32 @@ where
         let wanted = usize::try_from(request.samples()).map_err(|_| {
             VectorStoreError::datastore(SqliteVecError::ResultLimitTooLarge(request.samples()))
         })?;
-        let physical = self
-            .sql
-            .exec(
-                &format!("SELECT COUNT(*) AS count FROM {}", self.tables.vectors),
-                None,
-            )
+        // An empty catalog has no visible results, so skip the embedding request.
+        let has_documents = self.count(&format!(
+            "SELECT EXISTS(SELECT 1 FROM {}) AS count",
+            self.tables.documents
+        ))?;
+        if has_documents == 0 {
+            return Ok(Vec::new());
+        }
+        let embedding = self.model.embed_text(request.query()).await?;
+        let vector = embedding_f32_le(&embedding.vec, self.dimensions)
             .map_err(SqliteVecError::from)
-            .map_err(VectorStoreError::datastore)?
-            .one::<CountRow>()
-            .map_err(SqliteVecError::from)
-            .map_err(VectorStoreError::datastore)?
-            .count;
+            .map_err(VectorStoreError::datastore)?;
+
+        // Other requests can write while the embedding request waits. The code
+        // below does not await, so the count and every candidate query read the
+        // same database state.
+        let physical = self.count(&format!(
+            "SELECT COUNT(*) AS count FROM {}",
+            self.tables.vectors
+        ))?;
         if physical <= 0 {
             return Ok(Vec::new());
         }
         let physical = usize::try_from(physical).map_err(|_| {
             VectorStoreError::datastore(SqliteVecError::ResultLimitTooLarge(request.samples()))
         })?;
-        let embedding = self.model.embed_text(request.query()).await?;
-        let vector = embedding_f32_le(&embedding.vec, self.dimensions)
-            .map_err(SqliteVecError::from)
-            .map_err(VectorStoreError::datastore)?;
 
         let mut candidate_limit = wanted.min(physical).max(1);
         let mut results;
@@ -721,26 +738,27 @@ impl<M> InsertDocuments for SqliteVecIndex<M>
 where
     M: EmbedText,
 {
+    /// Upsert all documents in one `transactionSync()` call.
+    ///
+    /// An error in any document rolls back the complete batch.
     async fn insert_documents<Doc: Serialize + Embed + WasmCompatSend>(
         &self,
         documents: Vec<(Doc, Vec<Embedding>)>,
     ) -> Result<(), VectorStoreError> {
-        for (document, embeddings) in documents {
-            let value = serde_json::to_value(&document)?;
-            let id = value
-                .get(&self.id_field)
-                .ok_or_else(|| {
-                    VectorStoreError::datastore(SqliteVecError::MissingId(self.id_field.clone()))
-                })?
-                .as_str()
-                .ok_or_else(|| {
-                    VectorStoreError::datastore(SqliteVecError::InvalidId(self.id_field.clone()))
-                })?
-                .to_owned();
-            self.upsert_embeddings(&id, &value, &embeddings)
-                .map_err(VectorStoreError::datastore)?;
-        }
-        Ok(())
+        self.storage
+            .transaction_sync(|| {
+                for (document, embeddings) in &documents {
+                    let value = serde_json::to_value(document)?;
+                    let id = value
+                        .get(&self.id_field)
+                        .ok_or_else(|| SqliteVecError::MissingId(self.id_field.clone()))?
+                        .as_str()
+                        .ok_or_else(|| SqliteVecError::InvalidId(self.id_field.clone()))?;
+                    self.upsert_embeddings(id, &value, embeddings)?;
+                }
+                Ok::<_, SqliteVecError>(())
+            })
+            .map_err(VectorStoreError::datastore)
     }
 }
 

@@ -1,13 +1,12 @@
 use rig::{
     AgentBuilder,
     completion::Message,
-    providers::openai::{self, OpenAI},
+    providers::openai::{self, OpenAI, OpenAIConfig},
 };
-use rig_celld::SqliteVecIndex;
+use rig_celld::{CellStorage, SqliteVecIndex};
 use serde::{Deserialize, Serialize};
 use worker::*;
 
-const HISTORY_KEY: &str = "history";
 const DEFAULT_COMPLETION_MODEL: &str = openai::GPT_4O_MINI;
 const DEFAULT_EMBEDDING_MODEL: &str = openai::TEXT_EMBEDDING_3_SMALL;
 const DEFAULT_EMBEDDING_DIMENSIONS: usize = 512;
@@ -31,8 +30,8 @@ struct Memory {
 }
 
 #[derive(Debug, Deserialize)]
-struct StateRow {
-    value: String,
+struct MessageRow {
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,13 +41,16 @@ struct TurnRow {
 
 #[durable_object(fetch)]
 pub struct AgentCell {
-    state: State,
+    storage: CellStorage,
     env: Env,
 }
 
 impl DurableObject for AgentCell {
     fn new(state: State, env: Env) -> Self {
-        Self { state, env }
+        Self {
+            storage: state.into(),
+            env,
+        }
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
@@ -61,9 +63,10 @@ impl DurableObject for AgentCell {
             return Response::error("The prompt must not be empty.\n", 400);
         }
 
-        let sql = self.state.storage().sql();
-        initialize_state(&sql)?;
+        let sql = self.storage.sql();
+        self.storage.transaction_sync(|| initialize_state(&sql))?;
         let mut history = load_history(&sql)?;
+        let loaded = history.len();
 
         let api_key = self.env.var("OPENAI_API_KEY")?.to_string();
         let completion_model = optional_var(
@@ -81,9 +84,14 @@ impl DurableObject for AgentCell {
         .parse::<usize>()
         .map_err(to_worker_error)?;
 
-        let client = OpenAI::new(api_key);
+        let mut config = OpenAIConfig::new(api_key);
+        if let Ok(base_url) = self.env.var("OPENAI_BASE_URL") {
+            config = config.with_base_url(base_url.to_string());
+        }
+        let client: OpenAI = config.client();
         let embedding_model = client.embedding(embedding_model, Some(embedding_dimensions));
-        let index = SqliteVecIndex::new(sql.clone(), embedding_model).map_err(to_worker_error)?;
+        let index = SqliteVecIndex::new(self.storage.clone(), embedding_model.clone())
+            .map_err(to_worker_error)?;
         let memory_index = index.clone();
         let agent = AgentBuilder::new(client.completion(completion_model))
             .preamble(
@@ -98,18 +106,31 @@ impl DurableObject for AgentCell {
             .await
             .map_err(to_worker_error)?
             .output;
-        let turn = insert_turn(&sql, &input.prompt, &answer)?;
-        let memory = Memory {
-            id: turn.to_string(),
-            prompt: input.prompt.clone(),
-            answer: answer.clone(),
-        };
+        // Other requests to this agent can commit turns while this one waits
+        // for the provider. Append only the messages of this turn, so a
+        // concurrent turn is not overwritten.
+        let messages = history.split_off(loaded);
         let memory_text = format!("User: {}\nAssistant: {}", input.prompt, answer);
-        memory_index
-            .upsert_text(&memory.id, &memory, &memory_text)
+        let embedding = embedding_model
+            .embed_text(&memory_text)
             .await
             .map_err(to_worker_error)?;
-        save_history(&sql, &history)?;
+
+        // The turn, its memory, and its messages commit together. The index
+        // upsert runs as a nested transaction inside this one.
+        let turn = self.storage.transaction_sync(|| {
+            let turn = insert_turn(&sql, &input.prompt, &answer)?;
+            let memory = Memory {
+                id: turn.to_string(),
+                prompt: input.prompt.clone(),
+                answer: answer.clone(),
+            };
+            memory_index
+                .upsert_embedding(&memory.id, &memory, &embedding)
+                .map_err(to_worker_error)?;
+            append_messages(&sql, turn, &messages)?;
+            Ok::<_, Error>(turn)
+        })?;
 
         Response::from_json(&PromptOutput { answer, turn })
     }
@@ -149,43 +170,39 @@ fn agent_name(path: &str) -> Option<&str> {
 
 fn initialize_state(sql: &SqlStorage) -> Result<()> {
     sql.exec(
-        "CREATE TABLE IF NOT EXISTS agent_state(\
-         key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-        None,
-    )?;
-    sql.exec(
         "CREATE TABLE IF NOT EXISTS turns(\
          id INTEGER PRIMARY KEY AUTOINCREMENT, \
          prompt TEXT NOT NULL, answer TEXT NOT NULL)",
+        None,
+    )?;
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS messages(\
+         id INTEGER PRIMARY KEY AUTOINCREMENT, \
+         turn INTEGER NOT NULL REFERENCES turns(id), \
+         message TEXT NOT NULL)",
         None,
     )?;
     Ok(())
 }
 
 fn load_history(sql: &SqlStorage) -> Result<Vec<Message>> {
-    let rows = sql
-        .exec(
-            "SELECT value FROM agent_state WHERE key = ?",
-            vec![SqlStorageValue::String(HISTORY_KEY.to_owned())],
-        )?
-        .to_array::<StateRow>()?;
-
-    match rows.into_iter().next() {
-        Some(row) => serde_json::from_str(&row.value).map_err(Error::from),
-        None => Ok(Vec::new()),
-    }
+    sql.exec("SELECT message FROM messages ORDER BY id", None)?
+        .to_array::<MessageRow>()?
+        .into_iter()
+        .map(|row| serde_json::from_str(&row.message).map_err(Error::from))
+        .collect()
 }
 
-fn save_history(sql: &SqlStorage, history: &[Message]) -> Result<()> {
-    let value = serde_json::to_string(history)?;
-    sql.exec(
-        "INSERT INTO agent_state(key, value) VALUES (?, ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        vec![
-            SqlStorageValue::String(HISTORY_KEY.to_owned()),
-            SqlStorageValue::String(value),
-        ],
-    )?;
+fn append_messages(sql: &SqlStorage, turn: i64, messages: &[Message]) -> Result<()> {
+    for message in messages {
+        sql.exec(
+            "INSERT INTO messages(turn, message) VALUES (?, ?)",
+            vec![
+                SqlStorageValue::Integer(turn),
+                SqlStorageValue::String(serde_json::to_string(message)?),
+            ],
+        )?;
+    }
     Ok(())
 }
 
