@@ -838,6 +838,7 @@ fn temporal_inputs_recorded_before_policies_keep_the_legacy_contract() {
 #[ignore = "requires a live Temporal server configured with TEMPORAL_* variables"]
 async fn temporal_guarded_write_is_not_repeated_after_an_uncertain_attempt() {
     let (runtime, client) = live_client().await;
+    let namespace = client.options().namespace.clone();
     let ledger = Arc::new(Mutex::new(Vec::new()));
     let release = Arc::new(Notify::new());
     let guard = Arc::new(InMemoryGuardStore::new());
@@ -880,15 +881,15 @@ async fn temporal_guarded_write_is_not_repeated_after_an_uncertain_attempt() {
         release.notify_waiters();
         release.notify_one();
         shutdown();
-        (workflow_id, response)
+        (handle.run_id().unwrap().to_owned(), response)
     };
-    let (worker_result, (workflow_id, response)) = tokio::join!(worker.run(), run);
+    let (worker_result, (run_id, response)) = tokio::join!(worker.run(), run);
 
     worker_result.unwrap();
     assert_eq!(response.output, "finished");
     assert_eq!(ledger.lock().unwrap().len(), 1, "one external effect");
     let key = LogicalCallKey {
-        logical_execution_id: workflow_id,
+        logical_execution_id: format!("temporal:{}:{namespace}:{run_id}", namespace.len()),
         submission_id: "prompt-0".into(),
         model_turn: 1,
         call_index: 0,
@@ -1007,6 +1008,377 @@ async fn submit(
             WorkflowExecuteUpdateOptions::default(),
         )
         .await
+}
+
+async fn wait_queued(handle: &SessionHandle, count: usize) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let snapshot = handle
+                .query(
+                    TemporalAgentSessionWorkflow::snapshot,
+                    (),
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+            if snapshot.queued_submissions == count {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires a live Temporal server configured with TEMPORAL_* variables"]
+async fn full_audit_bytes_limit_admission_and_completed_prompts_after_compaction() {
+    let model = MockCompletionModel::from_turns([
+        MockTurn::text("x".repeat(500)),
+        MockTurn::text("short summary"),
+        MockTurn::text("y".repeat(500)),
+    ]);
+    let agent = TemporalAgent::new(model.clone())
+        .activity_max_attempts(1)
+        .session_history_max_bytes(900)
+        .compaction(compaction(&model, 1));
+    with_session(agent, "audit-limit", |handle| async move {
+        assert_eq!(prompt(&handle, "one").await.len(), 500);
+        let large = "z".repeat(400);
+        assert!(
+            handle
+                .execute_update(
+                    TemporalAgentSessionWorkflow::prompt,
+                    large.clone().into(),
+                    Default::default()
+                )
+                .await
+                .is_err()
+        );
+        let error = submit(&handle, SubmitInput::new("too-large", large))
+            .await
+            .unwrap_err();
+        assert!(update_failure_message(&error).contains("history exceeds"));
+        let second = submit(&handle, SubmitInput::new("second", "two"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            second.submission.state,
+            SubmissionState::Failed { .. }
+        ));
+        assert!(handle.get_result(Default::default()).await.is_err());
+        let snapshot = handle
+            .query(
+                TemporalAgentSessionWorkflow::snapshot,
+                (),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.history.len(), 2);
+    })
+    .await;
+    assert_eq!(model.requests().len(), 3);
+}
+
+#[tokio::test]
+#[ignore = "requires a Temporal dev server on port 7234 with limit.historyCount.suggestContinueAsNew=12"]
+async fn continuation_preserves_failed_compaction_and_execution_chain_identity() {
+    let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+    let (mut connection_options, client_options) =
+        ClientOptions::load_from_config(LoadClientConfigProfileOptions::default()).unwrap();
+    connection_options.target = std::env::var("TEMPORAL_CONTINUATION_ADDRESS")
+        .unwrap_or_else(|_| "http://localhost:7234".into())
+        .parse()
+        .unwrap();
+    let client = Client::new(
+        Connection::connect(connection_options).await.unwrap(),
+        client_options,
+    )
+    .unwrap();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    let model = MockCompletionModel::from_turns([
+        MockTurn::tool_call("same", "lookup", serde_json::json!({"key":"x"})),
+        MockTurn::text("one"),
+        MockTurn::tool_call("same", "lookup", serde_json::json!({"key":"x"})),
+        MockTurn::text("two"),
+    ]);
+    let summaries = MockCompletionModel::from_turns([
+        MockTurn::error("summary down"),
+        MockTurn::error("summary down again"),
+    ]);
+    let agent = TemporalAgent::new(model)
+        .activity_max_attempts(1)
+        .compaction(compaction(&summaries, 1))
+        .tool(FlakyLookup {
+            attempts: Arc::new(AtomicUsize::new(0)),
+            fail_until: 0,
+            invocations: invocations.clone(),
+        });
+    let input = agent.session_input(Vec::new());
+    let queue = format!("continue-{}", uuid::Uuid::new_v4());
+    let id = queue.clone();
+    let mut options = WorkerOptions::new(queue.clone()).build();
+    agent.register(&mut options).unwrap();
+    let mut worker = Worker::new(&runtime, client.clone(), options).unwrap();
+    let shutdown = worker.shutdown_handle();
+    let run = async {
+        let initial = client
+            .start_workflow(
+                TemporalAgentSessionWorkflow::run,
+                input,
+                WorkflowStartOptions::new(queue, &id).build(),
+            )
+            .await
+            .unwrap();
+        let first_id = initial.run_id().unwrap().to_owned();
+        let handle: SessionHandle = client.get_workflow_handle(&id);
+        assert_eq!(
+            submit(&handle, SubmitInput::new("one", "one"))
+                .await
+                .unwrap()
+                .submission
+                .state,
+            SubmissionState::Answered
+        );
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while handle.describe(Default::default()).await.unwrap().run_id() == first_id {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = handle
+            .query(
+                TemporalAgentSessionWorkflow::snapshot,
+                (),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let prior = initial
+            .query(
+                TemporalAgentSessionWorkflow::snapshot,
+                (),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert!(prior.compaction_error.is_some());
+        assert_eq!(snapshot.compaction_error, prior.compaction_error);
+        assert_eq!(snapshot.history.len(), 4);
+        assert_eq!(
+            summaries.requests().len(),
+            1,
+            "unchanged transcript must not retry compaction"
+        );
+        let ledger = handle
+            .query(TemporalAgentSessionWorkflow::ledger, (), Default::default())
+            .await
+            .unwrap();
+        assert!(ledger.logical_session_id.ends_with(&first_id));
+        assert_eq!(
+            submit(&handle, SubmitInput::new("two", "two"))
+                .await
+                .unwrap()
+                .submission
+                .state,
+            SubmissionState::Answered
+        );
+        close(&handle).await;
+        shutdown();
+    };
+    let (result, ()) = tokio::join!(worker.run(), run);
+    result.unwrap();
+    let calls = invocations.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    let first = calls[0].logical_key.as_ref().unwrap();
+    let second = calls[1].logical_key.as_ref().unwrap();
+    assert_eq!(first.logical_execution_id, second.logical_execution_id);
+    assert_ne!(first.submission_id, second.submission_id);
+    assert_ne!(
+        calls[0].attempt.as_ref().unwrap().backend_execution_id,
+        calls[1].attempt.as_ref().unwrap().backend_execution_id
+    );
+    assert_eq!(summaries.requests().len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Temporal server configured with TEMPORAL_* variables"]
+async fn failed_prompt_cancels_an_already_admitted_follow_up() {
+    let model = MockCompletionModel::from_turns([
+        MockTurn::tool_call("block", "blocking_lookup", serde_json::json!({"key":"x"})),
+        MockTurn::error("active prompt failed"),
+        MockTurn::text("must not run"),
+    ]);
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let agent = TemporalAgent::new(model.clone())
+        .activity_max_attempts(1)
+        .tool(BlockingLookup {
+            started: started.clone(),
+            release: release.clone(),
+        });
+    with_session(agent, "failed-prompt-queued", |handle| async move {
+        let active = handle.execute_update(
+            TemporalAgentSessionWorkflow::prompt,
+            "first".into(),
+            Default::default(),
+        );
+        tokio::pin!(active);
+        tokio::select! {
+            result = &mut active => panic!("prompt completed before release: {result:?}"),
+            _ = started.notified() => {}
+        }
+        let queued = submit(&handle, SubmitInput::new("follow-up", "must not run"));
+        tokio::pin!(queued);
+        tokio::select! {
+            result = &mut queued => panic!("queued prompt completed before release: {result:?}"),
+            _ = wait_queued(&handle, 1) => {}
+        }
+        handle
+            .signal(
+                TemporalAgentSessionWorkflow::steer,
+                "must not steer".into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        release.notify_one();
+        assert!(active.await.is_err());
+        assert_eq!(
+            queued.await.unwrap().submission.state,
+            SubmissionState::Cancelled
+        );
+        let result = handle.get_result(Default::default()).await.unwrap();
+        assert!(result.history.is_empty());
+    })
+    .await;
+    assert_eq!(model.requests().len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Temporal server configured with TEMPORAL_* variables"]
+async fn queued_prompts_and_steering_compact_before_each_next_prompt() {
+    let model = MockCompletionModel::from_turns([
+        MockTurn::tool_call("block", "blocking_lookup", serde_json::json!({"key":"x"})),
+        MockTurn::text("answer 1"),
+        MockTurn::text("S1"),
+        MockTurn::text("answer 2"),
+        MockTurn::text("S2"),
+        MockTurn::text("answer 3"),
+        MockTurn::text("S3"),
+        MockTurn::text("answer 4"),
+        MockTurn::text("S4"),
+    ]);
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let agent = TemporalAgent::new(model.clone())
+        .activity_max_attempts(1)
+        .compaction(compaction(&model, 1))
+        .tool(BlockingLookup {
+            started: started.clone(),
+            release: release.clone(),
+        });
+    with_session(agent, "queued-compaction", |handle| async move {
+        let active = handle.execute_update(
+            TemporalAgentSessionWorkflow::prompt,
+            "first".into(),
+            Default::default(),
+        );
+        tokio::pin!(active);
+        tokio::select! {
+            result = &mut active => panic!("prompt completed before release: {result:?}"),
+            _ = started.notified() => {}
+        }
+        let pending = futures::future::join_all([
+            submit(&handle, SubmitInput::new("q1", "queued 1")),
+            submit(&handle, SubmitInput::new("q2", "queued 2")),
+        ]);
+        tokio::pin!(pending);
+        tokio::select! {
+            result = &mut pending => panic!("queued prompts completed before release: {result:?}"),
+            _ = wait_queued(&handle, 2) => {}
+        }
+        handle
+            .signal(
+                TemporalAgentSessionWorkflow::steer,
+                "steering".into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        release.notify_one();
+        assert_eq!(active.await.unwrap().output, "answer 2");
+        for result in pending.await {
+            assert_eq!(result.unwrap().submission.state, SubmissionState::Answered);
+        }
+        close(&handle).await
+    })
+    .await;
+    let requests = model.requests();
+    assert_eq!(requests.len(), 9);
+    for (index, summary) in [(3, "S1"), (5, "S2"), (7, "S3")] {
+        rig::transcript::validate_canonical(&requests[index].chat_history).unwrap();
+        assert_eq!(
+            user_texts(&requests[index].chat_history)[0],
+            format!("{SUMMARY_HEADER}{summary}")
+        );
+    }
+    assert_eq!(
+        user_texts(&requests[3].chat_history).last().unwrap(),
+        "steering"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Temporal server configured with TEMPORAL_* variables"]
+async fn a_reused_workflow_id_has_a_new_guard_identity() {
+    let (runtime, client) = live_client().await;
+    let effects = Arc::new(Mutex::new(Vec::new()));
+    let agent = TemporalAgent::new(MockCompletionModel::from_turns([
+        MockTurn::tool_call("same", "write", serde_json::json!({"key":"x"})),
+        MockTurn::text("one"),
+        MockTurn::tool_call("same", "write", serde_json::json!({"key":"x"})),
+        MockTurn::text("two"),
+    ]))
+    .invocation_guard(Arc::new(InMemoryGuardStore::new()))
+    .tool_with_policy(
+        LedgerWrite {
+            ledger: effects.clone(),
+            hold_first_attempt: Arc::new(Notify::new()),
+            hold: false,
+        },
+        ToolPolicy::interrupt_on_uncertain(),
+    );
+    let input = agent.input("write");
+    let id = format!("reused-{}", uuid::Uuid::new_v4());
+    let queue = format!("reused-{}", uuid::Uuid::new_v4());
+    let mut options = WorkerOptions::new(queue.clone()).build();
+    agent.register(&mut options).unwrap();
+    let mut worker = Worker::new(&runtime, client.clone(), options).unwrap();
+    let shutdown = worker.shutdown_handle();
+    let run = async {
+        for answer in ["one", "two"] {
+            let handle = client
+                .start_workflow(
+                    TemporalAgentWorkflow::run,
+                    input.clone(),
+                    WorkflowStartOptions::new(&queue, &id).build(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                handle.get_result(Default::default()).await.unwrap().output,
+                answer
+            );
+        }
+        shutdown();
+    };
+    let (result, ()) = tokio::join!(worker.run(), run);
+    result.unwrap();
+    assert_eq!(effects.lock().unwrap().len(), 2);
 }
 
 async fn prompt(handle: &SessionHandle, text: &str) -> String {

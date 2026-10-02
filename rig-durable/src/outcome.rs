@@ -155,12 +155,35 @@ impl DurableResponse {
 
     /// Drop outcomes from the end until the serialized response fits
     /// `max_bytes`, and record that it happened.
-    pub fn fit_within(mut self, max_bytes: usize) -> Self {
+    pub fn fit_within(mut self, max_bytes: usize) -> Option<Self> {
         while serialized_len(&self) > max_bytes && !self.tool_outcomes.is_empty() {
             self.tool_outcomes.pop();
             self.tool_outcomes_truncated = true;
         }
-        self
+        (serialized_len(&self) <= max_bytes).then_some(self)
+    }
+}
+
+/// Bounded sidecar for a response held in the orchestration result.
+#[cfg(feature = "duroxide")]
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RetainedOutcomes {
+    pub tool_outcomes: Vec<ToolOutcome>,
+    pub tool_outcomes_truncated: bool,
+}
+
+#[cfg(feature = "duroxide")]
+impl RetainedOutcomes {
+    pub fn new(tool_outcomes: Vec<ToolOutcome>, max_bytes: usize) -> Option<Self> {
+        let mut value = Self {
+            tool_outcomes,
+            tool_outcomes_truncated: false,
+        };
+        while serialized_len(&value) > max_bytes && !value.tool_outcomes.is_empty() {
+            value.tool_outcomes.pop();
+            value.tool_outcomes_truncated = true;
+        }
+        (serialized_len(&value) <= max_bytes).then_some(value)
     }
 }
 
@@ -235,11 +258,20 @@ mod tests {
             outcomes,
         );
         let full = serialized_len(&response);
-        let fitted = response.clone().fit_within(full);
+        let fitted = response.clone().fit_within(full).unwrap();
         assert!(!fitted.tool_outcomes_truncated);
-        let fitted = response.fit_within(full - 1);
+        let fitted = response.fit_within(full - 1).unwrap();
         assert!(fitted.tool_outcomes_truncated);
         assert_eq!(fitted.tool_outcomes.len(), 4);
         assert_eq!(fitted.tool_outcomes[3].call_index, 3);
+    }
+
+    #[test]
+    fn an_oversized_response_cannot_fit_without_losing_the_answer() {
+        let response = DurableResponse::new(
+            PromptResponse::new("a".repeat(70 * 1024), rig::completion::Usage::default()),
+            Vec::new(),
+        );
+        assert!(response.fit_within(60 * 1024).is_none());
     }
 }

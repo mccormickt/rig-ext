@@ -144,16 +144,14 @@ impl ToolExecutor {
                 }
             }
             ClaimOutcome::Existing(record) => {
-                if record.claim.arguments_digest != digest
-                    || record.claim.policy.version() != policy.version()
+                if record.claim.key != key
+                    || record.claim.tool_name != input.name
+                    || record.claim.arguments_digest != digest
+                    || record.claim.policy != *policy
                 {
                     DurableToolResult::interrupted(
                         InterruptionReason::ClaimMismatch,
-                        format!(
-                            "an earlier attempt claimed this call with different arguments or \
-                             tool implementation version `{}`",
-                            record.claim.policy.version()
-                        ),
+                        "an earlier attempt claimed this call with a different tool, arguments, or policy",
                     )
                 } else {
                     match record.state {
@@ -571,6 +569,47 @@ mod tests {
             InterruptionReason::ClaimMismatch
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn guard_rejects_a_different_tool_or_retained_policy() {
+        for change_tool in [true, false] {
+            let store = Arc::new(InMemoryGuardStore::new());
+            let policy = ToolPolicy::interrupt_on_uncertain();
+            let stored_policy = if change_tool {
+                policy.clone()
+            } else {
+                policy
+                    .clone()
+                    .retain_metadata(MetadataRetention::none().key("receipt"))
+            };
+            store
+                .claim(ClaimRequest {
+                    key: key(),
+                    tool_name: if change_tool { "other" } else { "counting" }.into(),
+                    arguments_digest: argument_digest("{}"),
+                    policy: stored_policy,
+                    attempt: AttemptMetadata::default(),
+                    claim_token: "owner".into(),
+                })
+                .await
+                .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let executor =
+                ToolExecutor::new(Arc::new(ToolSet::from_tools(vec![Counting(calls.clone())])))
+                    .with_guard(Some(store));
+            let result = executor
+                .execute(input("counting", "{}", Some(policy)))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            assert_eq!(
+                result.interruption.unwrap().reason,
+                InterruptionReason::ClaimMismatch
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]

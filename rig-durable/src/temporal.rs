@@ -165,7 +165,9 @@ trait TemporalWorkflowState {
     fn records_history(&self) -> bool {
         false
     }
-    fn record_history(&mut self, _history: Vec<Message>) {}
+    fn record_history(&mut self, _history: Vec<Message>) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -243,6 +245,9 @@ pub struct TemporalAgentSessionInput {
     /// Recent per-submission results, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub results: Vec<TemporalRetainedResult>,
+    /// Last compaction attempt, including a nonfatal error, across continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted_at: Option<(usize, Option<String>)>,
 }
 
 /// The detailed result of one admitted submission.
@@ -336,11 +341,16 @@ impl TemporalWorkflowState for TemporalAgentSessionWorkflow {
 
     /// `history` is the active context the run started from plus the
     /// messages it added. Only the added messages reach the transcript.
-    fn record_history(&mut self, mut history: Vec<Message>) {
+    fn record_history(&mut self, mut history: Vec<Message>) -> Result<(), String> {
         let (transcript_base, active_base) = self.run_base;
         let added = history.split_off(active_base.min(history.len()));
-        self.context.transcript.truncate(transcript_base);
-        self.context.transcript.extend(added);
+        let mut transcript = self.context.transcript[..transcript_base].to_vec();
+        transcript.extend(added);
+        if history_payload_too_large(&self.config, &transcript) {
+            return Err("agent session history exceeds configured limit".into());
+        }
+        self.context.transcript = transcript;
+        Ok(())
     }
 }
 
@@ -366,6 +376,9 @@ impl TemporalAgentSessionWorkflow {
         self.busy = false;
         self.preassigned_prompt_index = None;
         if failed {
+            self.ledger.cancel_pending();
+            self.queued.clear();
+            self.runtime.steering.clear();
             close_session(self);
         } else {
             self.runtime.status = if self.closed {
@@ -420,6 +433,7 @@ impl TemporalAgentSessionWorkflow {
             ledger: Some(self.ledger.clone()),
             queued: self.queued.iter().cloned().collect(),
             results: self.results.iter().cloned().collect(),
+            compacted_at: self.compacted_at.clone(),
         }
     }
 }
@@ -437,7 +451,7 @@ impl TemporalAgentSessionWorkflow {
             }
         };
         let ledger = input.ledger.unwrap_or_else(|| {
-            SubmissionLedger::new(ctx.workflow_id(), DEFAULT_LEDGER_MAX_BYTES)
+            SubmissionLedger::new(execution_chain_id(ctx), DEFAULT_LEDGER_MAX_BYTES)
                 .with_next_prompt_index(input.next_prompt_index)
         });
         if !ledger.is_supported() {
@@ -462,7 +476,7 @@ impl TemporalAgentSessionWorkflow {
             preassigned_prompt_index: None,
             queued: input.queued.into(),
             results: input.results.into(),
-            compacted_at: None,
+            compacted_at: input.compacted_at,
             init_error,
             busy: false,
             compacting: false,
@@ -489,13 +503,13 @@ impl TemporalAgentSessionWorkflow {
             })
             .await?;
 
+            if compact(ctx).await? {
+                continue;
+            }
             if run_queued_submission(ctx).await? {
                 continue;
             }
             if run_steering(ctx).await? {
-                continue;
-            }
-            if compact(ctx).await? {
                 continue;
             }
 
@@ -540,15 +554,17 @@ impl TemporalAgentSessionWorkflow {
         ctx: &mut WorkflowContext<Self>,
         prompt: Message,
     ) -> Result<PromptResponse, BoxedError> {
-        ctx.wait_condition(|workflow| !workflow.compacting)
-            .await
-            .map_err(|error| Box::new(error) as BoxedError)?;
+        ctx.wait_condition(|workflow| {
+            workflow.closed || (!workflow.compacting && !workflow.compaction_due())
+        })
+        .await
+        .map_err(|error| Box::new(error) as BoxedError)?;
         let start: Result<_, BoxedError> = ctx.state_mut(|workflow| {
             workflow.check_prompt(&prompt)?;
             Ok(workflow.begin_run())
         });
         let (config, history) = start?;
-        let result = run_agent(
+        let result = run_session_agent(
             ctx,
             TemporalAgentInput {
                 prompt,
@@ -572,6 +588,8 @@ impl TemporalAgentSessionWorkflow {
         if self.init_error.is_some() {
             return Err(SubmissionError::Closed.to_string().into());
         }
+        self.check_submission_payload(input)
+            .map_err(|error| submission_error(&error))?;
         let mut ledger = self.ledger.clone();
         ledger
             .admit(input, self.availability())
@@ -591,6 +609,7 @@ impl TemporalAgentSessionWorkflow {
     ) -> Result<TemporalSubmission, BoxedError> {
         let request_id = input.request_id.clone();
         let admitted: Result<Submission, SubmissionError> = ctx.state_mut(|workflow| {
+            workflow.check_submission_payload(&input)?;
             let availability = workflow.availability();
             match workflow.ledger.admit(&input, availability)? {
                 Admission::Admitted(submission) => {
@@ -703,6 +722,17 @@ impl TemporalAgentSessionWorkflow {
 }
 
 impl TemporalAgentSessionWorkflow {
+    fn check_submission_payload(&self, input: &SubmitInput) -> Result<(), SubmissionError> {
+        if self.ledger.receipt(&input.request_id).is_none()
+            && session_payload_too_large(&self.config, &self.context.transcript, &input.message)
+        {
+            return Err(SubmissionError::Invalid {
+                message: "agent session history exceeds configured limit".into(),
+            });
+        }
+        Ok(())
+    }
+
     fn check_prompt(&self, prompt: &Message) -> Result<(), BoxedError> {
         if self.closed || self.init_error.is_some() {
             Err("agent session is closed".into())
@@ -736,7 +766,9 @@ async fn run_queued_submission(
     let Some((input, receipt, config, history)) = next else {
         return Ok(false);
     };
-    if session_payload_too_large(&config, &history, &input.message) {
+    if ctx.state(|workflow| {
+        session_payload_too_large(&config, &workflow.context.transcript, &input.message)
+    }) {
         let error = "agent session history exceeds configured limit";
         ctx.state_mut(|workflow| {
             workflow.ledger.set_state(
@@ -748,9 +780,12 @@ async fn run_queued_submission(
             workflow.ledger.cancel_pending();
             workflow.end_run(true);
         });
+        let wait_ctx = ctx.clone();
+        ctx.wait_condition(move |_| wait_ctx.all_handlers_finished())
+            .await?;
         return Err(workflow_error(error));
     }
-    let result = run_agent(
+    let result = run_session_agent(
         ctx,
         TemporalAgentInput {
             prompt: input.message,
@@ -800,13 +835,18 @@ async fn run_steering(
     let Some((prompt, config, history)) = steering else {
         return Ok(false);
     };
-    if session_payload_too_large(&config, &history, &prompt) {
+    if ctx
+        .state(|workflow| session_payload_too_large(&config, &workflow.context.transcript, &prompt))
+    {
         ctx.state_mut(|workflow| workflow.end_run(true));
+        let wait_ctx = ctx.clone();
+        ctx.wait_condition(move |_| wait_ctx.all_handlers_finished())
+            .await?;
         return Err(workflow_error(
             "agent session history exceeds configured limit",
         ));
     }
-    let result = run_agent(
+    let result = run_session_agent(
         ctx,
         TemporalAgentInput {
             prompt,
@@ -816,6 +856,11 @@ async fn run_steering(
     )
     .await;
     ctx.state_mut(|workflow| workflow.end_run(result.is_err()));
+    if result.is_err() {
+        let wait_ctx = ctx.clone();
+        ctx.wait_condition(move |_| wait_ctx.all_handlers_finished())
+            .await?;
+    }
     result?;
     Ok(true)
 }
@@ -825,17 +870,18 @@ async fn run_steering(
 /// session. Returns `false` when no compaction is due.
 async fn compact(ctx: &mut WorkflowContext<TemporalAgentSessionWorkflow>) -> WorkflowResult<bool> {
     let planned = ctx.state_mut(|workflow| {
-        if workflow.busy || !workflow.compaction_due() {
+        if workflow.compacting || !workflow.compaction_due() {
             return None;
         }
+        let version = workflow.config.compaction.as_ref()?.version.clone();
         workflow.compacting = true;
         workflow.runtime.status = TemporalAgentStatus::Compacting;
         let request = workflow
             .context
-            .request(workflow.ledger.logical_session_id.clone());
-        Some((request, workflow.config.clone()))
+            .request(workflow.ledger.logical_session_id.clone(), &version);
+        Some((request, workflow.config.clone(), version))
     });
-    let Some((request, config)) = planned else {
+    let Some((request, config, version)) = planned else {
         return Ok(false);
     };
     let transcript_len = request.transcript.len();
@@ -850,7 +896,7 @@ async fn compact(ctx: &mut WorkflowContext<TemporalAgentSessionWorkflow>) -> Wor
         let error = match result {
             Ok(output) => workflow
                 .context
-                .apply(output)
+                .apply(output, &version)
                 .err()
                 .map(|error| error.to_string()),
             Err(error) => Some(error.to_string()),
@@ -1128,6 +1174,7 @@ impl TemporalAgent {
             ledger: None,
             queued: Vec::new(),
             results: Vec::new(),
+            compacted_at: None,
         }
     }
 
@@ -1162,6 +1209,41 @@ impl TemporalAgent {
             compaction: self.compaction,
         });
         Ok(())
+    }
+}
+
+/// Keep the session reserved while compaction and accepted steering finish.
+async fn run_session_agent(
+    ctx: &mut WorkflowContext<TemporalAgentSessionWorkflow>,
+    mut input: TemporalAgentInput,
+) -> WorkflowResult<DurableResponse> {
+    let mut outcomes = Vec::new();
+    loop {
+        let mut response = run_agent(ctx, input).await?;
+        outcomes.append(&mut response.tool_outcomes);
+        ctx.state_mut(|workflow| workflow.runtime.outcomes = outcomes.clone());
+        compact(ctx).await?;
+        let next = ctx.state_mut(|workflow| {
+            let prompt = workflow.runtime.steering.pop_front()?;
+            let (config, history) = workflow.begin_run();
+            Some(TemporalAgentInput {
+                prompt,
+                history,
+                config,
+            })
+        });
+        let Some(next) = next else {
+            response.tool_outcomes = outcomes;
+            return Ok(response);
+        };
+        if ctx.state(|workflow| {
+            session_payload_too_large(&next.config, &workflow.context.transcript, &next.prompt)
+        }) {
+            return Err(workflow_error(
+                "agent session history exceeds configured limit",
+            ));
+        }
+        input = next;
     }
 }
 
@@ -1283,16 +1365,15 @@ where
             }
             AgentRunStep::Done(response) => {
                 let history = agent.full_history();
-                if ctx.state(TemporalWorkflowState::records_history)
-                    && history_payload_too_large(&config, &history)
-                {
-                    return Err(workflow_error(
-                        "agent session history exceeds configured limit",
-                    ));
-                }
-                ctx.state_mut(|workflow| workflow.record_history(history.clone()));
-                let steering =
-                    ctx.state_mut(|workflow| workflow.runtime_mut().steering.pop_front());
+                ctx.state_mut(|workflow| workflow.record_history(history.clone()))
+                    .map_err(workflow_error)?;
+                let steering = ctx.state_mut(|workflow| {
+                    if workflow.records_history() {
+                        None
+                    } else {
+                        workflow.runtime_mut().steering.pop_front()
+                    }
+                });
                 let Some(prompt) = steering else {
                     let outcomes = ctx.state_mut(|workflow| {
                         let runtime = workflow.runtime_mut();
@@ -1329,8 +1410,16 @@ struct ResolvedCall {
     denied: bool,
 }
 
-/// Identity of one logical tool call. The workflow ID survives
-/// continue-as-new, so the key stays fixed across runs of one execution.
+fn execution_chain_id(ctx: &WorkflowContextView) -> String {
+    let namespace = ctx.namespace();
+    format!(
+        "temporal:{}:{namespace}:{}",
+        namespace.len(),
+        ctx.first_execution_run_id()
+    )
+}
+
+/// Identity of one logical tool call, scoped to a namespace and execution chain.
 fn logical_key<W>(
     ctx: &WorkflowContext<W>,
     prompt_index: u64,
@@ -1338,7 +1427,7 @@ fn logical_key<W>(
     call_index: usize,
 ) -> LogicalCallKey {
     LogicalCallKey {
-        logical_execution_id: ctx.workflow_id().to_string(),
+        logical_execution_id: execution_chain_id(&ctx.info()),
         submission_id: LogicalCallKey::submission_for_prompt(prompt_index),
         model_turn: turn,
         call_index,

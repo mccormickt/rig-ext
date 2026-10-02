@@ -25,6 +25,52 @@ use serde::Deserialize;
 
 const WAIT: Duration = Duration::from_secs(15);
 
+#[tokio::test]
+async fn oversized_answers_preserve_single_run_results_and_do_not_close_sessions() {
+    let answer = "x".repeat(70 * 1024);
+    let model = MockCompletionModel::from_turns([
+        MockTurn::text(answer.clone()),
+        MockTurn::text(answer.clone()),
+        MockTurn::text("next answer"),
+    ]);
+    let orchestrator = orchestrator(DurableAgent::builder("large", model).build().unwrap()).await;
+    let agent = orchestrator.agent("large").unwrap();
+    let run = agent.start("single").await.unwrap();
+    assert_eq!(run.wait_timeout(WAIT).await.unwrap().output, answer);
+    let detailed = run.wait_detailed_timeout(WAIT).await.unwrap();
+    assert_eq!(detailed.output(), answer);
+    assert!(detailed.tool_outcomes.is_empty());
+    assert!(!detailed.tool_outcomes_truncated);
+    assert_eq!(run.result_detailed().await.unwrap().output(), answer);
+
+    let session = agent.open_session("large-session").await.unwrap();
+    let receipt = session
+        .submit(SubmitInput::new("large", "session"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        session.wait_timeout(&receipt.request_id, WAIT).await,
+        Err(AgentOrchestratorError::ResultNotRetained { .. })
+    ));
+    assert_eq!(
+        session.receipt("large").await.unwrap().unwrap().state,
+        SubmissionState::Answered
+    );
+    assert_eq!(
+        session.prompt("next").await.unwrap().output(),
+        "next answer"
+    );
+    session.close().await.unwrap();
+    let result = session.result_timeout(WAIT).await.unwrap();
+    assert_eq!(result.context.transcript.len(), 4);
+    assert!(
+        serde_json::to_string(&result.context.transcript)
+            .unwrap()
+            .contains(&answer)
+    );
+    orchestrator.shutdown(None).await;
+}
+
 async fn orchestrator(definition: rig_durable::AgentDefinition) -> AgentOrchestrator {
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
     AgentOrchestrator::builder(store)

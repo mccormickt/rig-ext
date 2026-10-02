@@ -794,16 +794,33 @@ impl DurableRun {
         &self,
         timeout: Duration,
     ) -> Result<DurableResponse, AgentOrchestratorError> {
-        self.wait_timeout(timeout).await?;
-        self.tool_outcomes().await
-    }
-
-    /// Retained response and tool dispositions of a completed run.
-    pub async fn tool_outcomes(&self) -> Result<DurableResponse, AgentOrchestratorError> {
+        let response = self.wait_timeout(timeout).await?;
+        if let Some(outcomes) = self
+            .client
+            .get_kv_value_typed::<crate::outcome::RetainedOutcomes>(
+                &self.instance_id,
+                crate::orchestration::RUN_OUTCOMES_KEY,
+            )
+            .await?
+        {
+            let mut detailed = DurableResponse::new(response, outcomes.tool_outcomes);
+            detailed.tool_outcomes_truncated = outcomes.tool_outcomes_truncated;
+            return Ok(detailed);
+        }
         self.client
             .get_kv_value_typed(&self.instance_id, RUN_RESULT_KEY)
             .await?
             .ok_or_else(|| AgentOrchestratorError::OutcomesUnavailable(self.run_id.clone()))
+    }
+
+    /// Retained response and tool dispositions of a completed run.
+    pub async fn result_detailed(&self) -> Result<DurableResponse, AgentOrchestratorError> {
+        self.wait_detailed_timeout(Duration::ZERO).await
+    }
+
+    /// Compatibility alias for [`Self::result_detailed`].
+    pub async fn tool_outcomes(&self) -> Result<DurableResponse, AgentOrchestratorError> {
+        self.result_detailed().await
     }
 
     pub async fn next_approval(&self) -> Result<ApprovalRequest, AgentOrchestratorError> {

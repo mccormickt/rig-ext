@@ -89,6 +89,12 @@ impl Compaction {
     /// the absorbed watermark. The output is a no-op when nothing new was
     /// demoted.
     pub async fn run(&self, request: CompactionRequest) -> Result<CompactionOutput, String> {
+        if request.expected_version != self.version
+            || (request.carry_over.is_some()
+                && request.carry_over_version.as_deref() != Some(self.version.as_str()))
+        {
+            return Err("compaction policy or carry-over version mismatch".into());
+        }
         let absorbed = request.absorbed;
         let (_kept, demoted) = self
             .policy
@@ -194,6 +200,9 @@ pub struct CompactionRecord {
 pub struct CompactionRequest {
     /// Session identity handed to the compactor.
     pub conversation_id: String,
+    pub expected_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carry_over_version: Option<String>,
     /// The full transcript. The policy decides the window over it.
     pub transcript: Vec<Message>,
     /// Transcript messages the current artifact already stands in for.
@@ -222,6 +231,8 @@ pub enum CompactionError {
     NotCanonical { cutoff: usize, error: String },
     #[error("unsupported compaction record format version {0}")]
     UnsupportedFormat(u32),
+    #[error("compaction policy or carry-over version mismatch")]
+    VersionMismatch,
 }
 
 /// Audit transcript plus the artifact that currently stands in for its prefix.
@@ -267,9 +278,18 @@ impl ContextState {
     }
 
     /// The activity input for the next compaction round.
-    pub fn request(&self, conversation_id: impl Into<String>) -> CompactionRequest {
+    pub fn request(
+        &self,
+        conversation_id: impl Into<String>,
+        expected_version: &str,
+    ) -> CompactionRequest {
         CompactionRequest {
             conversation_id: conversation_id.into(),
+            expected_version: expected_version.into(),
+            carry_over_version: self
+                .compaction
+                .as_ref()
+                .map(|record| record.policy_version.clone()),
             transcript: self.transcript.clone(),
             absorbed: self.applied_cutoff(),
             carry_over: self
@@ -283,7 +303,19 @@ impl ContextState {
     /// unchanged, when the output carries no artifact or does not advance
     /// past the applied cutoff. Rejects a cutoff beyond the transcript or
     /// one that leaves a non-canonical active context.
-    pub fn apply(&mut self, output: CompactionOutput) -> Result<bool, CompactionError> {
+    pub fn apply(
+        &mut self,
+        output: CompactionOutput,
+        expected_version: &str,
+    ) -> Result<bool, CompactionError> {
+        if output.policy_version != expected_version
+            || self
+                .compaction
+                .as_ref()
+                .is_some_and(|record| record.policy_version != expected_version)
+        {
+            return Err(CompactionError::VersionMismatch);
+        }
         let Some(artifact) = output.artifact else {
             return Ok(false);
         };
@@ -329,12 +361,17 @@ impl ContextState {
             }
         }
         self.compaction = record;
+        self.validate_active_context()
+            .map_err(|error| CompactionError::NotCanonical {
+                cutoff: self.applied_cutoff(),
+                error: error.to_string(),
+            })?;
         Ok(self)
     }
 }
 
 fn splice(summary: &Message, transcript: &[Message], cutoff: usize) -> Vec<Message> {
-    let tail = transcript.get(cutoff..).unwrap_or_default();
+    let tail = &transcript[cutoff..];
     let mut context = Vec::with_capacity(tail.len() + 1);
     context.push(summary.clone());
     context.extend(tail.iter().cloned());
@@ -542,11 +579,11 @@ mod tests {
         let mut state = ContextState::new(transcript());
         // 10 messages, keep 2: the window would start at the second tool
         // result, so the policy demotes through it. Cutoff 9.
-        let output = compaction.run(state.request("s")).await.unwrap();
+        let output = compaction.run(state.request("s", "test")).await.unwrap();
         assert_eq!(output.cutoff, 9);
         assert_eq!(output.input_messages, 9);
         assert_eq!(output.policy_version, "test");
-        assert!(state.apply(output).unwrap());
+        assert!(state.apply(output, "test").unwrap());
         let context = state.active_context();
         assert_eq!(context.len(), 2);
         validate_canonical(&context).unwrap();
@@ -558,10 +595,10 @@ mod tests {
         );
 
         // Nothing new demoted: a no-op output leaves the record in place.
-        let output = compaction.run(state.request("s")).await.unwrap();
+        let output = compaction.run(state.request("s", "test")).await.unwrap();
         assert!(output.artifact.is_none());
         assert_eq!(output.cutoff, 9);
-        assert!(!state.apply(output).unwrap());
+        assert!(!state.apply(output, "test").unwrap());
         assert_eq!(state.applied_cutoff(), 9);
 
         // The next round compacts only the new prefix and carries the prior
@@ -572,10 +609,10 @@ mod tests {
             Message::user("fifth"),
             Message::assistant("done again"),
         ]);
-        let output = compaction.run(state.request("s")).await.unwrap();
+        let output = compaction.run(state.request("s", "test")).await.unwrap();
         assert_eq!(output.cutoff, 12);
         assert_eq!(output.input_messages, 3);
-        assert!(state.apply(output).unwrap());
+        assert!(state.apply(output, "test").unwrap());
         validate_canonical(&state.active_context()).unwrap();
         assert_eq!(
             state.compaction.as_ref().unwrap().artifact.value,
@@ -586,9 +623,9 @@ mod tests {
     #[test]
     fn stale_output_does_not_move_the_cutoff_backwards() {
         let mut state = ContextState::new(transcript());
-        assert!(state.apply(output(6, "newer")).unwrap());
-        assert!(!state.apply(output(4, "older")).unwrap());
-        assert!(!state.apply(output(6, "same cutoff")).unwrap());
+        assert!(state.apply(output(6, "newer"), "1").unwrap());
+        assert!(!state.apply(output(4, "older"), "1").unwrap());
+        assert!(!state.apply(output(6, "same cutoff"), "1").unwrap());
         assert_eq!(
             state.compaction.as_ref().unwrap().artifact.value,
             serde_json::json!("newer")
@@ -600,11 +637,11 @@ mod tests {
     fn outputs_that_split_a_tool_exchange_are_rejected() {
         let mut state = ContextState::new(transcript());
         assert!(matches!(
-            state.apply(output(2, "mid exchange")).unwrap_err(),
+            state.apply(output(2, "mid exchange"), "1").unwrap_err(),
             CompactionError::NotCanonical { cutoff: 2, .. }
         ));
         assert_eq!(
-            state.apply(output(11, "beyond")).unwrap_err(),
+            state.apply(output(11, "beyond"), "1").unwrap_err(),
             CompactionError::OutOfRange {
                 cutoff: 11,
                 len: 10
@@ -627,9 +664,59 @@ mod tests {
         };
         assert_eq!(
             ContextState::new(transcript())
-                .with_compaction(Some(record))
+                .with_compaction(Some(record.clone()))
                 .unwrap_err(),
             CompactionError::UnsupportedFormat(COMPACTION_FORMAT_VERSION + 1)
         );
+        let mut record = record;
+        record.format_version = COMPACTION_FORMAT_VERSION;
+        record.cutoff = 11;
+        assert!(matches!(
+            ContextState::new(transcript()).with_compaction(Some(record.clone())),
+            Err(CompactionError::OutOfRange { .. })
+        ));
+        record.cutoff = 2;
+        assert!(matches!(
+            ContextState::new(transcript()).with_compaction(Some(record)),
+            Err(CompactionError::NotCanonical { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn version_mismatch_calls_neither_policy_nor_model() {
+        struct NoPolicy;
+        impl MemoryPolicy for NoPolicy {
+            fn apply(&self, _: Vec<Message>) -> Result<Vec<Message>, MemoryError> {
+                panic!("version mismatch must precede policy execution")
+            }
+        }
+        let model = rig::test_utils::MockCompletionModel::from_turns([]);
+        let compaction =
+            Compaction::new(NoPolicy, ModelCompactor::new(model.clone())).version("v2");
+        let mut state = ContextState::new(transcript());
+        assert!(
+            compaction
+                .run(state.request("s", "v1"))
+                .await
+                .unwrap_err()
+                .contains("version")
+        );
+        let mut prior = output(4, "prior");
+        prior.policy_version = "v1".into();
+        state.apply(prior, "v1").unwrap();
+        assert!(
+            compaction
+                .run(state.request("s", "v2"))
+                .await
+                .unwrap_err()
+                .contains("version")
+        );
+        let before = state.clone();
+        assert_eq!(
+            state.apply(output(6, "new"), "v1"),
+            Err(CompactionError::VersionMismatch)
+        );
+        assert_eq!(state, before);
+        assert!(model.requests().is_empty());
     }
 }

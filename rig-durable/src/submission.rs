@@ -13,6 +13,18 @@ use sha2::{Digest, Sha256};
 
 pub const LEDGER_FORMAT_VERSION: u32 = 1;
 pub const DEFAULT_LEDGER_MAX_BYTES: usize = 48 * 1024;
+pub const MAX_REQUEST_ID_BYTES: usize = 256;
+pub const MAX_ERROR_BYTES: usize = 256;
+
+/// Bound persisted error text on a UTF-8 boundary.
+pub(crate) fn bounded_error(mut error: String) -> String {
+    let mut end = error.len().min(MAX_ERROR_BYTES);
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    error.truncate(end);
+    error
+}
 
 /// How a session treats a submission while another prompt is active.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -205,9 +217,9 @@ impl SubmissionLedger {
         input: &SubmitInput,
         availability: SessionAvailability,
     ) -> Result<Admission, SubmissionError> {
-        if input.request_id.is_empty() {
+        if input.request_id.is_empty() || input.request_id.len() > MAX_REQUEST_ID_BYTES {
             return Err(SubmissionError::Invalid {
-                message: "request_id must not be empty".into(),
+                message: format!("request_id must contain 1 to {MAX_REQUEST_ID_BYTES} bytes"),
             });
         }
         let digest = input
@@ -258,13 +270,19 @@ impl SubmissionLedger {
 
     fn serialized_len_with(&self, candidate: &Submission) -> Result<usize, SubmissionError> {
         let mut projected = self.clone();
-        // Measure the largest terminal form so later transitions cannot
-        // overflow the limit.
-        let mut widest = candidate.clone();
-        widest.state = SubmissionState::Failed {
-            error: String::new(),
-        };
-        projected.receipts.insert(widest.request_id.clone(), widest);
+        projected
+            .receipts
+            .insert(candidate.request_id.clone(), candidate.clone());
+        // Reserve the largest JSON error encoding for every pending receipt.
+        for receipt in projected.receipts.values_mut() {
+            if !receipt.state.is_terminal() {
+                receipt.state = SubmissionState::Failed {
+                    error: "\0".repeat(MAX_ERROR_BYTES),
+                };
+            }
+        }
+        // Steering can also advance this counter after admission.
+        projected.next_prompt_index = u64::MAX;
         serde_json::to_vec(&projected)
             .map(|bytes| bytes.len())
             .map_err(|error| SubmissionError::Invalid {
@@ -274,7 +292,15 @@ impl SubmissionLedger {
 
     pub fn set_state(&mut self, request_id: &str, state: SubmissionState) -> Option<&Submission> {
         let receipt = self.receipts.get_mut(request_id)?;
-        receipt.state = state;
+        if receipt.state.is_terminal() {
+            return Some(receipt);
+        }
+        receipt.state = match state {
+            SubmissionState::Failed { error } => SubmissionState::Failed {
+                error: bounded_error(error),
+            },
+            other => other,
+        };
         Some(receipt)
     }
 
@@ -395,22 +421,50 @@ mod tests {
         let empty = SubmissionLedger::new("session-1", 1);
         let base = serde_json::to_vec(&empty).unwrap().len();
         // Room for one receipt, measured in its widest terminal form.
-        let mut ledger = SubmissionLedger::new("session-1", base + 260);
+        let limit = base + 260 + MAX_ERROR_BYTES * 6 + 20;
+        let mut ledger = SubmissionLedger::new("session-1", limit);
         let first = ledger.admit(&SubmitInput::new("req-1", "a"), IDLE).unwrap();
         assert!(matches!(first, Admission::Admitted(_)));
         let second = ledger.admit(&SubmitInput::new("req-2", "b"), IDLE);
         assert_eq!(
             second.unwrap_err(),
-            SubmissionError::LedgerFull {
-                max_bytes: base + 260
-            }
+            SubmissionError::LedgerFull { max_bytes: limit }
         );
         assert!(ledger.receipt("req-1").is_some());
         assert!(matches!(
             ledger.admit(&SubmitInput::new("req-1", "a"), IDLE).unwrap(),
             Admission::Existing(_)
         ));
-        assert!(serde_json::to_vec(&ledger).unwrap().len() <= base + 260);
+        assert!(serde_json::to_vec(&ledger).unwrap().len() <= limit);
+    }
+
+    #[test]
+    fn pending_receipts_reserve_all_terminal_transitions() {
+        let mut ledger = SubmissionLedger::new("s", 12_000);
+        let mut ids = Vec::new();
+        loop {
+            let id = ids.len().to_string();
+            if ledger.admit(&SubmitInput::new(&id, "a"), IDLE).is_err() {
+                break;
+            }
+            ids.push(id);
+        }
+        assert!(ids.len() > 1);
+        for id in &ids {
+            ledger.set_state(
+                id,
+                SubmissionState::Failed {
+                    error: "\0".repeat(100_000),
+                },
+            );
+            assert!(serde_json::to_vec(&ledger).unwrap().len() <= ledger.max_bytes);
+        }
+        assert_eq!(ledger.receipts.len(), ids.len());
+        assert!(matches!(
+            ledger.admit(&SubmitInput::new(&ids[0], "a"), IDLE),
+            Ok(Admission::Existing(_))
+        ));
+        assert!(bounded_error("é".repeat(500)).len() <= MAX_ERROR_BYTES);
     }
 
     #[test]

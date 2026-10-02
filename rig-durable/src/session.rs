@@ -145,7 +145,7 @@ struct SessionState {
 impl SessionState {
     fn availability(&self) -> SessionAvailability {
         SessionAvailability {
-            busy: self.running.is_some(),
+            busy: self.running.is_some() || !self.queued.is_empty(),
             closed: self.closed,
         }
     }
@@ -165,11 +165,14 @@ impl SessionState {
                     Ok(Admission::Existing(_)) => {}
                     Err(error) => {
                         self.rejections.entries.push_back(SessionRejection {
-                            command_id,
-                            request_id,
+                            command_id: rejection_identifier(command_id),
+                            request_id: rejection_identifier(request_id),
                             error,
                         });
-                        while self.rejections.entries.len() > SESSION_REJECTION_RETENTION {
+                        while self.rejections.entries.len() > SESSION_REJECTION_RETENTION
+                            || serde_json::to_vec(&self.rejections)
+                                .map_or(true, |bytes| bytes.len() > KV_VALUE_LIMIT)
+                        {
                             self.rejections.entries.pop_front();
                         }
                         self.rejections_dirty = true;
@@ -245,6 +248,15 @@ impl SessionState {
     }
 }
 
+fn rejection_identifier(value: String) -> String {
+    use sha2::{Digest, Sha256};
+    if value.len() <= crate::submission::MAX_REQUEST_ID_BYTES {
+        value
+    } else {
+        format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
+    }
+}
+
 pub(crate) async fn run_session(
     ctx: OrchestrationContext,
     input: SessionInput,
@@ -274,14 +286,16 @@ pub(crate) async fn run_session(
         (None, InvocationContract::Logical) => Some(config.snapshot()),
         (None, InvocationContract::Legacy) => None,
     };
-    input
-        .context
-        .validate_active_context()
+    let context = ContextState::new(input.context.transcript)
+        .with_compaction(input.context.compaction)
         .map_err(|error| format!("session context is not canonical: {error}"))?;
     let generation = input.generation;
     let mut state = SessionState {
-        context: input.context,
-        ledger: input.ledger,
+        context,
+        ledger: SubmissionLedger {
+            max_bytes: input.ledger.max_bytes.min(KV_VALUE_LIMIT),
+            ..input.ledger
+        },
         queued: input.queued.into(),
         retained_results: input.retained_results,
         rejections: SessionRejections {
@@ -397,16 +411,18 @@ async fn run_prompt(
     let mut full = agent.full_history();
     let added = full.split_off(base_len);
     state.context.append(added);
-    let detailed = DurableResponse::new(response, outcomes).fit_within(KV_VALUE_LIMIT);
-    state.retain_result(ctx, &receipt.submission_id, &detailed);
+    // Oversized answers remain in the audit transcript but are not retained in KV.
+    if let Some(detailed) = DurableResponse::new(response, outcomes).fit_within(KV_VALUE_LIMIT) {
+        state.retain_result(ctx, &receipt.submission_id, &detailed);
+    }
     state.set_state(&input.request_id, SubmissionState::Answered);
     // Publish the answer before any summary runs.
     state.flush(ctx);
-    if config.compaction.is_some() {
+    if let Some(compaction) = &config.compaction {
         set_status(ctx, state.status("compacting"), &|_| {});
         let request = state
             .context
-            .request(state.ledger.logical_session_id.clone());
+            .request(state.ledger.logical_session_id.clone(), &compaction.version);
         let output = ctx
             .schedule_activity_with_retry_typed(
                 &engine.names.compaction_activity,
@@ -419,7 +435,7 @@ async fn run_prompt(
         state.compaction_error = match output {
             Ok(output) => state
                 .context
-                .apply(output)
+                .apply(output, &compaction.version)
                 .err()
                 .map(|error| error.to_string()),
             Err(error) => Some(error),
@@ -460,4 +476,80 @@ async fn checkpoint(
         None => ctx.continue_as_new(payload).await?,
     };
     serde_json::from_str(&raw).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::submission::{DEFAULT_LEDGER_MAX_BYTES, SubmissionMode};
+
+    fn state() -> SessionState {
+        SessionState {
+            context: ContextState::default(),
+            ledger: SubmissionLedger::new("s", DEFAULT_LEDGER_MAX_BYTES),
+            queued: VecDeque::new(),
+            retained_results: Vec::new(),
+            rejections: SessionRejections::default(),
+            closed: false,
+            running: None,
+            compaction_error: None,
+            ledger_dirty: false,
+            rejections_dirty: false,
+        }
+    }
+
+    #[test]
+    fn queued_work_is_busy_before_execution_starts() {
+        let mut state = state();
+        for id in ["first", "second"] {
+            let command = SessionCommand::Submit {
+                command_id: id.into(),
+                input: SubmitInput::new(id, "go").mode(SubmissionMode::RejectIfBusy),
+            };
+            state.handle(&serde_json::to_string(&command).unwrap());
+        }
+        assert!(state.running.is_none());
+        assert_eq!(state.queued.len(), 1);
+        assert_eq!(state.ledger.receipts.len(), 1);
+        assert_eq!(state.rejections.entries[0].error, SubmissionError::Busy);
+    }
+
+    #[test]
+    fn rejection_retention_is_byte_bounded_without_evicting_receipts() {
+        let mut state = state();
+        state.handle(
+            &serde_json::to_string(&SessionCommand::Submit {
+                command_id: "keep".into(),
+                input: SubmitInput::new("keep", "go"),
+            })
+            .unwrap(),
+        );
+        state.ledger.max_bytes = 1;
+        for index in 0..200 {
+            let command = SessionCommand::Submit {
+                command_id: format!("{index}{}", "\0".repeat(250)),
+                input: SubmitInput::new(format!("{index}{}", "\0".repeat(250)), "rejected"),
+            };
+            state.handle(&serde_json::to_string(&command).unwrap());
+            assert!(serde_json::to_vec(&state.rejections).unwrap().len() <= KV_VALUE_LIMIT);
+        }
+        assert!(state.rejections.entries.len() < SESSION_REJECTION_RETENTION);
+        assert!(state.ledger.receipt("keep").is_some());
+        assert!(
+            state
+                .rejections
+                .entries
+                .iter()
+                .all(|r| matches!(r.error, SubmissionError::LedgerFull { .. }))
+        );
+        let huge = SessionCommand::Submit {
+            command_id: "a".repeat(100_000),
+            input: SubmitInput::new("b".repeat(100_000), "go"),
+        };
+        state.handle(&serde_json::to_string(&huge).unwrap());
+        let last = state.rejections.entries.back().unwrap();
+        assert!(last.command_id.starts_with("sha256:"));
+        assert!(last.request_id.starts_with("sha256:"));
+        assert!(serde_json::to_vec(&state.rejections).unwrap().len() <= KV_VALUE_LIMIT);
+    }
 }

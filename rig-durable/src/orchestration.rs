@@ -15,7 +15,7 @@ use crate::{
     driver::{self, CompletionOptions},
     identity::{AttemptMetadata, LogicalCallKey},
     names::RuntimeNames,
-    outcome::{CallPosition, DurableResponse, ToolOutcome},
+    outcome::{CallPosition, RetainedOutcomes, ToolOutcome},
     policy::ReplaySafety,
     streaming::StreamTranscript,
     tools::{ToolEntry, ToolRoute},
@@ -27,8 +27,10 @@ type ToolFuture<'a> =
 
 pub(crate) const STEERING_QUEUE_NAME: &str = "RigAgentSteeringV1";
 
-/// KV key under which a single run retains its [`DurableResponse`].
+/// Legacy KV key for a retained detailed response.
 pub const RUN_RESULT_KEY: &str = "rig_durable.run.result.v1";
+/// KV key for bounded tool outcomes; the response is the orchestration output.
+pub const RUN_OUTCOMES_KEY: &str = "rig_durable.run.outcomes.v1";
 
 /// Largest value this crate writes to Duroxide's per-instance KV store. It
 /// leaves headroom under Duroxide's 64 KiB value limit.
@@ -163,9 +165,9 @@ pub(crate) async fn run_with_names(
                 }
                 // Retained after every awaited event of the run, so histories
                 // recorded before this key existed still replay.
-                let detailed = DurableResponse::new(response.clone(), tool_outcomes)
-                    .fit_within(KV_VALUE_LIMIT);
-                ctx.set_kv_value_typed(RUN_RESULT_KEY, &detailed);
+                if let Some(outcomes) = RetainedOutcomes::new(tool_outcomes, KV_VALUE_LIMIT) {
+                    ctx.set_kv_value_typed(RUN_OUTCOMES_KEY, &outcomes);
+                }
                 set_status(&ctx, serde_json::json!({"phase":"completed"}), &decorate);
                 return Ok(response);
             }
