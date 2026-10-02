@@ -17,8 +17,8 @@ use rig::{
     tool::{Tool, ToolContext, ToolExecutionError},
 };
 use rig_durable::{
-    ApprovalDecision, CompactionPolicy, InMemoryGuardStore, InvocationContract,
-    InvocationGuardStore, LogicalCallKey, OutcomeSource, SubmissionMode, SubmissionState,
+    ApprovalDecision, Compaction, InMemoryGuardStore, InvocationContract, InvocationGuardStore,
+    LogicalCallKey, ModelCompactor, ModelSummary, OutcomeSource, SubmissionMode, SubmissionState,
     SubmitInput, ToolDisposition, ToolInvocation, ToolOutcome, ToolPolicy,
     temporal::{
         TemporalAgent, TemporalAgentError, TemporalAgentInput, TemporalAgentSessionSnapshot,
@@ -26,6 +26,7 @@ use rig_durable::{
         TemporalSubmission,
     },
 };
+use rig_memory::SlidingWindowMemory;
 use serde::Deserialize;
 use temporalio_client::{
     Client, ClientOptions, Connection, WorkflowExecuteUpdateOptions, WorkflowGetResultOptions,
@@ -1230,27 +1231,39 @@ async fn temporal_follow_up_during_a_tool_round_runs_after_the_answer_and_reject
     );
 }
 
+fn compaction(model: &MockCompletionModel, keep: usize) -> Compaction {
+    Compaction::new(
+        SlidingWindowMemory::last_messages(keep),
+        ModelCompactor::new(model.clone()),
+    )
+}
+
+const SUMMARY_HEADER: &str = "Summary of the earlier conversation:\n";
+const CARRY_OVER_HEADER: &str = "Summary of the conversation before this window:\n";
+
 #[tokio::test]
 #[ignore = "requires a live Temporal server configured with TEMPORAL_* variables"]
 async fn temporal_compaction_keeps_the_request_canonical_and_the_transcript_complete() {
     let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("call-1", "add", serde_json::json!({"x": 1, "y": 2})),
         MockTurn::text("answer one"),
+        MockTurn::text("SUMMARY A"),
         MockTurn::text("answer two"),
-        MockTurn::text("SUMMARY ONE"),
+        MockTurn::text("SUMMARY B"),
         MockTurn::text("answer three"),
-        MockTurn::text("SUMMARY TWO"),
+        MockTurn::text("SUMMARY C"),
         MockTurn::text("answer four"),
-        MockTurn::text("SUMMARY THREE"),
+        MockTurn::text("SUMMARY D"),
     ]);
     let agent = TemporalAgent::new(model.clone())
         .activity_max_attempts(1)
         .tool(MockAddTool)
-        .compaction(CompactionPolicy::new(4, 2).version("test-1"));
+        .compaction(compaction(&model, 2).version("test-1"));
     let result = with_session(agent, "rig-temporal-compaction-test", |handle| async move {
         assert_eq!(prompt(&handle, "one").await, "answer one");
+        // Each prompt waits for the compaction round the previous one
+        // scheduled.
         assert_eq!(prompt(&handle, "two").await, "answer two");
-        // The third prompt waits for the summary that the second one scheduled.
         assert_eq!(prompt(&handle, "three").await, "answer three");
         assert_eq!(prompt(&handle, "four").await, "answer four");
         close(&handle).await
@@ -1258,49 +1271,71 @@ async fn temporal_compaction_keeps_the_request_canonical_and_the_transcript_comp
     .await;
 
     let requests: Vec<CompletionRequest> = model.requests();
-    assert_eq!(requests.len(), 8);
+    assert_eq!(requests.len(), 9);
 
-    let summary_one = &requests[3];
+    // Prompt one left 4 transcript messages. Keeping 2 would start the
+    // window at the tool result, so the policy demoted the whole exchange.
+    let summary_a = &requests[2];
     assert!(matches!(
-        summary_one.chat_history.first(),
+        summary_a.chat_history.first(),
         Some(Message::System { .. })
     ));
-    assert_eq!(summary_one.chat_history.len(), 6);
-    assert!(has_tool_call(&summary_one.chat_history));
+    assert_eq!(summary_a.chat_history.len(), 5);
+    assert!(has_tool_call(&summary_a.chat_history));
     assert_eq!(
-        user_texts(&summary_one.chat_history[1..]),
+        user_texts(&summary_a.chat_history[1..]),
         ["one", SUMMARY_PROMPT]
     );
 
-    let third = &requests[4];
-    rig::transcript::validate_canonical(&third.chat_history).unwrap();
-    assert_eq!(third.chat_history.len(), 4);
-    let texts = user_texts(&third.chat_history);
+    let second = &requests[3];
+    rig::transcript::validate_canonical(&second.chat_history).unwrap();
+    assert_eq!(second.chat_history.len(), 3);
     assert_eq!(
-        texts[0],
-        "Summary of the earlier conversation (compacted, policy version test-1):\nSUMMARY ONE"
+        user_texts(&second.chat_history),
+        [format!("{SUMMARY_HEADER}SUMMARY A"), "two".into()]
     );
-    assert_eq!(&texts[1..], ["two", "three"]);
-    assert!(!has_tool_call(&third.chat_history));
+    assert!(!has_tool_call(&second.chat_history));
 
-    let summary_two = &requests[5];
+    let summary_b = &requests[4];
+    assert_eq!(summary_b.chat_history.len(), 4);
     assert_eq!(
-        user_texts(&summary_two.chat_history[1..]),
+        user_texts(&summary_b.chat_history[1..]),
         [
-            "Summary of the conversation before this window:\nSUMMARY ONE",
-            "two",
-            SUMMARY_PROMPT
+            format!("{CARRY_OVER_HEADER}SUMMARY A"),
+            SUMMARY_PROMPT.into()
         ]
     );
 
-    let fourth = &requests[6];
+    let third = &requests[5];
+    rig::transcript::validate_canonical(&third.chat_history).unwrap();
+    assert_eq!(third.chat_history.len(), 4);
+    assert_eq!(
+        user_texts(&third.chat_history),
+        [
+            format!("{SUMMARY_HEADER}SUMMARY B"),
+            "two".into(),
+            "three".into()
+        ]
+    );
+
+    let summary_c = &requests[6];
+    assert_eq!(
+        user_texts(&summary_c.chat_history[1..]),
+        [
+            format!("{CARRY_OVER_HEADER}SUMMARY B"),
+            "two".into(),
+            SUMMARY_PROMPT.into()
+        ]
+    );
+
+    let fourth = &requests[7];
     rig::transcript::validate_canonical(&fourth.chat_history).unwrap();
     assert_eq!(
         user_texts(&fourth.chat_history),
         [
-            "Summary of the earlier conversation (compacted, policy version test-1):\nSUMMARY TWO",
-            "three",
-            "four"
+            format!("{SUMMARY_HEADER}SUMMARY C"),
+            "three".into(),
+            "four".into()
         ]
     );
 
@@ -1311,7 +1346,8 @@ async fn temporal_compaction_keeps_the_request_canonical_and_the_transcript_comp
     assert_eq!(record.cutoff, 8);
     assert_eq!(record.input_messages, 2);
     assert_eq!(record.policy_version, "test-1");
-    assert_eq!(record.summary, "SUMMARY THREE");
+    let summary: ModelSummary = serde_json::from_value(record.artifact.value).unwrap();
+    assert_eq!(summary.text, "SUMMARY D");
 }
 
 #[tokio::test]
@@ -1326,7 +1362,7 @@ async fn temporal_failed_summary_leaves_the_context_in_place_and_the_session_ope
     ]);
     let agent = TemporalAgent::new(model.clone())
         .activity_max_attempts(1)
-        .compaction(CompactionPolicy::new(1, 0));
+        .compaction(compaction(&model, 1));
     let result = with_session(
         agent,
         "rig-temporal-compaction-failure-test",
@@ -1349,7 +1385,7 @@ async fn temporal_failed_summary_leaves_the_context_in_place_and_the_session_ope
     .await;
 
     let requests = model.requests();
-    // The summary after the third prompt had no scripted turn and failed too.
+    // The round after the third prompt had no scripted turn and failed too.
     assert_eq!(requests.len(), 6);
     assert_eq!(user_texts(&requests[2].chat_history), ["one", "two"]);
     assert_eq!(
@@ -1358,13 +1394,10 @@ async fn temporal_failed_summary_leaves_the_context_in_place_and_the_session_ope
     );
     assert_eq!(
         user_texts(&requests[4].chat_history),
-        [
-            "Summary of the earlier conversation (compacted, policy version 1):\nSUMMARY",
-            "three"
-        ]
+        [format!("{SUMMARY_HEADER}SUMMARY"), "three".into()]
     );
     assert_eq!(result.history.len(), 6);
-    assert_eq!(result.compaction.unwrap().cutoff, 4);
+    assert_eq!(result.compaction.unwrap().cutoff, 3);
 }
 
 struct Disposition;

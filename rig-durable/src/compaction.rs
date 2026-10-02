@@ -1,18 +1,32 @@
 //! Bound the active model context separately from the audit transcript.
 //!
-//! A [`ContextState`] keeps the full transcript and, optionally, one
-//! [`CompactionRecord`] that stands in for a prefix of it. Compaction happens
-//! only between completed prompts: the cutoff always falls on a prompt
-//! boundary, so assistant turns stay with their tool results and the active
-//! context stays a canonical transcript. The transcript itself is never
-//! shortened by compaction.
+//! Compaction composes two Rig abstractions. A [`MemoryPolicy`] from
+//! `rig-memory` decides which transcript prefix leaves the active window. A
+//! [`Compactor`] from `rig::memory` folds that prefix, together with the prior
+//! artifact, into a new artifact. Both run inside the compaction activity, so
+//! workflow code never executes policy or model logic. The workflow owns only
+//! the durable watermark: a [`ContextState`] keeps the full transcript and one
+//! [`CompactionRecord`] that stands in for a prefix of it. This is the durable
+//! form of `rig_memory::CompactingMemory`, whose watermark lives in process
+//! memory.
+//!
+//! Compaction runs after a completed prompt, never inside one. The transcript
+//! itself is never shortened by compaction.
+
+use std::{fmt, sync::Arc};
 
 use rig::{
-    completion::{Message, Usage},
-    message::UserContent,
+    DynModel,
+    completion::{CompletionRequest, Message, Usage},
+    id::ConversationId,
+    memory::{Compactor, MemoryError},
+    operation::Completion,
     transcript::{TranscriptError, validate_canonical},
+    wasm_compat::WasmBoxedFuture,
 };
-use serde::{Deserialize, Serialize};
+use rig_memory::MemoryPolicy;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 
 pub const COMPACTION_FORMAT_VERSION: u32 = 1;
 
@@ -20,99 +34,197 @@ const DEFAULT_INSTRUCTIONS: &str = "You compact conversation history for an assi
 continue the conversation. Write a concise summary that preserves user goals, decisions, facts, \
 tool results, and open questions. Do not add commentary.";
 
-/// When and how to compact the active context.
+const SUMMARY_PROMPT: &str = "Summarize the conversation above for an assistant that will \
+continue it. Reply with the summary only.";
+
+/// Serializable compaction settings recorded with a configuration. The
+/// policy and compactor are worker code; only their version is recorded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompactionPolicy {
-    /// Compact when the active context holds more messages than this.
-    pub max_context_messages: usize,
-    /// Minimum number of recent transcript messages kept verbatim. The
-    /// cutoff moves to the latest prompt boundary that keeps at least this
-    /// many messages.
-    pub keep_recent_messages: usize,
-    /// Version of the summarization instructions and model settings. It is
-    /// recorded with every summary.
+pub struct CompactionConfig {
+    /// Version of the policy and compactor pair. It is recorded with every
+    /// artifact.
     pub version: String,
-    /// System instructions for the summarization model call.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
 }
 
-impl CompactionPolicy {
-    pub fn new(max_context_messages: usize, keep_recent_messages: usize) -> Self {
+/// Worker-side compaction: a [`MemoryPolicy`] chooses what leaves the active
+/// window and a [`Compactor`] folds it into an artifact.
+///
+/// The compactor's artifact must serialize, because the workflow retains it
+/// and passes it back as `carry_over` on the next round.
+#[derive(Clone)]
+pub struct Compaction {
+    policy: Arc<dyn MemoryPolicy>,
+    compactor: Arc<dyn ErasedCompactor>,
+    version: String,
+}
+
+impl Compaction {
+    pub fn new<P, C>(policy: P, compactor: C) -> Self
+    where
+        P: MemoryPolicy + 'static,
+        C: Compactor + 'static,
+        C::Artifact: Serialize + DeserializeOwned,
+    {
         Self {
-            max_context_messages: max_context_messages.max(1),
-            keep_recent_messages,
+            policy: Arc::new(policy),
+            compactor: Arc::new(compactor),
             version: "1".into(),
-            instructions: None,
         }
     }
 
+    /// Record a version for this policy and compactor pair. Change it when
+    /// either changes in a way that alters the artifacts it produces.
     pub fn version(mut self, version: impl Into<String>) -> Self {
         self.version = version.into();
         self
     }
 
-    pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
-        self.instructions = Some(instructions.into());
-        self
+    pub fn config(&self) -> CompactionConfig {
+        CompactionConfig {
+            version: self.version.clone(),
+        }
     }
 
-    pub fn instructions_text(&self) -> &str {
-        self.instructions.as_deref().unwrap_or(DEFAULT_INSTRUCTIONS)
+    /// Apply the policy to the transcript and compact what it demoted after
+    /// the absorbed watermark. The output is a no-op when nothing new was
+    /// demoted.
+    pub async fn run(&self, request: CompactionRequest) -> Result<CompactionOutput, String> {
+        let absorbed = request.absorbed;
+        let (_kept, demoted) = self
+            .policy
+            .apply_with_demoted(request.transcript)
+            .map_err(|error| error.to_string())?;
+        let cutoff = demoted.len();
+        if cutoff <= absorbed {
+            return Ok(CompactionOutput {
+                cutoff: absorbed,
+                policy_version: self.version.clone(),
+                input_messages: 0,
+                artifact: None,
+            });
+        }
+        let evicted = demoted
+            .get(absorbed..)
+            .ok_or("compaction watermark exceeds demoted slice length")?;
+        let conversation_id = ConversationId::new(request.conversation_id);
+        let artifact = self
+            .compactor
+            .compact(&conversation_id, evicted, request.carry_over.as_ref())
+            .await?;
+        Ok(CompactionOutput {
+            cutoff,
+            policy_version: self.version.clone(),
+            input_messages: evicted.len(),
+            artifact: Some(artifact),
+        })
     }
 }
 
-/// One applied summary. Transcript messages before `cutoff` are represented
-/// by `summary` in the active context.
+impl fmt::Debug for Compaction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Compaction")
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Object-safe view of a [`Compactor`] whose artifact round-trips through
+/// JSON.
+trait ErasedCompactor: Send + Sync {
+    fn compact<'a>(
+        &'a self,
+        conversation_id: &'a ConversationId,
+        evicted: &'a [Message],
+        carry_over: Option<&'a Value>,
+    ) -> WasmBoxedFuture<'a, Result<CompactionArtifact, String>>;
+}
+
+impl<C> ErasedCompactor for C
+where
+    C: Compactor + Send + Sync,
+    C::Artifact: Serialize + DeserializeOwned,
+{
+    fn compact<'a>(
+        &'a self,
+        conversation_id: &'a ConversationId,
+        evicted: &'a [Message],
+        carry_over: Option<&'a Value>,
+    ) -> WasmBoxedFuture<'a, Result<CompactionArtifact, String>> {
+        Box::pin(async move {
+            let carry_over = carry_over
+                .map(|value| serde_json::from_value::<C::Artifact>(value.clone()))
+                .transpose()
+                .map_err(|error| format!("prior compaction artifact does not decode: {error}"))?;
+            let artifact = Compactor::compact(self, conversation_id, evicted, carry_over.as_ref())
+                .await
+                .map_err(|error| error.to_string())?;
+            let value = serde_json::to_value(&artifact)
+                .map_err(|error| format!("compaction artifact does not encode: {error}"))?;
+            Ok(CompactionArtifact {
+                value,
+                message: artifact.into(),
+            })
+        })
+    }
+}
+
+/// A compactor artifact in the two forms the workflow needs: the encoded
+/// value it carries over, and the message it splices into the context.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompactionArtifact {
+    pub value: Value,
+    pub message: Message,
+}
+
+/// One applied artifact. Transcript messages before `cutoff` are represented
+/// by `artifact.message` in the active context.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompactionRecord {
     pub format_version: u32,
-    /// Number of transcript messages the summary stands in for.
+    /// Number of transcript messages the artifact stands in for.
     pub cutoff: usize,
     pub policy_version: String,
-    pub summary: String,
-    pub usage: Usage,
-    /// Transcript messages summarized in this round, after the prior cutoff.
+    pub artifact: CompactionArtifact,
+    /// Transcript messages compacted in this round, after the prior cutoff.
     pub input_messages: usize,
 }
 
-/// Input of the summarization activity.
+/// Input of the compaction activity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompactionRequest {
-    /// The cutoff this summary will stand in for.
-    pub cutoff: usize,
-    pub policy_version: String,
-    pub instructions: String,
-    /// Summary that already covers the transcript before `messages`.
+    /// Session identity handed to the compactor.
+    pub conversation_id: String,
+    /// The full transcript. The policy decides the window over it.
+    pub transcript: Vec<Message>,
+    /// Transcript messages the current artifact already stands in for.
+    pub absorbed: usize,
+    /// Encoded artifact of the applied record, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prior_summary: Option<String>,
-    /// Transcript messages between the prior cutoff and `cutoff`.
-    pub messages: Vec<Message>,
+    pub carry_over: Option<Value>,
 }
 
-/// Output of the summarization activity.
+/// Output of the compaction activity. `artifact` is `None` when the policy
+/// demoted nothing beyond the absorbed watermark.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompactionOutput {
     pub cutoff: usize,
     pub policy_version: String,
-    pub summary: String,
-    pub usage: Usage,
     pub input_messages: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<CompactionArtifact>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CompactionError {
-    #[error("summary cutoff {cutoff} does not advance past the applied cutoff {applied}")]
-    Stale { cutoff: usize, applied: usize },
-    #[error("summary cutoff {cutoff} exceeds the transcript length {len}")]
+    #[error("compaction cutoff {cutoff} exceeds the transcript length {len}")]
     OutOfRange { cutoff: usize, len: usize },
-    #[error("summary cutoff {cutoff} is not a prompt boundary")]
-    NotABoundary { cutoff: usize },
+    #[error("compaction cutoff {cutoff} leaves a non-canonical context: {error}")]
+    NotCanonical { cutoff: usize, error: String },
     #[error("unsupported compaction record format version {0}")]
     UnsupportedFormat(u32),
 }
 
-/// Audit transcript plus the summary that currently stands in for its prefix.
+/// Audit transcript plus the artifact that currently stands in for its prefix.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContextState {
     /// Every message, in order. Compaction never removes from it.
@@ -140,16 +252,11 @@ impl ContextState {
         self.transcript.extend(messages);
     }
 
-    /// Messages the next prompt is built on: the summary, if any, followed
-    /// by the transcript after the cutoff.
+    /// Messages the next prompt is built on: the artifact message, if any,
+    /// followed by the transcript after the cutoff.
     pub fn active_context(&self) -> Vec<Message> {
         match &self.compaction {
-            Some(record) => {
-                let mut context = Vec::with_capacity(self.transcript.len() - record.cutoff + 1);
-                context.push(summary_message(record));
-                context.extend(self.transcript[record.cutoff..].iter().cloned());
-                context
-            }
+            Some(record) => splice(&record.artifact.message, &self.transcript, record.cutoff),
             None => self.transcript.clone(),
         }
     }
@@ -159,41 +266,29 @@ impl ContextState {
         validate_canonical(&self.active_context())
     }
 
-    /// Decide whether the policy requires a summary now, and of what.
-    pub fn plan(&self, policy: &CompactionPolicy) -> Option<CompactionRequest> {
-        let active_len = self.active_context().len();
-        if active_len <= policy.max_context_messages {
-            return None;
-        }
-        let applied = self.applied_cutoff();
-        let latest_allowed = self
-            .transcript
-            .len()
-            .checked_sub(policy.keep_recent_messages)?;
-        let cutoff = (applied + 1..=latest_allowed)
-            .rev()
-            .find(|&index| is_prompt_boundary(&self.transcript, index))?;
-        Some(CompactionRequest {
-            cutoff,
-            policy_version: policy.version.clone(),
-            instructions: policy.instructions_text().to_owned(),
-            prior_summary: self
+    /// The activity input for the next compaction round.
+    pub fn request(&self, conversation_id: impl Into<String>) -> CompactionRequest {
+        CompactionRequest {
+            conversation_id: conversation_id.into(),
+            transcript: self.transcript.clone(),
+            absorbed: self.applied_cutoff(),
+            carry_over: self
                 .compaction
                 .as_ref()
-                .map(|record| record.summary.clone()),
-            messages: self.transcript[applied..cutoff].to_vec(),
-        })
+                .map(|record| record.artifact.value.clone()),
+        }
     }
 
-    /// Apply a finished summary. A summary whose cutoff does not advance past
-    /// the applied cutoff is stale and leaves the context unchanged.
-    pub fn apply(&mut self, output: CompactionOutput) -> Result<(), CompactionError> {
-        let applied = self.applied_cutoff();
-        if output.cutoff <= applied {
-            return Err(CompactionError::Stale {
-                cutoff: output.cutoff,
-                applied,
-            });
+    /// Apply a finished round. Returns `false`, and leaves the context
+    /// unchanged, when the output carries no artifact or does not advance
+    /// past the applied cutoff. Rejects a cutoff beyond the transcript or
+    /// one that leaves a non-canonical active context.
+    pub fn apply(&mut self, output: CompactionOutput) -> Result<bool, CompactionError> {
+        let Some(artifact) = output.artifact else {
+            return Ok(false);
+        };
+        if output.cutoff <= self.applied_cutoff() {
+            return Ok(false);
         }
         if output.cutoff > self.transcript.len() {
             return Err(CompactionError::OutOfRange {
@@ -201,20 +296,20 @@ impl ContextState {
                 len: self.transcript.len(),
             });
         }
-        if !is_prompt_boundary(&self.transcript, output.cutoff) {
-            return Err(CompactionError::NotABoundary {
+        validate_canonical(&splice(&artifact.message, &self.transcript, output.cutoff)).map_err(
+            |error| CompactionError::NotCanonical {
                 cutoff: output.cutoff,
-            });
-        }
+                error: error.to_string(),
+            },
+        )?;
         self.compaction = Some(CompactionRecord {
             format_version: COMPACTION_FORMAT_VERSION,
             cutoff: output.cutoff,
             policy_version: output.policy_version,
-            summary: output.summary,
-            usage: output.usage,
+            artifact,
             input_messages: output.input_messages,
         });
-        Ok(())
+        Ok(true)
     }
 
     /// Restore a record retained by an earlier execution.
@@ -238,31 +333,118 @@ impl ContextState {
     }
 }
 
-/// A cutoff is valid when the message at that index starts a new prompt: a
-/// user message that carries no tool result, or a system message. The index
-/// equal to the transcript length is the end boundary.
-pub fn is_prompt_boundary(transcript: &[Message], index: usize) -> bool {
-    match transcript.get(index) {
-        None => index == transcript.len(),
-        Some(Message::System { .. }) => true,
-        Some(Message::User { content }) => !content
-            .iter()
-            .any(|item| matches!(item, UserContent::ToolResult(_))),
-        Some(Message::Assistant { .. }) => false,
+fn splice(summary: &Message, transcript: &[Message], cutoff: usize) -> Vec<Message> {
+    let tail = transcript.get(cutoff..).unwrap_or_default();
+    let mut context = Vec::with_capacity(tail.len() + 1);
+    context.push(summary.clone());
+    context.extend(tail.iter().cloned());
+    context
+}
+
+/// A [`Compactor`] that summarizes the evicted window with one model call.
+/// Its artifact serializes, so it works across the durable boundary.
+pub struct ModelCompactor {
+    model: DynModel<Completion>,
+    instructions: String,
+}
+
+impl ModelCompactor {
+    pub fn new(model: impl Into<DynModel<Completion>>) -> Self {
+        Self {
+            model: model.into(),
+            instructions: DEFAULT_INSTRUCTIONS.into(),
+        }
+    }
+
+    /// System instructions for the summarization model call.
+    pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.instructions = instructions.into();
+        self
     }
 }
 
-/// The message that stands in for the compacted prefix.
-pub fn summary_message(record: &CompactionRecord) -> Message {
-    Message::user(format!(
-        "Summary of the earlier conversation (compacted, policy version {}):\n{}",
-        record.policy_version, record.summary
-    ))
+impl fmt::Debug for ModelCompactor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModelCompactor")
+            .field("instructions", &self.instructions)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Artifact of [`ModelCompactor`]: the summary text and the usage of the
+/// call that produced it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelSummary {
+    pub text: String,
+    pub usage: Usage,
+}
+
+impl From<ModelSummary> for Message {
+    fn from(summary: ModelSummary) -> Self {
+        Message::user(format!(
+            "Summary of the earlier conversation:\n{}",
+            summary.text
+        ))
+    }
+}
+
+impl Compactor for ModelCompactor {
+    type Artifact = ModelSummary;
+
+    fn compact<'a>(
+        &'a self,
+        _conversation_id: &'a ConversationId,
+        evicted: &'a [Message],
+        carry_over: Option<&'a Self::Artifact>,
+    ) -> WasmBoxedFuture<'a, Result<Self::Artifact, MemoryError>> {
+        Box::pin(async move {
+            let mut chat_history = Vec::with_capacity(evicted.len() + 3);
+            chat_history.push(Message::system(self.instructions.clone()));
+            if let Some(prior) = carry_over {
+                chat_history.push(Message::user(format!(
+                    "Summary of the conversation before this window:\n{}",
+                    prior.text
+                )));
+            }
+            chat_history.extend(evicted.iter().cloned());
+            chat_history.push(Message::user(SUMMARY_PROMPT));
+            let completion = CompletionRequest {
+                model: None,
+                chat_history,
+                documents: Vec::new(),
+                tools: Vec::new(),
+                temperature: None,
+                max_tokens: None,
+                tool_choice: None,
+                additional_params: None,
+                output_schema: None,
+                record_telemetry_content: false,
+            };
+            let response = self
+                .model
+                .call(completion)
+                .await
+                .map_err(|error| MemoryError::Backend(Box::new(error)))?;
+            let text = response.text();
+            if text.trim().is_empty() {
+                return Err(MemoryError::Policy(
+                    "summarization model returned no text".into(),
+                ));
+            }
+            Ok(ModelSummary {
+                text,
+                usage: response.usage,
+            })
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use rig::message::{AssistantContent, ToolCall, ToolFunction, ToolName, ToolResultContent};
+    use rig::message::{
+        AssistantContent, ToolCall, ToolFunction, ToolName, ToolResultContent, UserContent,
+    };
+    use rig_memory::SlidingWindowMemory;
 
     use super::*;
 
@@ -303,78 +485,124 @@ mod tests {
         messages
     }
 
-    fn output(cutoff: usize, summary: &str) -> CompactionOutput {
-        CompactionOutput {
-            cutoff,
-            policy_version: "1".into(),
-            summary: summary.into(),
-            usage: Usage::default(),
-            input_messages: cutoff,
+    /// Joins the evicted user texts; the artifact is its own text.
+    struct JoinCompactor;
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct Joined(String);
+
+    impl From<Joined> for Message {
+        fn from(joined: Joined) -> Self {
+            Message::system(joined.0)
         }
     }
 
-    #[test]
-    fn cutoff_lands_on_a_prompt_boundary_and_keeps_tool_groups_together() {
-        let state = ContextState::new(transcript());
-        // 10 messages; keep at least 3 recent. Latest allowed cutoff is 7,
-        // which splits the second tool exchange; the plan backs up to 6.
-        let plan = state.plan(&CompactionPolicy::new(4, 3)).unwrap();
-        assert_eq!(plan.cutoff, 6);
-        assert_eq!(plan.messages.len(), 6);
-        assert!(plan.prior_summary.is_none());
-        validate_canonical(&plan.messages).unwrap();
+    impl Compactor for JoinCompactor {
+        type Artifact = Joined;
+
+        fn compact<'a>(
+            &'a self,
+            _conversation_id: &'a ConversationId,
+            evicted: &'a [Message],
+            carry_over: Option<&'a Self::Artifact>,
+        ) -> WasmBoxedFuture<'a, Result<Self::Artifact, MemoryError>> {
+            Box::pin(async move {
+                let mut parts: Vec<String> = carry_over
+                    .map(|prior| prior.0.clone())
+                    .into_iter()
+                    .collect();
+                parts.extend(evicted.iter().filter_map(|message| match message {
+                    Message::User { content } => content.iter().find_map(|item| match item {
+                        UserContent::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    }),
+                    _ => None,
+                }));
+                Ok(Joined(parts.join("|")))
+            })
+        }
     }
 
-    #[test]
-    fn active_context_after_compaction_is_canonical_and_transcript_is_retained() {
+    fn output(cutoff: usize, text: &str) -> CompactionOutput {
+        CompactionOutput {
+            cutoff,
+            policy_version: "1".into(),
+            input_messages: cutoff,
+            artifact: Some(CompactionArtifact {
+                value: Value::String(text.into()),
+                message: Message::system(text),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_evicts_and_compactor_carries_the_prior_artifact() {
+        let compaction =
+            Compaction::new(SlidingWindowMemory::last_messages(2), JoinCompactor).version("test");
         let mut state = ContextState::new(transcript());
-        state.apply(output(6, "user asked twice")).unwrap();
+        // 10 messages, keep 2: the window would start at the second tool
+        // result, so the policy demotes through it. Cutoff 9.
+        let output = compaction.run(state.request("s")).await.unwrap();
+        assert_eq!(output.cutoff, 9);
+        assert_eq!(output.input_messages, 9);
+        assert_eq!(output.policy_version, "test");
+        assert!(state.apply(output).unwrap());
         let context = state.active_context();
-        assert_eq!(context.len(), 5);
+        assert_eq!(context.len(), 2);
         validate_canonical(&context).unwrap();
-        assert!(matches!(&context[0], Message::User { .. }));
         assert_eq!(state.transcript.len(), 10);
-        assert_eq!(state.transcript, transcript());
+        let record = state.compaction.as_ref().unwrap();
+        assert_eq!(
+            record.artifact.value,
+            serde_json::json!("first|second|third")
+        );
 
-        // Later rounds summarize only the messages after the applied cutoff
-        // and carry the prior summary.
-        state.append([Message::user("fourth"), Message::assistant("done")]);
-        let plan = state.plan(&CompactionPolicy::new(3, 2)).unwrap();
-        assert_eq!(plan.cutoff, 10);
-        assert_eq!(plan.messages.len(), 4);
-        assert_eq!(plan.prior_summary.as_deref(), Some("user asked twice"));
+        // Nothing new demoted: a no-op output leaves the record in place.
+        let output = compaction.run(state.request("s")).await.unwrap();
+        assert!(output.artifact.is_none());
+        assert_eq!(output.cutoff, 9);
+        assert!(!state.apply(output).unwrap());
+        assert_eq!(state.applied_cutoff(), 9);
+
+        // The next round compacts only the new prefix and carries the prior
+        // artifact into the compactor.
+        state.append([
+            Message::user("fourth"),
+            Message::assistant("done"),
+            Message::user("fifth"),
+            Message::assistant("done again"),
+        ]);
+        let output = compaction.run(state.request("s")).await.unwrap();
+        assert_eq!(output.cutoff, 12);
+        assert_eq!(output.input_messages, 3);
+        assert!(state.apply(output).unwrap());
+        validate_canonical(&state.active_context()).unwrap();
+        assert_eq!(
+            state.compaction.as_ref().unwrap().artifact.value,
+            serde_json::json!("first|second|third|fourth")
+        );
     }
 
     #[test]
-    fn stale_summary_does_not_move_the_cutoff_backwards() {
+    fn stale_output_does_not_move_the_cutoff_backwards() {
         let mut state = ContextState::new(transcript());
-        state.apply(output(6, "newer")).unwrap();
-        let stale = state.apply(output(4, "older"));
+        assert!(state.apply(output(6, "newer")).unwrap());
+        assert!(!state.apply(output(4, "older")).unwrap());
+        assert!(!state.apply(output(6, "same cutoff")).unwrap());
         assert_eq!(
-            stale.unwrap_err(),
-            CompactionError::Stale {
-                cutoff: 4,
-                applied: 6
-            }
+            state.compaction.as_ref().unwrap().artifact.value,
+            serde_json::json!("newer")
         );
-        assert_eq!(
-            state.apply(output(6, "same cutoff")).unwrap_err(),
-            CompactionError::Stale {
-                cutoff: 6,
-                applied: 6
-            }
-        );
-        assert_eq!(state.compaction.as_ref().unwrap().summary, "newer");
         assert_eq!(state.applied_cutoff(), 6);
     }
 
     #[test]
-    fn summaries_that_split_a_tool_exchange_are_rejected() {
+    fn outputs_that_split_a_tool_exchange_are_rejected() {
         let mut state = ContextState::new(transcript());
-        assert_eq!(
+        assert!(matches!(
             state.apply(output(2, "mid exchange")).unwrap_err(),
-            CompactionError::NotABoundary { cutoff: 2 }
-        );
+            CompactionError::NotCanonical { cutoff: 2, .. }
+        ));
         assert_eq!(
             state.apply(output(11, "beyond")).unwrap_err(),
             CompactionError::OutOfRange {
@@ -386,9 +614,22 @@ mod tests {
     }
 
     #[test]
-    fn no_plan_when_within_budget_or_nothing_can_be_kept() {
-        let state = ContextState::new(transcript());
-        assert!(state.plan(&CompactionPolicy::new(10, 2)).is_none());
-        assert!(state.plan(&CompactionPolicy::new(2, 20)).is_none());
+    fn restored_records_are_checked() {
+        let record = CompactionRecord {
+            format_version: COMPACTION_FORMAT_VERSION + 1,
+            cutoff: 1,
+            policy_version: "1".into(),
+            artifact: CompactionArtifact {
+                value: Value::Null,
+                message: Message::system("x"),
+            },
+            input_messages: 1,
+        };
+        assert_eq!(
+            ContextState::new(transcript())
+                .with_compaction(Some(record))
+                .unwrap_err(),
+            CompactionError::UnsupportedFormat(COMPACTION_FORMAT_VERSION + 1)
+        );
     }
 }

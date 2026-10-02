@@ -27,7 +27,7 @@ use crate::{
     activity_types::{InvocationContract, ToolActivityInput, ToolActivityOutput, ToolInvocation},
     approval::{ApprovalDecision, ApprovalRequest},
     compaction::{
-        CompactionError, CompactionOutput, CompactionPolicy, CompactionRecord, CompactionRequest,
+        Compaction, CompactionConfig, CompactionOutput, CompactionRecord, CompactionRequest,
         ContextState,
     },
     driver::{self, CompletionOptions},
@@ -67,7 +67,7 @@ pub struct TemporalAgentConfig {
     pub contract: InvocationContract,
     /// Completed-prompt compaction for session workflows. `None` disables it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compaction: Option<CompactionPolicy>,
+    pub compaction: Option<CompactionConfig>,
 }
 
 impl Default for TemporalAgentConfig {
@@ -301,12 +301,13 @@ pub struct TemporalAgentSessionWorkflow {
     preassigned_prompt_index: Option<u64>,
     queued: VecDeque<SubmitInput>,
     results: VecDeque<TemporalRetainedResult>,
-    /// Transcript length at which the last summary failed, with the error.
-    compaction_error: Option<(usize, String)>,
+    /// Transcript length when compaction last ran, with the error if it
+    /// failed. Compaction runs again once the transcript grows.
+    compacted_at: Option<(usize, Option<String>)>,
     init_error: Option<String>,
     busy: bool,
-    /// A summary activity is in flight. Submissions see the session as busy;
-    /// the `prompt` update waits for it.
+    /// A compaction activity is in flight. Submissions see the session as
+    /// busy; the `prompt` update waits for it.
     compacting: bool,
     closed: bool,
 }
@@ -385,21 +386,28 @@ impl TemporalAgentSessionWorkflow {
         }
     }
 
-    fn compaction_plan(&self) -> Option<CompactionRequest> {
-        let policy = self.config.compaction.as_ref()?;
-        if let Some((failed_at, _)) = &self.compaction_error
-            && *failed_at == self.context.transcript.len()
-        {
-            return None;
-        }
-        self.context.plan(policy)
+    /// Compaction is due after a completed prompt: when the transcript has
+    /// grown since compaction last ran.
+    fn compaction_due(&self) -> bool {
+        self.config.compaction.is_some()
+            && !self.context.transcript.is_empty()
+            && self
+                .compacted_at
+                .as_ref()
+                .is_none_or(|(len, _)| *len != self.context.transcript.len())
+    }
+
+    fn compaction_error(&self) -> Option<String> {
+        self.compacted_at
+            .as_ref()
+            .and_then(|(_, error)| error.clone())
     }
 
     fn pending_work(&self) -> bool {
         self.closed
             || !self.runtime.steering.is_empty()
             || !self.queued.is_empty()
-            || self.compaction_plan().is_some()
+            || self.compaction_due()
     }
 
     fn continue_as_new_input(&self) -> TemporalAgentSessionInput {
@@ -454,7 +462,7 @@ impl TemporalAgentSessionWorkflow {
             preassigned_prompt_index: None,
             queued: input.queued.into(),
             results: input.results.into(),
-            compaction_error: None,
+            compacted_at: None,
             init_error,
             busy: false,
             compacting: false,
@@ -659,10 +667,7 @@ impl TemporalAgentSessionWorkflow {
             compaction_cutoff: self.context.applied_cutoff(),
             queued_submissions: self.queued.len(),
             ledger_receipts: self.ledger.receipts.len(),
-            compaction_error: self
-                .compaction_error
-                .as_ref()
-                .map(|(_, error)| error.clone()),
+            compaction_error: self.compaction_error(),
         }
     }
 
@@ -815,23 +820,25 @@ async fn run_steering(
     Ok(true)
 }
 
-/// Summarize the planned transcript window. A failed or stale summary leaves
-/// the context unchanged and does not fail the session. Returns `false` when
-/// no compaction is due.
+/// Run one compaction round over the transcript. A round that fails, or that
+/// demotes nothing new, leaves the context unchanged and does not fail the
+/// session. Returns `false` when no compaction is due.
 async fn compact(ctx: &mut WorkflowContext<TemporalAgentSessionWorkflow>) -> WorkflowResult<bool> {
     let planned = ctx.state_mut(|workflow| {
-        if workflow.busy {
+        if workflow.busy || !workflow.compaction_due() {
             return None;
         }
-        let request = workflow.compaction_plan()?;
         workflow.compacting = true;
         workflow.runtime.status = TemporalAgentStatus::Compacting;
+        let request = workflow
+            .context
+            .request(workflow.ledger.logical_session_id.clone());
         Some((request, workflow.config.clone()))
     });
     let Some((request, config)) = planned else {
         return Ok(false);
     };
-    let transcript_len = ctx.state(|workflow| workflow.context.transcript.len());
+    let transcript_len = request.transcript.len();
     let result = ctx
         .execute_activity(
             TemporalActivities::compact,
@@ -840,18 +847,15 @@ async fn compact(ctx: &mut WorkflowContext<TemporalAgentSessionWorkflow>) -> Wor
         )
         .await;
     ctx.state_mut(|workflow| {
-        let applied = match result {
-            Ok(output) => match workflow.context.apply(output) {
-                Ok(()) | Err(CompactionError::Stale { .. }) => Ok(()),
-                Err(error) => Err(error.to_string()),
-            },
-            Err(error) => Err(error.to_string()),
+        let error = match result {
+            Ok(output) => workflow
+                .context
+                .apply(output)
+                .err()
+                .map(|error| error.to_string()),
+            Err(error) => Some(error.to_string()),
         };
-        if let Err(error) = applied {
-            workflow.compaction_error = Some((transcript_len, error));
-        } else {
-            workflow.compaction_error = None;
-        }
+        workflow.compacted_at = Some((transcript_len, error));
         workflow.compacting = false;
         workflow.runtime.status = if workflow.closed {
             TemporalAgentStatus::Closed
@@ -890,6 +894,7 @@ fn history_payload_too_large(config: &TemporalAgentConfig, history: &[Message]) 
 struct TemporalActivities {
     model: DynModel<Completion>,
     tools: ToolExecutor,
+    compaction: Option<Compaction>,
 }
 
 #[activities]
@@ -932,14 +937,14 @@ impl TemporalActivities {
         self.tools.execute(input).await.map_err(activity_error)
     }
 
-    /// Summarize a transcript window for session compaction.
+    /// Run the registered policy and compactor over a session transcript.
     #[activity(name = "RigTemporalContextCompactionV1")]
     async fn compact(
         self: Arc<Self>,
         _ctx: ActivityContext,
         request: CompactionRequest,
     ) -> Result<CompactionOutput, ActivityError> {
-        activities::compaction::summarize(&self.model, request)
+        activities::compaction::compact(self.compaction.as_ref(), request)
             .await
             .map_err(activity_error)
     }
@@ -955,6 +960,7 @@ pub struct TemporalAgent {
     tools: Arc<ToolSet>,
     guard: Option<Arc<dyn InvocationGuardStore>>,
     config: TemporalAgentConfig,
+    compaction: Option<Compaction>,
 }
 
 impl TemporalAgent {
@@ -964,6 +970,7 @@ impl TemporalAgent {
             tools: Arc::new(ToolSet::default()),
             guard: None,
             config: TemporalAgentConfig::default(),
+            compaction: None,
         }
     }
 
@@ -1021,10 +1028,12 @@ impl TemporalAgent {
         self
     }
 
-    /// Summarize older context once a session's active context passes the
-    /// policy limit. Applies to session workflows only.
-    pub fn compaction(mut self, policy: CompactionPolicy) -> Self {
-        self.config.compaction = Some(policy);
+    /// Compact session context after completed prompts with a Rig memory
+    /// policy and compactor. The pair runs in an activity on this worker.
+    /// Applies to session workflows only.
+    pub fn compaction(mut self, compaction: Compaction) -> Self {
+        self.config.compaction = Some(compaction.config());
+        self.compaction = Some(compaction);
         self
     }
 
@@ -1150,6 +1159,7 @@ impl TemporalAgent {
             tools: ToolExecutor::new(self.tools)
                 .with_guard(self.guard)
                 .with_registered_policies(policies),
+            compaction: self.compaction,
         });
         Ok(())
     }

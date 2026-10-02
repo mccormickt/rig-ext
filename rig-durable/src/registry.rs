@@ -6,6 +6,7 @@ use rig::{DynModel, operation::Completion, tool::ToolSet};
 use crate::{
     activities::{self, tool::ToolExecutor},
     activity_types::{ToolActivityInput, ToolActivityOutput},
+    compaction::Compaction,
     config::DurableAgentConfig,
     guard::InvocationGuardStore,
     names::RuntimeNames,
@@ -22,6 +23,7 @@ pub fn activity_registry(
         model.into(),
         ToolExecutor::new(Arc::new(tools)),
         &RuntimeNames::legacy(),
+        None,
     )
 }
 
@@ -37,17 +39,17 @@ pub fn activity_registry_with_guard(
     let executor = ToolExecutor::new(Arc::new(tools))
         .with_guard(Some(guard))
         .with_registered_policies(catalog.policies());
-    activity_registry_with_names(model.into(), executor, &RuntimeNames::legacy())
+    activity_registry_with_names(model.into(), executor, &RuntimeNames::legacy(), None)
 }
 
 pub(crate) fn activity_registry_with_names(
     model: DynModel<Completion>,
     executor: ToolExecutor,
     names: &RuntimeNames,
+    compaction: Option<Compaction>,
 ) -> ActivityRegistry {
     let model = Arc::new(model);
     let completion_model = Arc::clone(&model);
-    let compaction_model = Arc::clone(&model);
     let executor = Arc::new(executor);
     let logical_executor = Arc::clone(&executor);
     let completion_activity = names.completion_activity.clone();
@@ -76,8 +78,8 @@ pub(crate) fn activity_registry_with_names(
             },
         )
         .register_typed(compaction_activity, move |_ctx, request| {
-            let model = Arc::clone(&compaction_model);
-            async move { activities::compaction::summarize(model.as_ref(), request).await }
+            let compaction = compaction.clone();
+            async move { activities::compaction::compact(compaction.as_ref(), request).await }
         })
         .build()
 }

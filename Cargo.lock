@@ -6562,6 +6562,7 @@ dependencies = [
  "duroxide",
  "futures",
  "rig",
+ "rig-memory",
  "semver",
  "serde",
  "serde_json",
@@ -6626,6 +6627,16 @@ dependencies = [
  "rig-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rig-memory"
+version = "0.43.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9b7e4b48e4f589b9ba55f460e23691faa89b4de24549822f7445c0d126c91cf"
+dependencies = [
+ "rig-core",
+ "tracing",
 ]
 
 [[package]]

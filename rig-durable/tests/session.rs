@@ -16,10 +16,11 @@ use rig::{
     tool::{Tool, ToolContext, ToolExecutionError},
 };
 use rig_durable::{
-    AgentOrchestrator, AgentOrchestratorError, CompactionPolicy, DurableAgent, InvocationContract,
-    OutcomeSource, SubmissionError, SubmissionMode, SubmissionState, SubmitInput, ToolDisposition,
-    ToolOptions, ToolPolicy,
+    AgentOrchestrator, AgentOrchestratorError, Compaction, DurableAgent, InvocationContract,
+    ModelCompactor, ModelSummary, OutcomeSource, SubmissionError, SubmissionMode, SubmissionState,
+    SubmitInput, ToolDisposition, ToolOptions, ToolPolicy,
 };
+use rig_memory::SlidingWindowMemory;
 use serde::Deserialize;
 
 const WAIT: Duration = Duration::from_secs(15);
@@ -288,26 +289,37 @@ fn has_tool_call(messages: &[Message]) -> bool {
     })
 }
 
+fn compaction(model: &MockCompletionModel, keep: usize) -> Compaction {
+    Compaction::new(
+        SlidingWindowMemory::last_messages(keep),
+        ModelCompactor::new(model.clone()),
+    )
+}
+
+const SUMMARY_HEADER: &str = "Summary of the earlier conversation:\n";
+const CARRY_OVER_HEADER: &str = "Summary of the conversation before this window:\n";
+
 #[tokio::test]
 async fn compaction_keeps_the_request_canonical_and_the_transcript_complete() {
     let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("call-1", "add", serde_json::json!({"x": 1, "y": 2})),
         MockTurn::text("answer one"),
+        // Compaction runs after every completed prompt. The window keeps two
+        // messages and never starts at an orphan tool result.
+        MockTurn::text("SUMMARY A"),
         MockTurn::text("answer two"),
-        // Summarizer call, scheduled after the second prompt answers.
-        MockTurn::text("SUMMARY ONE"),
+        MockTurn::text("SUMMARY B"),
         MockTurn::text("answer three"),
-        // Second summary, built on the first.
-        MockTurn::text("SUMMARY TWO"),
+        MockTurn::text("SUMMARY C"),
         MockTurn::text("answer four"),
-        // Summaries run after the answer is published, so the session is
+        // Compaction runs after the answer is published, so the session is
         // closed before the requests are counted.
-        MockTurn::text("SUMMARY THREE"),
+        MockTurn::text("SUMMARY D"),
     ]);
     let orchestrator = orchestrator(
         DurableAgent::builder("compacting", model.clone())
             .tool(MockAddTool)
-            .compaction(CompactionPolicy::new(4, 2).version("test-1"))
+            .compaction(compaction(&model, 2).version("test-1"))
             .build()
             .unwrap(),
     )
@@ -319,11 +331,7 @@ async fn compaction_keeps_the_request_canonical_and_the_transcript_complete() {
         .await
         .unwrap();
 
-    // Prompt one: 4 transcript messages, within budget.
     assert_eq!(session.prompt("one").await.unwrap().output(), "answer one");
-    assert_eq!(scripted_requests(&model, 2).len(), 2);
-    // Prompt two: 6 messages. Cutoff 4 is the prompt boundary that keeps
-    // two; it does not split the tool exchange.
     assert_eq!(session.prompt("two").await.unwrap().output(), "answer two");
     assert_eq!(
         session.prompt("three").await.unwrap().output(),
@@ -336,62 +344,86 @@ async fn compaction_keeps_the_request_canonical_and_the_transcript_complete() {
     session.close().await.unwrap();
     let result = session.result_timeout(WAIT).await.unwrap();
 
-    let requests = scripted_requests(&model, 8);
+    let requests = scripted_requests(&model, 9);
 
-    let summary_one = &requests[3];
+    // Prompt one left 4 transcript messages. Keeping 2 would start the
+    // window at the tool result, so the policy demoted the whole exchange.
+    let summary_a = &requests[2];
     assert!(matches!(
-        summary_one.chat_history.first(),
+        summary_a.chat_history.first(),
         Some(Message::System { .. })
     ));
-    assert_eq!(summary_one.chat_history.len(), 6);
-    assert!(has_tool_call(&summary_one.chat_history));
+    assert_eq!(summary_a.chat_history.len(), 5);
+    assert!(has_tool_call(&summary_a.chat_history));
     assert_eq!(
-        user_texts(&summary_one.chat_history[1..]),
+        user_texts(&summary_a.chat_history[1..]),
         ["one", SUMMARY_PROMPT]
     );
 
-    let third = &requests[4];
-    rig::transcript::validate_canonical(&third.chat_history).unwrap();
-    assert_eq!(third.chat_history.len(), 4);
-    let texts = user_texts(&third.chat_history);
+    let second = &requests[3];
+    rig::transcript::validate_canonical(&second.chat_history).unwrap();
+    assert_eq!(second.chat_history.len(), 3);
     assert_eq!(
-        texts[0],
-        "Summary of the earlier conversation (compacted, policy version test-1):\nSUMMARY ONE"
+        user_texts(&second.chat_history),
+        [format!("{SUMMARY_HEADER}SUMMARY A"), "two".into()]
     );
-    assert_eq!(&texts[1..], ["two", "three"]);
     assert!(
-        !has_tool_call(&third.chat_history),
+        !has_tool_call(&second.chat_history),
         "the tool exchange left the active context"
     );
 
-    let summary_two = &requests[5];
+    // The next round compacts only the newly demoted message and carries
+    // the prior summary into the compactor.
+    let summary_b = &requests[4];
+    assert_eq!(summary_b.chat_history.len(), 4);
     assert_eq!(
-        user_texts(&summary_two.chat_history[1..]),
+        user_texts(&summary_b.chat_history[1..]),
         [
-            "Summary of the conversation before this window:\nSUMMARY ONE",
-            "two",
-            SUMMARY_PROMPT
+            format!("{CARRY_OVER_HEADER}SUMMARY A"),
+            SUMMARY_PROMPT.into()
         ]
     );
-    assert_eq!(summary_two.chat_history.len(), 5);
 
-    let fourth = &requests[6];
+    let third = &requests[5];
+    rig::transcript::validate_canonical(&third.chat_history).unwrap();
+    assert_eq!(third.chat_history.len(), 4);
+    assert_eq!(
+        user_texts(&third.chat_history),
+        [
+            format!("{SUMMARY_HEADER}SUMMARY B"),
+            "two".into(),
+            "three".into()
+        ]
+    );
+
+    let summary_c = &requests[6];
+    assert_eq!(summary_c.chat_history.len(), 5);
+    assert_eq!(
+        user_texts(&summary_c.chat_history[1..]),
+        [
+            format!("{CARRY_OVER_HEADER}SUMMARY B"),
+            "two".into(),
+            SUMMARY_PROMPT.into()
+        ]
+    );
+
+    let fourth = &requests[7];
     rig::transcript::validate_canonical(&fourth.chat_history).unwrap();
+    assert_eq!(fourth.chat_history.len(), 4);
     assert_eq!(
         user_texts(&fourth.chat_history),
         [
-            "Summary of the earlier conversation (compacted, policy version test-1):\nSUMMARY TWO",
-            "three",
-            "four"
+            format!("{SUMMARY_HEADER}SUMMARY C"),
+            "three".into(),
+            "four".into()
         ]
     );
-    assert_eq!(fourth.chat_history.len(), 4);
     assert_eq!(
-        user_texts(&requests[7].chat_history[1..]),
+        user_texts(&requests[8].chat_history[1..]),
         [
-            "Summary of the conversation before this window:\nSUMMARY TWO",
-            "three",
-            SUMMARY_PROMPT
+            format!("{CARRY_OVER_HEADER}SUMMARY C"),
+            "three".into(),
+            SUMMARY_PROMPT.into()
         ]
     );
 
@@ -408,7 +440,12 @@ async fn compaction_keeps_the_request_canonical_and_the_transcript_complete() {
     assert_eq!(record.cutoff, 8);
     assert_eq!(record.input_messages, 2);
     assert_eq!(record.policy_version, "test-1");
-    assert_eq!(record.summary, "SUMMARY THREE");
+    let summary: ModelSummary = serde_json::from_value(record.artifact.value).unwrap();
+    assert_eq!(summary.text, "SUMMARY D");
+    assert_eq!(
+        user_texts(std::slice::from_ref(&record.artifact.message)),
+        [format!("{SUMMARY_HEADER}SUMMARY D")]
+    );
     orchestrator.shutdown(None).await;
 }
 
@@ -424,7 +461,7 @@ async fn failed_summary_leaves_the_context_in_place_and_the_session_open() {
     let orchestrator = orchestrator(
         DurableAgent::builder("compaction-failure", model.clone())
             .completion_retry(RetryPolicy::new(1))
-            .compaction(CompactionPolicy::new(1, 0))
+            .compaction(compaction(&model, 1))
             .build()
             .unwrap(),
     )
@@ -445,33 +482,30 @@ async fn failed_summary_leaves_the_context_in_place_and_the_session_open() {
     session.close().await.unwrap();
     let result = session.result_timeout(WAIT).await.unwrap();
 
-    // The summary after the third prompt had no scripted turn and failed too.
+    // The round after the third prompt had no scripted turn and failed too.
     let requests = scripted_requests(&model, 6);
-    // The failed summary left the full context for the second prompt.
+    // The failed round left the full context for the second prompt.
     assert_eq!(user_texts(&requests[2].chat_history), ["one", "two"]);
-    // The next summary covered everything up to the newest boundary.
+    // The next round covered everything the policy demoted.
     assert_eq!(
         user_texts(&requests[3].chat_history[1..]),
         ["one", "two", SUMMARY_PROMPT]
     );
     assert_eq!(
         user_texts(&requests[4].chat_history),
-        [
-            "Summary of the earlier conversation (compacted, policy version 1):\nSUMMARY",
-            "three"
-        ]
+        [format!("{SUMMARY_HEADER}SUMMARY"), "three".into()]
     );
     assert_eq!(
         user_texts(&requests[5].chat_history[1..]),
         [
-            "Summary of the conversation before this window:\nSUMMARY",
-            "three",
-            SUMMARY_PROMPT
+            format!("{CARRY_OVER_HEADER}SUMMARY"),
+            "three".into(),
+            SUMMARY_PROMPT.into()
         ]
     );
 
     assert_eq!(result.context.transcript.len(), 6);
-    assert_eq!(result.context.compaction.unwrap().cutoff, 4);
+    assert_eq!(result.context.compaction.unwrap().cutoff, 3);
     orchestrator.shutdown(None).await;
 }
 

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     activity_types::InvocationContract,
-    compaction::CompactionPolicy,
+    compaction::CompactionConfig,
     policy::ToolPolicy,
     tools::{ToolCatalog, ToolEntry, ToolRoute},
 };
@@ -89,7 +89,7 @@ pub struct DurableAgentConfig {
     pub contract: InvocationContract,
     /// Compaction of the active context between completed prompts in a
     /// session. Single runs do not compact.
-    pub compaction: Option<CompactionPolicy>,
+    pub compaction: Option<CompactionConfig>,
 }
 
 impl Default for DurableAgentConfig {
@@ -221,7 +221,7 @@ pub struct ConfigSnapshot {
     pub approval: ApprovalConfig,
     pub checkpoint: CheckpointConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compaction: Option<CompactionPolicy>,
+    pub compaction: Option<CompactionConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

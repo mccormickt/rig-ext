@@ -27,7 +27,7 @@ use crate::{
     AgentInput, ApprovalDecision, ApprovalRequest, CheckpointConfig, CompletionMode,
     CompletionSettings, DurableAgentConfig, InvocationContract,
     activities::tool::ToolExecutor,
-    compaction::CompactionPolicy,
+    compaction::Compaction,
     config::ConfigSnapshot,
     guard::InvocationGuardStore,
     names::RuntimeNames,
@@ -190,6 +190,7 @@ pub struct DurableAgentBuilder {
     children: Vec<AgentDefinition>,
     config: DurableAgentConfig,
     guard: Option<Arc<dyn InvocationGuardStore>>,
+    compaction: Option<Compaction>,
 }
 
 impl DurableAgentBuilder {
@@ -205,6 +206,7 @@ impl DurableAgentBuilder {
             children: Vec::new(),
             config: DurableAgentConfig::default(),
             guard: None,
+            compaction: None,
         }
     }
 
@@ -268,10 +270,12 @@ impl DurableAgentBuilder {
         self
     }
 
-    /// Compact the active context of sessions between completed prompts.
-    /// Single runs do not compact. The audit transcript keeps every message.
-    pub fn compaction(mut self, policy: CompactionPolicy) -> Self {
-        self.config.compaction = Some(policy);
+    /// Compact the active context of sessions after completed prompts. The
+    /// policy and compactor run on the worker; single runs do not compact.
+    /// The audit transcript keeps every message.
+    pub fn compaction(mut self, compaction: Compaction) -> Self {
+        self.config.compaction = Some(compaction.config());
+        self.compaction = Some(compaction);
         self
     }
 
@@ -384,7 +388,8 @@ impl DurableAgentBuilder {
         let executor = ToolExecutor::new(Arc::new(self.tools))
             .with_guard(self.guard)
             .with_registered_policies(self.config.tools.policies());
-        let activities = activity_registry_with_names(self.model, executor, &names);
+        let activities =
+            activity_registry_with_names(self.model, executor, &names, self.compaction);
         let orchestrations =
             orchestration_registry_with_names(self.config.clone(), names.clone(), Some(&version));
         let description = self.description.unwrap_or_else(|| self.name.clone());

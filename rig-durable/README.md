@@ -293,22 +293,54 @@ the answer; the Temporal `submit` update returns when the prompt answers.
 
 ### Compaction
 
-`compaction(CompactionPolicy::new(max_context_messages, keep_recent_messages))`
-bounds the active context a session sends to the model. After a prompt answers,
-if the active context has more than `max_context_messages` messages, the
-session runs one summarization activity over the oldest messages up to the
-latest prompt boundary that keeps at least `keep_recent_messages`. A cutoff
-never splits a tool exchange, so the request stays canonical. The summary
-replaces that prefix as a user message that names the policy version; later
-summaries build on the earlier one. The audit transcript keeps every message,
-and `SessionResult`/`TemporalAgentSessionResult` carry both the transcript and
-the `CompactionRecord` (cutoff, policy version, summary, usage).
+`compaction(Compaction::new(policy, compactor))` bounds the active context a
+session sends to the model with Rig's memory abstractions: a
+`rig_memory::MemoryPolicy` (`SlidingWindowMemory`, `TokenWindowMemory`, or
+your own) decides which transcript prefix leaves the active window, and a
+`rig::memory::Compactor` folds that prefix, with the prior artifact as
+`carry_over`, into a new artifact. This is the durable form of
+`rig_memory::CompactingMemory`: the policy and compactor run in one activity
+on the worker, and the workflow keeps only the watermark, so the
+`CompactionRecord` (cutoff, policy version, encoded artifact, artifact
+message, input count) survives replay and continue-as-new.
 
-A failed or stale summary leaves the context in place and does not fail the
-session; the session retries after the next prompt grows the transcript.
-Compaction runs between prompts: a Duroxide session processes it as the next
-command, and a Temporal session treats it as busy for submissions while the
-legacy `prompt` update waits for it. Compaction bounds the model context;
+After every completed prompt the session runs one compaction activity over
+the full transcript. When the policy demotes nothing beyond the applied
+cutoff the round is a no-op. Otherwise the workflow checks that the artifact
+message followed by the kept transcript is canonical (`validate_canonical`)
+before it applies the new cutoff; a cutoff that splits a tool exchange is
+rejected. Later rounds compact only the newly demoted messages. The audit
+transcript keeps every message, and `SessionResult`/
+`TemporalAgentSessionResult` carry both the transcript and the record.
+
+The compactor's artifact must implement `Serialize` and `DeserializeOwned`,
+because the workflow retains it between rounds. `ModelCompactor` is the
+crate-owned compactor: one model call summarizes the evicted window and its
+`ModelSummary` artifact records the text and usage. `rig_memory::TemplateCompactor`
+does not qualify in Rig 0.43, because its `TextSummary` artifact has no serde
+support and no public constructor.
+
+```rust,ignore
+use rig_durable::{Compaction, ModelCompactor};
+use rig_memory::SlidingWindowMemory;
+
+let agent = DurableAgent::builder("support", model.clone())
+    .compaction(
+        Compaction::new(
+            SlidingWindowMemory::last_messages(40),
+            ModelCompactor::new(model.clone()),
+        )
+        .version("summary-v1"),
+    )
+    .build()?;
+```
+
+A failed round leaves the context in place and does not fail the session; the
+session runs again after the next prompt grows the transcript. Compaction
+runs between prompts: a Duroxide session processes it as the next command,
+and a Temporal session treats it as busy for submissions while the legacy
+`prompt` update waits for it. A worker without a registered `Compaction`
+fails the activity closed. Compaction bounds the model context;
 continue-as-new and checkpoints bound event history. Both backends serialize
 the transcript, so `session_history_max_bytes` still applies to it.
 

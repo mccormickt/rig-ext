@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     activity_types::InvocationContract,
-    compaction::{CompactionError, ContextState},
+    compaction::ContextState,
     config::{CheckpointPolicy, ConfigSnapshot, DurableAgentConfig},
     names::RuntimeNames,
     orchestration::{Cursor, Engine, KV_VALUE_LIMIT, Step, set_status},
@@ -402,24 +402,26 @@ async fn run_prompt(
     state.set_state(&input.request_id, SubmissionState::Answered);
     // Publish the answer before any summary runs.
     state.flush(ctx);
-    if let Some(policy) = &config.compaction
-        && let Some(request) = state.context.plan(policy)
-    {
+    if config.compaction.is_some() {
         set_status(ctx, state.status("compacting"), &|_| {});
-        let summary = ctx
+        let request = state
+            .context
+            .request(state.ledger.logical_session_id.clone());
+        let output = ctx
             .schedule_activity_with_retry_typed(
                 &engine.names.compaction_activity,
                 &request,
                 config.completion_retry.clone(),
             )
             .await;
-        // A summary that fails, or that does not advance the cutoff, leaves
-        // the current context in place; the next prompt plans again.
-        state.compaction_error = match summary {
-            Ok(output) => match state.context.apply(output) {
-                Ok(()) | Err(CompactionError::Stale { .. }) => None,
-                Err(error) => Some(error.to_string()),
-            },
+        // A round that fails, or that demotes nothing new, leaves the
+        // current context in place; the next completed prompt runs again.
+        state.compaction_error = match output {
+            Ok(output) => state
+                .context
+                .apply(output)
+                .err()
+                .map(|error| error.to_string()),
             Err(error) => Some(error),
         };
     }

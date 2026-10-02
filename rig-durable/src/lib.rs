@@ -44,7 +44,10 @@ pub use activity_types::{
     InvocationContract, ToolActivityInput, ToolActivityOutput, ToolInvocation,
 };
 pub use approval::{ApprovalDecision, ApprovalRequest};
-pub use compaction::{CompactionPolicy, CompactionRecord, ContextState};
+pub use compaction::{
+    Compaction, CompactionArtifact, CompactionConfig, CompactionRecord, ContextState,
+    ModelCompactor, ModelSummary,
+};
 #[cfg(feature = "duroxide")]
 pub use config::{
     ApprovalConfig, CheckpointConfig, CheckpointPolicy, CompletionMode, CompletionSettings,
