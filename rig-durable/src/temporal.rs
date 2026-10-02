@@ -26,14 +26,25 @@ use crate::{
     activities::{self, tool::ToolExecutor},
     activity_types::{InvocationContract, ToolActivityInput, ToolActivityOutput, ToolInvocation},
     approval::{ApprovalDecision, ApprovalRequest},
+    compaction::{
+        CompactionError, CompactionOutput, CompactionPolicy, CompactionRecord, CompactionRequest,
+        ContextState,
+    },
     driver::{self, CompletionOptions},
     guard::InvocationGuardStore,
     identity::{AttemptMetadata, LogicalCallKey},
+    outcome::{CallPosition, DurableResponse, ToolOutcome},
     policy::ToolPolicy,
+    submission::{
+        Admission, DEFAULT_LEDGER_MAX_BYTES, SessionAvailability, Submission, SubmissionError,
+        SubmissionLedger, SubmissionState, SubmitInput,
+    },
 };
 
 const DEFAULT_ACTIVITY_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_SESSION_HISTORY_MAX_BYTES: usize = 1_000_000;
+/// Number of per-submission results a session workflow keeps in its state.
+pub const SESSION_RESULT_RETENTION: usize = 16;
 
 /// Request configuration. It travels in the workflow input, so a running
 /// workflow keeps the configuration it started with across continue-as-new.
@@ -54,6 +65,9 @@ pub struct TemporalAgentConfig {
     /// [`TemporalAgent`] use [`InvocationContract::Logical`].
     #[serde(default)]
     pub contract: InvocationContract,
+    /// Completed-prompt compaction for session workflows. `None` disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionPolicy>,
 }
 
 impl Default for TemporalAgentConfig {
@@ -70,6 +84,7 @@ impl Default for TemporalAgentConfig {
             activity_max_attempts: 3,
             session_history_max_bytes: DEFAULT_SESSION_HISTORY_MAX_BYTES,
             contract: InvocationContract::Logical,
+            compaction: None,
         }
     }
 }
@@ -122,6 +137,8 @@ pub enum TemporalAgentStatus {
     Approval {
         request: ApprovalRequest,
     },
+    /// A session is summarizing its older context.
+    Compacting,
     Completed,
     Closed,
 }
@@ -132,11 +149,19 @@ struct TemporalRuntimeState {
     decisions: Vec<ApprovalDecision>,
     steering: VecDeque<Message>,
     next_prompt_index: u64,
+    /// Dispositions of the current or latest run, in dispatch order.
+    outcomes: Vec<ToolOutcome>,
 }
 
 trait TemporalWorkflowState {
     fn runtime(&self) -> &TemporalRuntimeState;
     fn runtime_mut(&mut self) -> &mut TemporalRuntimeState;
+    fn allocate_prompt_index(&mut self) -> Result<u64, String> {
+        let runtime = self.runtime_mut();
+        let index = runtime.next_prompt_index;
+        runtime.next_prompt_index = index.checked_add(1).ok_or("prompt index overflow")?;
+        Ok(index)
+    }
     fn records_history(&self) -> bool {
         false
     }
@@ -166,7 +191,9 @@ impl TemporalAgentWorkflow {
         ctx: &mut WorkflowContext<Self>,
         input: TemporalAgentInput,
     ) -> WorkflowResult<PromptResponse> {
-        run_agent(ctx, input).await
+        run_agent(ctx, input)
+            .await
+            .map(|detailed| detailed.response)
     }
 
     #[signal]
@@ -184,10 +211,18 @@ impl TemporalAgentWorkflow {
     pub fn status(&self, _ctx: &WorkflowContextView) -> TemporalAgentStatus {
         self.runtime.status.clone()
     }
+
+    /// Dispositions of every tool call this run made, in dispatch order.
+    /// The workflow result stays Rig's `PromptResponse`.
+    #[query]
+    pub fn tool_outcomes(&self, _ctx: &WorkflowContextView) -> Vec<ToolOutcome> {
+        self.runtime.outcomes.clone()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TemporalAgentSessionInput {
+    /// Audit transcript. Compaction never removes messages from it.
     #[serde(default)]
     pub history: Vec<Message>,
     pub config: TemporalAgentConfig,
@@ -195,11 +230,44 @@ pub struct TemporalAgentSessionInput {
     pub queued_steering: Vec<Message>,
     #[serde(default)]
     pub next_prompt_index: u64,
+    /// Summary that stands in for a prefix of `history`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionRecord>,
+    /// Submission receipts carried across continue-as-new. `None` starts a
+    /// fresh ledger whose next prompt index is `next_prompt_index`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<SubmissionLedger>,
+    /// Admitted submissions that have not run yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued: Vec<SubmitInput>,
+    /// Recent per-submission results, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub results: Vec<TemporalRetainedResult>,
+}
+
+/// The detailed result of one admitted submission.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TemporalRetainedResult {
+    pub submission_id: String,
+    pub response: DurableResponse,
+}
+
+/// Reply of the `submit` update: the receipt and, when the session retained
+/// it, the detailed response for that submission.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TemporalSubmission {
+    pub submission: Submission,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<DurableResponse>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TemporalAgentSessionResult {
     pub history: Vec<Message>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<SubmissionLedger>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -210,14 +278,36 @@ pub struct TemporalAgentSessionSnapshot {
     pub next_prompt_index: u64,
     pub busy: bool,
     pub closed: bool,
+    /// Transcript messages the active context replaces with a summary.
+    #[serde(default)]
+    pub compaction_cutoff: usize,
+    #[serde(default)]
+    pub queued_submissions: usize,
+    #[serde(default)]
+    pub ledger_receipts: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_error: Option<String>,
 }
 
 #[workflow]
 pub struct TemporalAgentSessionWorkflow {
     runtime: TemporalRuntimeState,
     config: TemporalAgentConfig,
-    history: Vec<Message>,
+    context: ContextState,
+    /// Transcript and active-context lengths when the current run started.
+    run_base: (usize, usize),
+    ledger: SubmissionLedger,
+    /// Prompt index the ledger assigned to the submission about to run.
+    preassigned_prompt_index: Option<u64>,
+    queued: VecDeque<SubmitInput>,
+    results: VecDeque<TemporalRetainedResult>,
+    /// Transcript length at which the last summary failed, with the error.
+    compaction_error: Option<(usize, String)>,
+    init_error: Option<String>,
     busy: bool,
+    /// A summary activity is in flight. Submissions see the session as busy;
+    /// the `prompt` update waits for it.
+    compacting: bool,
     closed: bool,
 }
 
@@ -230,29 +320,144 @@ impl TemporalWorkflowState for TemporalAgentSessionWorkflow {
         &mut self.runtime
     }
 
+    fn allocate_prompt_index(&mut self) -> Result<u64, String> {
+        if let Some(index) = self.preassigned_prompt_index.take() {
+            return Ok(index);
+        }
+        self.ledger
+            .allocate_prompt_index()
+            .map_err(|error| error.to_string())
+    }
+
     fn records_history(&self) -> bool {
         true
     }
 
-    fn record_history(&mut self, history: Vec<Message>) {
-        self.history = history;
+    /// `history` is the active context the run started from plus the
+    /// messages it added. Only the added messages reach the transcript.
+    fn record_history(&mut self, mut history: Vec<Message>) {
+        let (transcript_base, active_base) = self.run_base;
+        let added = history.split_off(active_base.min(history.len()));
+        self.context.transcript.truncate(transcript_base);
+        self.context.transcript.extend(added);
+    }
+}
+
+type BoxedError = Box<dyn std::error::Error + Send + Sync>;
+
+impl TemporalAgentSessionWorkflow {
+    fn availability(&self) -> SessionAvailability {
+        SessionAvailability {
+            busy: self.busy || self.compacting || !self.queued.is_empty(),
+            closed: self.closed,
+        }
+    }
+
+    /// Reserve the session for one run and return the run inputs.
+    fn begin_run(&mut self) -> (TemporalAgentConfig, Vec<Message>) {
+        let active = self.context.active_context();
+        self.run_base = (self.context.transcript.len(), active.len());
+        self.busy = true;
+        (self.config.clone(), active)
+    }
+
+    fn end_run(&mut self, failed: bool) {
+        self.busy = false;
+        self.preassigned_prompt_index = None;
+        if failed {
+            close_session(self);
+        } else {
+            self.runtime.status = if self.closed {
+                TemporalAgentStatus::Closed
+            } else {
+                TemporalAgentStatus::Idle
+            };
+        }
+    }
+
+    fn retain_result(&mut self, submission_id: String, response: DurableResponse) {
+        self.results.push_back(TemporalRetainedResult {
+            submission_id,
+            response,
+        });
+        while self.results.len() > SESSION_RESULT_RETENTION {
+            self.results.pop_front();
+        }
+    }
+
+    fn compaction_plan(&self) -> Option<CompactionRequest> {
+        let policy = self.config.compaction.as_ref()?;
+        if let Some((failed_at, _)) = &self.compaction_error
+            && *failed_at == self.context.transcript.len()
+        {
+            return None;
+        }
+        self.context.plan(policy)
+    }
+
+    fn pending_work(&self) -> bool {
+        self.closed
+            || !self.runtime.steering.is_empty()
+            || !self.queued.is_empty()
+            || self.compaction_plan().is_some()
+    }
+
+    fn continue_as_new_input(&self) -> TemporalAgentSessionInput {
+        TemporalAgentSessionInput {
+            history: self.context.transcript.clone(),
+            config: self.config.clone(),
+            queued_steering: self.runtime.steering.iter().cloned().collect(),
+            next_prompt_index: self.ledger.next_prompt_index,
+            compaction: self.context.compaction.clone(),
+            ledger: Some(self.ledger.clone()),
+            queued: self.queued.iter().cloned().collect(),
+            results: self.results.iter().cloned().collect(),
+        }
     }
 }
 
 #[workflow_methods]
 impl TemporalAgentSessionWorkflow {
     #[init]
-    fn init(_ctx: &WorkflowContextView, input: TemporalAgentSessionInput) -> Self {
+    fn init(ctx: &WorkflowContextView, input: TemporalAgentSessionInput) -> Self {
+        let mut init_error = None;
+        let context = match ContextState::new(input.history).with_compaction(input.compaction) {
+            Ok(context) => context,
+            Err(error) => {
+                init_error = Some(error.to_string());
+                ContextState::default()
+            }
+        };
+        let ledger = input.ledger.unwrap_or_else(|| {
+            SubmissionLedger::new(ctx.workflow_id(), DEFAULT_LEDGER_MAX_BYTES)
+                .with_next_prompt_index(input.next_prompt_index)
+        });
+        if !ledger.is_supported() {
+            init_error.get_or_insert_with(|| {
+                format!(
+                    "unsupported submission ledger format version {}",
+                    ledger.format_version
+                )
+            });
+        }
         Self {
             runtime: TemporalRuntimeState {
                 status: TemporalAgentStatus::Idle,
                 steering: input.queued_steering.into(),
-                next_prompt_index: input.next_prompt_index,
+                next_prompt_index: ledger.next_prompt_index,
                 ..TemporalRuntimeState::default()
             },
             config: input.config,
-            history: input.history,
+            context,
+            run_base: (0, 0),
+            ledger,
+            preassigned_prompt_index: None,
+            queued: input.queued.into(),
+            results: input.results.into(),
+            compaction_error: None,
+            init_error,
             busy: false,
+            compacting: false,
             closed: false,
         }
     }
@@ -261,52 +466,28 @@ impl TemporalAgentSessionWorkflow {
     pub async fn run(
         ctx: &mut WorkflowContext<Self>,
     ) -> WorkflowResult<TemporalAgentSessionResult> {
+        if let Some(error) = ctx.state(|workflow| workflow.init_error.clone()) {
+            ctx.state_mut(close_session);
+            return Err(workflow_error(error));
+        }
         loop {
             let wait_ctx = ctx.clone();
             ctx.wait_condition(move |workflow| {
                 !workflow.busy
-                    && (workflow.closed
-                        || !workflow.runtime.steering.is_empty()
+                    && !workflow.compacting
+                    && (workflow.pending_work()
                         || (wait_ctx.continue_as_new_suggested()
                             && wait_ctx.all_handlers_finished()))
             })
             .await?;
 
-            let steering = ctx.state_mut(|workflow| {
-                if workflow.busy {
-                    return None;
-                }
-                let prompt = workflow.runtime.steering.pop_front()?;
-                workflow.busy = true;
-                Some((prompt, workflow.config.clone(), workflow.history.clone()))
-            });
-            if let Some((prompt, config, history)) = steering {
-                if session_payload_too_large(&config, &history, &prompt) {
-                    ctx.state_mut(close_session);
-                    return Err(workflow_error(
-                        "agent session history exceeds configured limit",
-                    ));
-                }
-                let result = run_agent(
-                    ctx,
-                    TemporalAgentInput {
-                        prompt,
-                        history,
-                        config,
-                    },
-                )
-                .await;
-                ctx.state_mut(|workflow| {
-                    workflow.busy = false;
-                    if result.is_err() {
-                        close_session(workflow);
-                    } else if workflow.closed {
-                        workflow.runtime.status = TemporalAgentStatus::Closed;
-                    } else {
-                        workflow.runtime.status = TemporalAgentStatus::Idle;
-                    }
-                });
-                result?;
+            if run_queued_submission(ctx).await? {
+                continue;
+            }
+            if run_steering(ctx).await? {
+                continue;
+            }
+            if compact(ctx).await? {
                 continue;
             }
 
@@ -315,12 +496,7 @@ impl TemporalAgentSessionWorkflow {
                 break;
             }
             if ctx.continue_as_new_suggested() && ctx.all_handlers_finished() {
-                let input = ctx.state(|workflow| TemporalAgentSessionInput {
-                    history: workflow.history.clone(),
-                    config: workflow.config.clone(),
-                    queued_steering: workflow.runtime.steering.iter().cloned().collect(),
-                    next_prompt_index: workflow.runtime.next_prompt_index,
-                });
+                let input = ctx.state(TemporalAgentSessionWorkflow::continue_as_new_input);
                 return match ctx.continue_as_new(input, ContinueAsNewOptions::default()) {
                     Err(error) => Err(error),
                     Ok(never) => match never {},
@@ -330,27 +506,24 @@ impl TemporalAgentSessionWorkflow {
         let wait_ctx = ctx.clone();
         ctx.wait_condition(move |_| wait_ctx.all_handlers_finished())
             .await?;
-        ctx.state_mut(|workflow| workflow.runtime.status = TemporalAgentStatus::Closed);
-        Ok(TemporalAgentSessionResult {
-            history: ctx.state(|workflow| workflow.history.clone()),
-        })
+        ctx.state_mut(|workflow| {
+            workflow.ledger.cancel_pending();
+            workflow.runtime.status = TemporalAgentStatus::Closed;
+        });
+        Ok(ctx.state(|workflow| TemporalAgentSessionResult {
+            history: workflow.context.transcript.clone(),
+            compaction: workflow.context.compaction.clone(),
+            ledger: Some(workflow.ledger.clone()),
+        }))
     }
 
     #[update_validator(prompt)]
     fn validate_prompt(
         &self,
         _ctx: &WorkflowContextView,
-        _prompt: &Message,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.closed {
-            Err("agent session is closed".into())
-        } else if self.busy {
-            Err("agent session is processing another prompt".into())
-        } else if session_payload_too_large(&self.config, &self.history, _prompt) {
-            Err("agent session history exceeds configured limit".into())
-        } else {
-            Ok(())
-        }
+        prompt: &Message,
+    ) -> Result<(), BoxedError> {
+        self.check_prompt(prompt)
     }
 
     /// Run one prompt and any steering messages queued while it is active.
@@ -358,22 +531,15 @@ impl TemporalAgentSessionWorkflow {
     pub async fn prompt(
         ctx: &mut WorkflowContext<Self>,
         prompt: Message,
-    ) -> Result<PromptResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let start: Result<_, Box<dyn std::error::Error + Send + Sync>> =
-            ctx.state_mut(|workflow| {
-                if workflow.closed {
-                    return Err("agent session is closed".into());
-                }
-                if workflow.busy {
-                    return Err("agent session is processing another prompt".into());
-                }
-                if session_payload_too_large(&workflow.config, &workflow.history, &prompt) {
-                    return Err("agent session history exceeds configured limit".into());
-                }
-                workflow.busy = true;
-                Ok((workflow.config.clone(), workflow.history.clone()))
-            });
-        let (config, history): (TemporalAgentConfig, Vec<Message>) = start?;
+    ) -> Result<PromptResponse, BoxedError> {
+        ctx.wait_condition(|workflow| !workflow.compacting)
+            .await
+            .map_err(|error| Box::new(error) as BoxedError)?;
+        let start: Result<_, BoxedError> = ctx.state_mut(|workflow| {
+            workflow.check_prompt(&prompt)?;
+            Ok(workflow.begin_run())
+        });
+        let (config, history) = start?;
         let result = run_agent(
             ctx,
             TemporalAgentInput {
@@ -383,19 +549,75 @@ impl TemporalAgentSessionWorkflow {
             },
         )
         .await;
-        ctx.state_mut(|workflow| {
-            workflow.busy = false;
-            if result.is_err() {
-                close_session(workflow);
-            } else {
-                workflow.runtime.status = if workflow.closed {
-                    TemporalAgentStatus::Closed
-                } else {
-                    TemporalAgentStatus::Idle
-                };
+        ctx.state_mut(|workflow| workflow.end_run(result.is_err()));
+        result
+            .map(|detailed| detailed.response)
+            .map_err(|error| Box::new(error) as BoxedError)
+    }
+
+    #[update_validator(submit)]
+    fn validate_submit(
+        &self,
+        _ctx: &WorkflowContextView,
+        input: &SubmitInput,
+    ) -> Result<(), BoxedError> {
+        if self.init_error.is_some() {
+            return Err(SubmissionError::Closed.to_string().into());
+        }
+        let mut ledger = self.ledger.clone();
+        ledger
+            .admit(input, self.availability())
+            .map(drop)
+            .map_err(|error| submission_error(&error))
+    }
+
+    /// Admit a prompt with a client request ID and wait for its answer.
+    ///
+    /// A retried request receives its original receipt. The update fails
+    /// without a history event when the ledger rejects the request; the
+    /// message starts with the `SubmissionError` reason tag.
+    #[update]
+    pub async fn submit(
+        ctx: &mut WorkflowContext<Self>,
+        input: SubmitInput,
+    ) -> Result<TemporalSubmission, BoxedError> {
+        let request_id = input.request_id.clone();
+        let admitted: Result<Submission, SubmissionError> = ctx.state_mut(|workflow| {
+            let availability = workflow.availability();
+            match workflow.ledger.admit(&input, availability)? {
+                Admission::Admitted(submission) => {
+                    workflow.queued.push_back(input);
+                    Ok(submission)
+                }
+                Admission::Existing(submission) => Ok(submission),
             }
         });
-        result.map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+        let submission = admitted.map_err(|error| submission_error(&error))?;
+        let wait_id = request_id.clone();
+        ctx.wait_condition(move |workflow| {
+            workflow
+                .ledger
+                .receipt(&wait_id)
+                .is_none_or(|receipt| receipt.state.is_terminal())
+        })
+        .await
+        .map_err(|error| Box::new(error) as BoxedError)?;
+        Ok(ctx.state(|workflow| {
+            let submission = workflow
+                .ledger
+                .receipt(&request_id)
+                .cloned()
+                .unwrap_or(submission);
+            let response = workflow
+                .results
+                .iter()
+                .find(|result| result.submission_id == submission.submission_id)
+                .map(|result| result.response.clone());
+            TemporalSubmission {
+                submission,
+                response,
+            }
+        }))
     }
 
     #[signal]
@@ -410,6 +632,8 @@ impl TemporalAgentSessionWorkflow {
         }
     }
 
+    /// Stop admitting prompts. Admitted submissions and queued steering still
+    /// run before the workflow completes.
     #[signal]
     pub fn close(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {
         self.closed = true;
@@ -427,13 +651,219 @@ impl TemporalAgentSessionWorkflow {
     pub fn snapshot(&self, _ctx: &WorkflowContextView) -> TemporalAgentSessionSnapshot {
         TemporalAgentSessionSnapshot {
             status: self.runtime.status.clone(),
-            history: self.history.clone(),
+            history: self.context.transcript.clone(),
             queued_steering: self.runtime.steering.len(),
-            next_prompt_index: self.runtime.next_prompt_index,
+            next_prompt_index: self.ledger.next_prompt_index,
             busy: self.busy,
             closed: self.closed,
+            compaction_cutoff: self.context.applied_cutoff(),
+            queued_submissions: self.queued.len(),
+            ledger_receipts: self.ledger.receipts.len(),
+            compaction_error: self
+                .compaction_error
+                .as_ref()
+                .map(|(_, error)| error.clone()),
         }
     }
+
+    /// Receipt of one client request, if the ledger has it.
+    #[query]
+    pub fn receipt(&self, _ctx: &WorkflowContextView, request_id: String) -> Option<Submission> {
+        self.ledger.receipt(&request_id).cloned()
+    }
+
+    #[query]
+    pub fn ledger(&self, _ctx: &WorkflowContextView) -> SubmissionLedger {
+        self.ledger.clone()
+    }
+
+    /// Dispositions of the current or latest run, in dispatch order.
+    #[query]
+    pub fn tool_outcomes(&self, _ctx: &WorkflowContextView) -> Vec<ToolOutcome> {
+        self.runtime.outcomes.clone()
+    }
+
+    /// Detailed response of one submission, while the session retains it.
+    #[query]
+    pub fn result(
+        &self,
+        _ctx: &WorkflowContextView,
+        submission_id: String,
+    ) -> Option<DurableResponse> {
+        self.results
+            .iter()
+            .find(|result| result.submission_id == submission_id)
+            .map(|result| result.response.clone())
+    }
+}
+
+impl TemporalAgentSessionWorkflow {
+    fn check_prompt(&self, prompt: &Message) -> Result<(), BoxedError> {
+        if self.closed || self.init_error.is_some() {
+            Err("agent session is closed".into())
+        } else if self.busy || !self.queued.is_empty() {
+            Err("agent session is processing another prompt".into())
+        } else if session_payload_too_large(&self.config, &self.context.transcript, prompt) {
+            Err("agent session history exceeds configured limit".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Run the oldest admitted submission. Returns `false` when none is queued.
+async fn run_queued_submission(
+    ctx: &mut WorkflowContext<TemporalAgentSessionWorkflow>,
+) -> WorkflowResult<bool> {
+    let next = ctx.state_mut(|workflow| {
+        if workflow.busy {
+            return None;
+        }
+        let input = workflow.queued.pop_front()?;
+        let receipt = workflow.ledger.receipt(&input.request_id).cloned()?;
+        workflow.preassigned_prompt_index = Some(receipt.prompt_index);
+        workflow
+            .ledger
+            .set_state(&input.request_id, SubmissionState::Running);
+        let (config, history) = workflow.begin_run();
+        Some((input, receipt, config, history))
+    });
+    let Some((input, receipt, config, history)) = next else {
+        return Ok(false);
+    };
+    if session_payload_too_large(&config, &history, &input.message) {
+        let error = "agent session history exceeds configured limit";
+        ctx.state_mut(|workflow| {
+            workflow.ledger.set_state(
+                &input.request_id,
+                SubmissionState::Failed {
+                    error: error.to_string(),
+                },
+            );
+            workflow.ledger.cancel_pending();
+            workflow.end_run(true);
+        });
+        return Err(workflow_error(error));
+    }
+    let result = run_agent(
+        ctx,
+        TemporalAgentInput {
+            prompt: input.message,
+            history,
+            config,
+        },
+    )
+    .await;
+    let failed = result.is_err();
+    let state = match &result {
+        Ok(_) => SubmissionState::Answered,
+        Err(error) => SubmissionState::Failed {
+            error: error.to_string(),
+        },
+    };
+    ctx.state_mut(|workflow| {
+        workflow.ledger.set_state(&input.request_id, state);
+        if let Ok(response) = &result {
+            workflow.retain_result(receipt.submission_id.clone(), response.clone());
+        } else {
+            workflow.ledger.cancel_pending();
+        }
+        workflow.end_run(failed);
+    });
+    if let Err(error) = result {
+        let wait_ctx = ctx.clone();
+        ctx.wait_condition(move |_| wait_ctx.all_handlers_finished())
+            .await?;
+        return Err(error);
+    }
+    Ok(true)
+}
+
+/// Run the oldest queued steering message as a prompt. Returns `false` when
+/// none is queued.
+async fn run_steering(
+    ctx: &mut WorkflowContext<TemporalAgentSessionWorkflow>,
+) -> WorkflowResult<bool> {
+    let steering = ctx.state_mut(|workflow| {
+        if workflow.busy {
+            return None;
+        }
+        let prompt = workflow.runtime.steering.pop_front()?;
+        let (config, history) = workflow.begin_run();
+        Some((prompt, config, history))
+    });
+    let Some((prompt, config, history)) = steering else {
+        return Ok(false);
+    };
+    if session_payload_too_large(&config, &history, &prompt) {
+        ctx.state_mut(|workflow| workflow.end_run(true));
+        return Err(workflow_error(
+            "agent session history exceeds configured limit",
+        ));
+    }
+    let result = run_agent(
+        ctx,
+        TemporalAgentInput {
+            prompt,
+            history,
+            config,
+        },
+    )
+    .await;
+    ctx.state_mut(|workflow| workflow.end_run(result.is_err()));
+    result?;
+    Ok(true)
+}
+
+/// Summarize the planned transcript window. A failed or stale summary leaves
+/// the context unchanged and does not fail the session. Returns `false` when
+/// no compaction is due.
+async fn compact(ctx: &mut WorkflowContext<TemporalAgentSessionWorkflow>) -> WorkflowResult<bool> {
+    let planned = ctx.state_mut(|workflow| {
+        if workflow.busy {
+            return None;
+        }
+        let request = workflow.compaction_plan()?;
+        workflow.compacting = true;
+        workflow.runtime.status = TemporalAgentStatus::Compacting;
+        Some((request, workflow.config.clone()))
+    });
+    let Some((request, config)) = planned else {
+        return Ok(false);
+    };
+    let transcript_len = ctx.state(|workflow| workflow.context.transcript.len());
+    let result = ctx
+        .execute_activity(
+            TemporalActivities::compact,
+            request,
+            activity_options(&config),
+        )
+        .await;
+    ctx.state_mut(|workflow| {
+        let applied = match result {
+            Ok(output) => match workflow.context.apply(output) {
+                Ok(()) | Err(CompactionError::Stale { .. }) => Ok(()),
+                Err(error) => Err(error.to_string()),
+            },
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = applied {
+            workflow.compaction_error = Some((transcript_len, error));
+        } else {
+            workflow.compaction_error = None;
+        }
+        workflow.compacting = false;
+        workflow.runtime.status = if workflow.closed {
+            TemporalAgentStatus::Closed
+        } else {
+            TemporalAgentStatus::Idle
+        };
+    });
+    Ok(true)
+}
+
+fn submission_error(error: &SubmissionError) -> BoxedError {
+    format!("{}: {error}", error.reason()).into()
 }
 
 fn close_session(workflow: &mut TemporalAgentSessionWorkflow) {
@@ -500,6 +930,18 @@ impl TemporalActivities {
             .get_or_insert_with(Default::default);
         attempt.activity_attempt = Some(ctx.info().attempt);
         self.tools.execute(input).await.map_err(activity_error)
+    }
+
+    /// Summarize a transcript window for session compaction.
+    #[activity(name = "RigTemporalContextCompactionV1")]
+    async fn compact(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        request: CompactionRequest,
+    ) -> Result<CompactionOutput, ActivityError> {
+        activities::compaction::summarize(&self.model, request)
+            .await
+            .map_err(activity_error)
     }
 }
 
@@ -576,6 +1018,13 @@ impl TemporalAgent {
 
     pub fn session_history_max_bytes(mut self, bytes: usize) -> Self {
         self.config.session_history_max_bytes = bytes.max(1);
+        self
+    }
+
+    /// Summarize older context once a session's active context passes the
+    /// policy limit. Applies to session workflows only.
+    pub fn compaction(mut self, policy: CompactionPolicy) -> Self {
+        self.config.compaction = Some(policy);
         self
     }
 
@@ -666,6 +1115,10 @@ impl TemporalAgent {
             config: self.config.clone(),
             queued_steering: Vec::new(),
             next_prompt_index: 0,
+            compaction: None,
+            ledger: None,
+            queued: Vec::new(),
+            results: Vec::new(),
         }
     }
 
@@ -705,10 +1158,11 @@ impl TemporalAgent {
 async fn run_agent<W>(
     ctx: &mut WorkflowContext<W>,
     input: TemporalAgentInput,
-) -> WorkflowResult<PromptResponse>
+) -> WorkflowResult<DurableResponse>
 where
     W: TemporalWorkflowState,
 {
+    ctx.state_mut(|workflow| workflow.runtime_mut().outcomes.clear());
     let config = input.config;
     let mut agent = AgentRun::new(input.prompt)
         .with_history(input.history)
@@ -762,6 +1216,7 @@ where
                 });
                 let mut resolved = Vec::with_capacity(calls.len());
                 for (index, mut pending) in calls.into_iter().enumerate() {
+                    let mut denied = false;
                     if pending.preresolved_result.is_none() {
                         let call = &pending.tool_call;
                         let tool = config
@@ -776,7 +1231,7 @@ where
                             })?;
                         if tool.requires_approval {
                             let version = tool.policy.version().to_string();
-                            pending = await_approval(
+                            (pending, denied) = await_approval(
                                 ctx,
                                 pending,
                                 config.contract,
@@ -788,7 +1243,7 @@ where
                             .await?;
                         }
                     }
-                    resolved.push(pending);
+                    resolved.push(ResolvedCall { pending, denied });
                 }
                 ctx.state_mut(|workflow| {
                     workflow.runtime_mut().status = TemporalAgentStatus::Tools {
@@ -796,13 +1251,24 @@ where
                     }
                 });
                 let results = join_all(resolved.into_iter().enumerate().map(
-                    |(call_index, pending)| {
-                        execute_tool(ctx, pending, &config, prompt_index, model_turn, call_index)
+                    |(call_index, resolved)| {
+                        execute_tool(
+                            ctx,
+                            resolved,
+                            &config,
+                            CallPosition {
+                                prompt_index,
+                                turn: model_turn,
+                                call_index,
+                            },
+                        )
                     },
                 ))
                 .await
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
+                let (results, outcomes): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+                ctx.state_mut(|workflow| workflow.runtime_mut().outcomes.extend(outcomes));
                 agent.tool_results(results).map_err(workflow_error)?;
             }
             AgentRunStep::Done(response) => {
@@ -818,10 +1284,12 @@ where
                 let steering =
                     ctx.state_mut(|workflow| workflow.runtime_mut().steering.pop_front());
                 let Some(prompt) = steering else {
-                    ctx.state_mut(|workflow| {
-                        workflow.runtime_mut().status = TemporalAgentStatus::Completed;
+                    let outcomes = ctx.state_mut(|workflow| {
+                        let runtime = workflow.runtime_mut();
+                        runtime.status = TemporalAgentStatus::Completed;
+                        runtime.outcomes.clone()
                     });
-                    return Ok(response);
+                    return Ok(DurableResponse::new(response, outcomes));
                 };
                 prompt_index = allocate_prompt_index(ctx)?;
                 agent = AgentRun::new(prompt)
@@ -842,14 +1310,13 @@ fn allocate_prompt_index<W>(
 where
     W: TemporalWorkflowState,
 {
-    ctx.state_mut(|workflow| {
-        let runtime = workflow.runtime_mut();
-        let index = runtime.next_prompt_index;
-        runtime.next_prompt_index = index
-            .checked_add(1)
-            .ok_or_else(|| workflow_error("prompt index overflow"))?;
-        Ok(index)
-    })
+    ctx.state_mut(|workflow| workflow.allocate_prompt_index().map_err(workflow_error))
+}
+
+struct ResolvedCall {
+    pending: rig::agent::PendingToolCall,
+    /// A human denied the call; `pending` carries the denial result.
+    denied: bool,
 }
 
 /// Identity of one logical tool call. The workflow ID survives
@@ -877,7 +1344,7 @@ async fn await_approval<W>(
     prompt_index: u64,
     turn: usize,
     call_index: usize,
-) -> Result<rig::agent::PendingToolCall, temporalio_sdk::WorkflowTermination>
+) -> Result<(rig::agent::PendingToolCall, bool), temporalio_sdk::WorkflowTermination>
 where
     W: TemporalWorkflowState,
 {
@@ -923,20 +1390,30 @@ where
     });
     if let ApprovalDecision::Deny { reason, .. } = decision {
         pending = driver::deny_tool(pending, reason);
+        return Ok((pending, true));
     }
-    Ok(pending)
+    Ok((pending, false))
 }
 
 async fn execute_tool<W>(
     ctx: &WorkflowContext<W>,
-    pending: rig::agent::PendingToolCall,
+    resolved: ResolvedCall,
     config: &TemporalAgentConfig,
-    prompt_index: u64,
-    turn: usize,
-    call_index: usize,
-) -> Result<UserContent, temporalio_sdk::WorkflowTermination> {
+    position: CallPosition,
+) -> Result<(UserContent, ToolOutcome), temporalio_sdk::WorkflowTermination> {
+    let ResolvedCall { pending, denied } = resolved;
+    let CallPosition {
+        prompt_index,
+        turn,
+        call_index,
+    } = position;
     if let Some(result) = pending.preresolved_result {
-        return Ok(result);
+        let outcome = if denied {
+            ToolOutcome::denied(position, &pending.tool_call)
+        } else {
+            ToolOutcome::preresolved(position, &pending.tool_call)
+        };
+        return Ok((result, outcome));
     }
     let call = pending.tool_call;
     let name = call.function.name.to_string();
@@ -991,7 +1468,8 @@ async fn execute_tool<W>(
             .await?
         }
     };
-    Ok(driver::tool_result(&call, output.content))
+    let outcome = ToolOutcome::from_activity(position, &call, &output);
+    Ok((driver::tool_result(&call, output.content), outcome))
 }
 
 fn activity_options(config: &TemporalAgentConfig) -> ActivityOptions {

@@ -1,7 +1,7 @@
 use rig::{agent::AgentRun, completion::Message};
 use serde::{Deserialize, Serialize};
 
-use crate::config::ConfigSnapshot;
+use crate::{config::ConfigSnapshot, outcome::ToolOutcome};
 
 const CONTINUATION_FORMAT_VERSION: u32 = 1;
 
@@ -33,6 +33,9 @@ enum ContinuationEnvelope {
         #[serde(default)]
         prompt_index: u64,
         agent_run: AgentRun,
+        /// Dispositions of the tool calls made before this continuation.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tool_outcomes: Vec<ToolOutcome>,
     },
 }
 
@@ -42,6 +45,7 @@ pub(crate) struct ResumedRun {
     pub generation: u32,
     pub last_model_turn: usize,
     pub prompt_index: u64,
+    pub tool_outcomes: Vec<ToolOutcome>,
 }
 
 impl AgentInput {
@@ -72,6 +76,7 @@ impl AgentInput {
                 generation: 0,
                 last_model_turn: 0,
                 prompt_index: 0,
+                tool_outcomes: Vec::new(),
             }),
             Some(ContinuationEnvelope::V1 {
                 format_version,
@@ -80,11 +85,13 @@ impl AgentInput {
                 last_model_turn,
                 prompt_index,
                 agent_run,
+                tool_outcomes,
             }) if format_version == CONTINUATION_FORMAT_VERSION => Ok(ResumedRun {
                 agent: agent_run,
                 generation,
                 last_model_turn,
                 prompt_index,
+                tool_outcomes,
             }),
             Some(_) => Err("unsupported agent continuation format version".into()),
         }
@@ -97,6 +104,7 @@ impl AgentInput {
         last_model_turn: usize,
         prompt_index: u64,
         snapshot: Option<ConfigSnapshot>,
+        tool_outcomes: Vec<ToolOutcome>,
     ) -> Self {
         Self {
             // Start-only fields are retained for a stable, human-readable wire shape.
@@ -110,6 +118,7 @@ impl AgentInput {
                 last_model_turn,
                 prompt_index,
                 agent_run,
+                tool_outcomes,
             }),
         }
     }

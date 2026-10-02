@@ -27,12 +27,22 @@ use crate::{
     AgentInput, ApprovalDecision, ApprovalRequest, CheckpointConfig, CompletionMode,
     CompletionSettings, DurableAgentConfig, InvocationContract,
     activities::tool::ToolExecutor,
+    compaction::CompactionPolicy,
     config::ConfigSnapshot,
     guard::InvocationGuardStore,
     names::RuntimeNames,
-    orchestration::{STEERING_QUEUE_NAME, SteeringCommand, check_route_policy},
+    orchestration::{RUN_RESULT_KEY, STEERING_QUEUE_NAME, SteeringCommand, check_route_policy},
+    outcome::DurableResponse,
     policy::{ReplaySafety, ToolPolicy},
     registry::{activity_registry_with_names, orchestration_registry_with_names},
+    session::{
+        SESSION_INBOX_QUEUE, SESSION_LEDGER_KEY, SESSION_REJECTIONS_KEY, SessionCommand,
+        SessionInput, SessionRejections, SessionResult, session_result_key,
+    },
+    submission::{
+        DEFAULT_LEDGER_MAX_BYTES, Submission, SubmissionError, SubmissionLedger, SubmissionState,
+        SubmitInput,
+    },
     tools::{ToolCatalog, ToolEntry, durable_agent_tool},
 };
 
@@ -86,6 +96,16 @@ pub enum AgentOrchestratorError {
     RunNotFound(String),
     #[error("agent run `{0}` completed before accepting steering")]
     SteeringNotAccepted(String),
+    #[error("agent run `{0}` retained no tool outcomes; it ran under an earlier crate version")]
+    OutcomesUnavailable(String),
+    #[error("submission rejected: {0}")]
+    SubmissionRejected(SubmissionError),
+    #[error("session `{0}` does not exist")]
+    SessionNotFound(String),
+    #[error("submission `{request_id}` was cancelled because the session closed")]
+    SubmissionCancelled { request_id: String },
+    #[error("result of submission `{request_id}` is no longer retained")]
+    ResultNotRetained { request_id: String },
     #[cfg(feature = "sqlite")]
     #[error("failed to open SQLite provider: {0}")]
     Sqlite(String),
@@ -134,6 +154,7 @@ struct AgentMetadata {
     version: Version,
     description: String,
     orchestration: String,
+    session_orchestration: String,
     approval_queue: String,
     checkpoint_target: Option<String>,
     /// Attached to new runs under the logical contract.
@@ -244,6 +265,13 @@ impl DurableAgentBuilder {
 
     pub fn checkpoint(mut self, checkpoint: CheckpointConfig) -> Self {
         self.config.checkpoint = checkpoint;
+        self
+    }
+
+    /// Compact the active context of sessions between completed prompts.
+    /// Single runs do not compact. The audit transcript keeps every message.
+    pub fn compaction(mut self, policy: CompactionPolicy) -> Self {
+        self.config.compaction = Some(policy);
         self
     }
 
@@ -368,6 +396,7 @@ impl DurableAgentBuilder {
                 version: self.version,
                 description,
                 orchestration: names.orchestration,
+                session_orchestration: names.session_orchestration,
                 approval_queue: self.config.approval.queue_name.clone(),
                 checkpoint_target: self.config.checkpoint.target_version.clone(),
                 snapshot: match self.config.contract {
@@ -631,7 +660,7 @@ impl DurableAgent {
         history: Vec<Message>,
     ) -> Result<DurableRun, AgentOrchestratorError> {
         let run_id = run_id.into();
-        let instance_id = instance_id(&self.metadata, &run_id);
+        let instance_id = instance_id(&self.metadata, "rig-agent", &run_id);
         let mut input = AgentInput::new(prompt);
         input.history = history;
         input.snapshot = self.metadata.snapshot.clone();
@@ -650,21 +679,74 @@ impl DurableAgent {
         let run_id = run_id.into();
         DurableRun {
             client: self.client.clone(),
-            instance_id: instance_id(&self.metadata, &run_id),
+            instance_id: instance_id(&self.metadata, "rig-agent", &run_id),
             run_id,
             approval_queue: self.metadata.approval_queue.clone(),
         }
     }
+
+    /// Start a long-lived session. Submit prompts with
+    /// [`DurableSession::submit`]; the session deduplicates them on
+    /// `request_id` for its whole life.
+    pub async fn open_session(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Result<DurableSession, AgentOrchestratorError> {
+        self.open_session_with_history(session_id, Vec::new()).await
+    }
+
+    pub async fn open_session_with_history(
+        &self,
+        session_id: impl Into<String>,
+        history: Vec<Message>,
+    ) -> Result<DurableSession, AgentOrchestratorError> {
+        let session = self.session(session_id);
+        let input = SessionInput::new(session.instance_id(), DEFAULT_LEDGER_MAX_BYTES)
+            .with_history(history)
+            .with_snapshot(self.metadata.snapshot.clone());
+        self.client
+            .start_orchestration_versioned_typed(
+                session.instance_id(),
+                &self.metadata.session_orchestration,
+                self.metadata.version.to_string(),
+                input,
+            )
+            .await?;
+        // The start is queued; wait until the instance exists so the first
+        // submission can tell a pending session from an unknown one.
+        let deadline = tokio::time::Instant::now() + DEFAULT_WAIT_TIMEOUT;
+        while matches!(session.status().await?, OrchestrationStatus::NotFound) {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AgentOrchestratorError::Client(ClientError::Timeout));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(session)
+    }
+
+    /// Handle to a session that was opened earlier.
+    pub fn session(&self, session_id: impl Into<String>) -> DurableSession {
+        let session_id = session_id.into();
+        let instance_id = instance_id(&self.metadata, "rig-session", &session_id);
+        DurableSession {
+            run: DurableRun {
+                client: self.client.clone(),
+                instance_id,
+                run_id: session_id,
+                approval_queue: self.metadata.approval_queue.clone(),
+            },
+        }
+    }
 }
 
-fn instance_id(metadata: &AgentMetadata, run_id: &str) -> String {
+fn instance_id(metadata: &AgentMetadata, prefix: &str, id: &str) -> String {
     let mut digest = Sha256::new();
     let version = metadata.version.to_string();
-    for part in [metadata.name.as_str(), version.as_str(), run_id] {
+    for part in [metadata.name.as_str(), version.as_str(), id] {
         digest.update((part.len() as u64).to_be_bytes());
         digest.update(part.as_bytes());
     }
-    format!("rig-agent-{:x}", digest.finalize())
+    format!("{prefix}-{:x}", digest.finalize())
 }
 
 #[derive(Clone)]
@@ -696,6 +778,27 @@ impl DurableRun {
             .wait_for_orchestration_typed(&self.instance_id, timeout)
             .await?
             .map_err(AgentOrchestratorError::Run)
+    }
+
+    /// Like [`Self::wait`], with the ordered disposition of every tool call.
+    pub async fn wait_detailed(&self) -> Result<DurableResponse, AgentOrchestratorError> {
+        self.wait_detailed_timeout(DEFAULT_WAIT_TIMEOUT).await
+    }
+
+    pub async fn wait_detailed_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<DurableResponse, AgentOrchestratorError> {
+        self.wait_timeout(timeout).await?;
+        self.tool_outcomes().await
+    }
+
+    /// Retained response and tool dispositions of a completed run.
+    pub async fn tool_outcomes(&self) -> Result<DurableResponse, AgentOrchestratorError> {
+        self.client
+            .get_kv_value_typed(&self.instance_id, RUN_RESULT_KEY)
+            .await?
+            .ok_or_else(|| AgentOrchestratorError::OutcomesUnavailable(self.run_id.clone()))
     }
 
     pub async fn next_approval(&self) -> Result<ApprovalRequest, AgentOrchestratorError> {
@@ -839,4 +942,281 @@ fn orchestration_status_value_is(status: &OrchestrationStatus, key: &str, expect
                 .map(str::to_owned)
         })
         .is_some_and(|value| value == expected)
+}
+
+/// Client handle to a long-lived session.
+///
+/// Submissions are deduplicated on `request_id` for the life of the session.
+/// A retried request receives its original receipt; the same `request_id`
+/// with a different message or mode is rejected.
+#[derive(Clone)]
+pub struct DurableSession {
+    run: DurableRun,
+}
+
+impl DurableSession {
+    pub fn id(&self) -> &str {
+        &self.run.run_id
+    }
+
+    pub fn instance_id(&self) -> &str {
+        &self.run.instance_id
+    }
+
+    /// Submit a message and wait for the session to admit or reject it.
+    /// Admission returns the receipt; the prompt may still be queued.
+    pub async fn submit(&self, input: SubmitInput) -> Result<Submission, AgentOrchestratorError> {
+        let digest = input
+            .payload_digest()
+            .map_err(|error| AgentOrchestratorError::Run(error.to_string()))?;
+        if let Some(receipt) = self.receipt(&input.request_id).await? {
+            if receipt.payload_digest != digest || receipt.mode != input.mode {
+                return Err(AgentOrchestratorError::SubmissionRejected(
+                    SubmissionError::Conflict {
+                        request_id: input.request_id,
+                    },
+                ));
+            }
+            return Ok(receipt);
+        }
+        let command_id = uuid::Uuid::new_v4().to_string();
+        let request_id = input.request_id.clone();
+        let mode = input.mode;
+        let enqueued = self
+            .run
+            .client
+            .enqueue_event_typed(
+                &self.run.instance_id,
+                SESSION_INBOX_QUEUE,
+                &SessionCommand::Submit {
+                    command_id: command_id.clone(),
+                    input,
+                },
+            )
+            .await;
+        if let Err(error) = enqueued {
+            return match self.run.status().await? {
+                OrchestrationStatus::Completed { .. } | OrchestrationStatus::Failed { .. } => Err(
+                    AgentOrchestratorError::SubmissionRejected(SubmissionError::Closed),
+                ),
+                OrchestrationStatus::NotFound => Err(AgentOrchestratorError::SessionNotFound(
+                    self.run.run_id.clone(),
+                )),
+                OrchestrationStatus::Running { .. } => Err(error.into()),
+            };
+        }
+        let deadline = tokio::time::Instant::now() + DEFAULT_WAIT_TIMEOUT;
+        loop {
+            if let Some(receipt) = self.receipt(&request_id).await? {
+                if receipt.payload_digest != digest || receipt.mode != mode {
+                    return Err(AgentOrchestratorError::SubmissionRejected(
+                        SubmissionError::Conflict { request_id },
+                    ));
+                }
+                return Ok(receipt);
+            }
+            if let Some(rejection) = self.rejection(&command_id).await? {
+                return Err(AgentOrchestratorError::SubmissionRejected(rejection));
+            }
+            match self.run.status().await? {
+                OrchestrationStatus::Completed { .. } | OrchestrationStatus::Failed { .. } => {
+                    return Err(AgentOrchestratorError::SubmissionRejected(
+                        SubmissionError::Closed,
+                    ));
+                }
+                OrchestrationStatus::NotFound => {
+                    return Err(AgentOrchestratorError::SessionNotFound(
+                        self.run.run_id.clone(),
+                    ));
+                }
+                OrchestrationStatus::Running { .. } => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AgentOrchestratorError::Client(ClientError::Timeout));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Submit a message with a fresh request ID and wait for its answer.
+    pub async fn prompt(
+        &self,
+        message: impl Into<Message>,
+    ) -> Result<DurableResponse, AgentOrchestratorError> {
+        let receipt = self
+            .submit(SubmitInput::new(uuid::Uuid::new_v4().to_string(), message))
+            .await?;
+        self.wait(&receipt.request_id).await
+    }
+
+    /// Wait for an admitted submission to answer.
+    pub async fn wait(&self, request_id: &str) -> Result<DurableResponse, AgentOrchestratorError> {
+        self.wait_timeout(request_id, DEFAULT_WAIT_TIMEOUT).await
+    }
+
+    pub async fn wait_timeout(
+        &self,
+        request_id: &str,
+        timeout: Duration,
+    ) -> Result<DurableResponse, AgentOrchestratorError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let receipt = self.receipt(request_id).await?;
+            match receipt.map(|receipt| receipt.state) {
+                Some(SubmissionState::Answered) => {
+                    let receipt = self
+                        .receipt(request_id)
+                        .await?
+                        .expect("receipt was present a moment ago");
+                    return self
+                        .run
+                        .client
+                        .get_kv_value_typed(
+                            &self.run.instance_id,
+                            &session_result_key(&receipt.submission_id),
+                        )
+                        .await?
+                        .ok_or_else(|| AgentOrchestratorError::ResultNotRetained {
+                            request_id: request_id.to_owned(),
+                        });
+                }
+                Some(SubmissionState::Failed { error }) => {
+                    return Err(AgentOrchestratorError::Run(error));
+                }
+                Some(SubmissionState::Cancelled) => {
+                    return Err(AgentOrchestratorError::SubmissionCancelled {
+                        request_id: request_id.to_owned(),
+                    });
+                }
+                pending @ (None | Some(SubmissionState::Queued | SubmissionState::Running)) => {
+                    match self.run.status().await? {
+                        OrchestrationStatus::NotFound => {
+                            return Err(AgentOrchestratorError::SessionNotFound(
+                                self.run.run_id.clone(),
+                            ));
+                        }
+                        OrchestrationStatus::Running { .. } => {}
+                        terminal => {
+                            // The session may have settled this request
+                            // between the two reads; the final ledger decides.
+                            let settled = self
+                                .receipt(request_id)
+                                .await?
+                                .is_some_and(|receipt| receipt.state.is_terminal());
+                            if settled {
+                                continue;
+                            }
+                            return Err(match terminal {
+                                OrchestrationStatus::Failed { details, .. }
+                                    if pending.is_some() =>
+                                {
+                                    AgentOrchestratorError::Run(details.display_message())
+                                }
+                                _ => AgentOrchestratorError::SubmissionRejected(
+                                    SubmissionError::Closed,
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AgentOrchestratorError::Client(ClientError::Timeout));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Receipt of a request, if the session admitted it.
+    pub async fn receipt(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<Submission>, AgentOrchestratorError> {
+        Ok(self
+            .ledger()
+            .await?
+            .and_then(|ledger| ledger.receipt(request_id).cloned()))
+    }
+
+    /// The whole submission ledger.
+    pub async fn ledger(&self) -> Result<Option<SubmissionLedger>, AgentOrchestratorError> {
+        Ok(self
+            .run
+            .client
+            .get_kv_value_typed(&self.run.instance_id, SESSION_LEDGER_KEY)
+            .await?)
+    }
+
+    async fn rejection(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<SubmissionError>, AgentOrchestratorError> {
+        let rejections: Option<SessionRejections> = self
+            .run
+            .client
+            .get_kv_value_typed(&self.run.instance_id, SESSION_REJECTIONS_KEY)
+            .await?;
+        Ok(rejections.and_then(|rejections| {
+            rejections
+                .entries
+                .iter()
+                .find(|entry| entry.command_id == command_id)
+                .map(|entry| entry.error.clone())
+        }))
+    }
+
+    /// Stop admitting submissions. Queued submissions still run; the
+    /// session completes after the last one answers.
+    pub async fn close(&self) -> Result<(), AgentOrchestratorError> {
+        self.run
+            .client
+            .enqueue_event_typed(
+                &self.run.instance_id,
+                SESSION_INBOX_QUEUE,
+                &SessionCommand::Close,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Wait for a closed session to complete and return its audit
+    /// transcript and ledger.
+    pub async fn result(&self) -> Result<SessionResult, AgentOrchestratorError> {
+        self.result_timeout(DEFAULT_WAIT_TIMEOUT).await
+    }
+
+    pub async fn result_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<SessionResult, AgentOrchestratorError> {
+        self.run
+            .client
+            .wait_for_orchestration_typed(&self.run.instance_id, timeout)
+            .await?
+            .map_err(AgentOrchestratorError::Run)
+    }
+
+    pub async fn next_approval(&self) -> Result<ApprovalRequest, AgentOrchestratorError> {
+        self.run.next_approval().await
+    }
+
+    pub async fn approve(&self, request: &ApprovalRequest) -> Result<(), AgentOrchestratorError> {
+        self.run.approve(request).await
+    }
+
+    pub async fn deny(
+        &self,
+        request: &ApprovalRequest,
+        reason: impl Into<String>,
+    ) -> Result<(), AgentOrchestratorError> {
+        self.run.deny(request, reason).await
+    }
+
+    pub async fn cancel(&self, reason: impl Into<String>) -> Result<(), AgentOrchestratorError> {
+        self.run.cancel(reason).await
+    }
+
+    pub async fn status(&self) -> Result<OrchestrationStatus, AgentOrchestratorError> {
+        self.run.status().await
+    }
 }

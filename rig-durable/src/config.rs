@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     activity_types::InvocationContract,
+    compaction::CompactionPolicy,
     policy::ToolPolicy,
     tools::{ToolCatalog, ToolEntry, ToolRoute},
 };
@@ -86,6 +87,9 @@ pub struct DurableAgentConfig {
     /// Wire contract between the orchestration and its tool activity. The
     /// default keeps existing histories replayable.
     pub contract: InvocationContract,
+    /// Compaction of the active context between completed prompts in a
+    /// session. Single runs do not compact.
+    pub compaction: Option<CompactionPolicy>,
 }
 
 impl Default for DurableAgentConfig {
@@ -100,6 +104,7 @@ impl Default for DurableAgentConfig {
             approval: ApprovalConfig::default(),
             checkpoint: CheckpointConfig::default(),
             contract: InvocationContract::default(),
+            compaction: None,
         }
     }
 }
@@ -129,6 +134,7 @@ impl DurableAgentConfig {
             completion_retry: RetrySnapshot::from(&self.completion_retry),
             approval: self.approval.clone(),
             checkpoint: self.checkpoint.clone(),
+            compaction: self.compaction.clone(),
         }
     }
 
@@ -178,6 +184,7 @@ impl DurableAgentConfig {
             approval: snapshot.approval.clone(),
             checkpoint: snapshot.checkpoint.clone(),
             contract: self.contract,
+            compaction: snapshot.compaction.clone(),
         })
     }
 }
@@ -213,6 +220,8 @@ pub struct ConfigSnapshot {
     pub completion_retry: RetrySnapshot,
     pub approval: ApprovalConfig,
     pub checkpoint: CheckpointConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionPolicy>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

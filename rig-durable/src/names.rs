@@ -9,6 +9,10 @@ pub const STREAMING_COMPLETION_ACTIVITY: &str = "RigModelStreamingCompletionV1";
 pub const TOOL_ACTIVITY: &str = "RigToolExecutionV1";
 /// Tool activity under [`InvocationContract::Logical`].
 pub const LOGICAL_TOOL_ACTIVITY: &str = "RigToolExecutionV2";
+/// Long-lived session orchestration.
+pub const SESSION_ORCHESTRATION: &str = "RigDurableAgentSessionV1";
+/// Summarization activity used by completed-prompt compaction.
+pub const COMPACTION_ACTIVITY: &str = "RigContextCompactionV1";
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeNames {
@@ -19,6 +23,8 @@ pub(crate) struct RuntimeNames {
     pub tool_activity: String,
     /// Tool activity for the logical contract.
     pub logical_tool_activity: String,
+    pub session_orchestration: String,
+    pub compaction_activity: String,
 }
 
 impl RuntimeNames {
@@ -29,6 +35,8 @@ impl RuntimeNames {
             streaming_completion_activity: STREAMING_COMPLETION_ACTIVITY.into(),
             tool_activity: TOOL_ACTIVITY.into(),
             logical_tool_activity: LOGICAL_TOOL_ACTIVITY.into(),
+            session_orchestration: SESSION_ORCHESTRATION.into(),
+            compaction_activity: COMPACTION_ACTIVITY.into(),
         }
     }
 
@@ -41,6 +49,8 @@ impl RuntimeNames {
             streaming_completion_activity: format!("{activity_prefix}::streaming::v1"),
             tool_activity: format!("{activity_prefix}::tool::v1"),
             logical_tool_activity: format!("{activity_prefix}::tool::v2"),
+            session_orchestration: format!("rig-duroxide::session::{name}"),
+            compaction_activity: format!("{activity_prefix}::compaction::v1"),
         }
     }
 

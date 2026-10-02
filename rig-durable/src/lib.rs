@@ -7,6 +7,7 @@
 pub mod activities;
 pub mod activity_types;
 pub mod approval;
+pub mod compaction;
 #[cfg(feature = "duroxide")]
 pub mod config;
 #[cfg(any(feature = "duroxide", feature = "temporal"))]
@@ -19,12 +20,16 @@ pub mod identity;
 pub mod names;
 #[cfg(feature = "duroxide")]
 pub mod orchestration;
+pub mod outcome;
 pub mod policy;
 #[cfg(feature = "duroxide")]
 pub mod registry;
 pub mod result;
 #[cfg(feature = "duroxide")]
+pub mod session;
+#[cfg(feature = "duroxide")]
 pub mod streaming;
+pub mod submission;
 #[cfg(feature = "temporal")]
 pub mod temporal;
 #[cfg(feature = "duroxide")]
@@ -39,6 +44,7 @@ pub use activity_types::{
     InvocationContract, ToolActivityInput, ToolActivityOutput, ToolInvocation,
 };
 pub use approval::{ApprovalDecision, ApprovalRequest};
+pub use compaction::{CompactionPolicy, CompactionRecord, ContextState};
 #[cfg(feature = "duroxide")]
 pub use config::{
     ApprovalConfig, CheckpointConfig, CheckpointPolicy, CompletionMode, CompletionSettings,
@@ -47,16 +53,22 @@ pub use config::{
 #[cfg(feature = "duroxide")]
 pub use facade::{
     AgentDefinition, AgentOrchestrator, AgentOrchestratorBuilder, AgentOrchestratorError,
-    DurableAgent, DurableAgentBuilder, DurableRun, ToolOptions,
+    DurableAgent, DurableAgentBuilder, DurableRun, DurableSession, ToolOptions,
 };
 pub use guard::{InMemoryGuardStore, InvocationGuardStore};
 pub use identity::{AttemptMetadata, LogicalCallKey};
+pub use outcome::{DurableResponse, OutcomeSource, ToolOutcome};
 pub use policy::{MetadataRetention, ReplaySafety, ToolPolicy};
 #[cfg(feature = "duroxide")]
 pub use registry::{activity_registry, orchestration_registry};
 pub use result::{DurableToolResult, InterruptionReason, ToolDisposition};
 #[cfg(feature = "duroxide")]
+pub use session::{SessionInput, SessionResult};
+#[cfg(feature = "duroxide")]
 pub use streaming::{StreamItem, StreamTranscript};
+pub use submission::{
+    Submission, SubmissionError, SubmissionLedger, SubmissionMode, SubmissionState, SubmitInput,
+};
 #[cfg(feature = "duroxide")]
 pub use tools::{
     ToolCatalog, ToolEntry, ToolRoute, activity_tool, catalog_from_toolset, sub_orchestration_tool,

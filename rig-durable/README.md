@@ -31,11 +31,22 @@ accepted before the close and waits for active handlers before it completes.
 An activity or agent failure closes the session. Completed turns commit history
 before the next queued turn starts, so a later failure does not discard them.
 
+The `submit` update admits a prompt under a client `request_id` (see
+[Sessions](#sessions)) and returns `TemporalSubmission` once the prompt
+answers: the receipt and, while the session retains it, the `DurableResponse`
+with ordered tool dispositions. A rejected request fails the update from its
+validator, without a history event, with a message that starts with the
+`SubmissionError` reason (`conflict`, `busy`, `closed`, `ledger_full`). The
+`receipt`, `ledger`, `result`, and `tool_outcomes` queries read the same
+state; `snapshot` reports the compaction cutoff, queued submissions, and the
+last compaction error.
+
 Temporal sessions continue as new at an idle boundary when the service suggests
-it. Conversation history, queued steering, and the next prompt identity are
-carried into the new run. `session_history_max_bytes` limits the serialized
-conversation payload (1 MB by default); prompts that exceed it are rejected and
-a completed turn that crosses it fails the session.
+it. Conversation history, the compaction record, the submission ledger, queued
+submissions, retained results, and queued steering are carried into the new
+run. `session_history_max_bytes` limits the serialized transcript payload
+(1 MB by default); prompts that exceed it are rejected and a completed turn
+that crosses it fails the session.
 
 ```rust,ignore
 use rig_durable::temporal::{TemporalAgent, TemporalAgentSessionWorkflow};
@@ -113,8 +124,11 @@ invocation guard that was not supplied.
 
 The ignored live suite covers happy-path model and tool activities, retries,
 stable invocation identity, exhausted retries, approval and denial, long-lived
-history, idle steering, closing, payload limits, registration validation, and
-guarded and idempotent writes across an activity timeout. Configure a server
+history, idle steering, closing, payload limits, registration validation,
+guarded and idempotent writes across an activity timeout, submission
+deduplication, follow-up and reject-if-busy admission during a tool round,
+completed-prompt compaction, a failed summary, ordered tool dispositions, and
+a failed submission closing the session. Configure a server
 with the standard Temporal environment variables before running it:
 
 ```bash
@@ -230,6 +244,86 @@ event identity. Adding or changing either for a live orchestration version will
 break replay determinism. Each completion request also contains the complete
 conversation and is recorded in history, so stored history grows quadratically
 with the number of turns.
+
+## Sessions
+
+Both backends run a long-lived session as one durable execution that admits
+prompts one at a time. `SubmitInput` carries the client's `request_id`, the
+message, and a `SubmissionMode`:
+
+| Mode | Session idle | Session busy |
+|---|---|---|
+| `FollowUp` (default) | runs now | queued; runs after the active prompt answers |
+| `RejectIfBusy` | runs now | rejected with `SubmissionError::Busy` |
+
+The session keeps a `SubmissionLedger` of receipts keyed by `request_id`.
+A retried request receives its original `Submission` in every state, including
+after the answer; the same `request_id` with a different message or mode is
+rejected with `Conflict`. Deduplication runs before the busy and closed checks.
+Each admitted submission gets the next `prompt_index`, which is the
+`submission_id` that tool calls carry in their `LogicalCallKey`. The ledger is
+capped at 48 KiB by default (`submission::DEFAULT_LEDGER_MAX_BYTES`); a session whose ledger
+is full rejects new requests with `LedgerFull` instead of evicting receipts.
+
+Busy is evaluated at operation boundaries: a request that arrives during a tool
+round is admitted or rejected after that round's results return. A queued
+follow-up never enters the active prompt's tool round. Post-tool steering of an
+active prompt and compaction of an active prompt stay out of scope.
+
+A failed prompt closes the session and cancels queued submissions. `close`
+stops admission; admitted submissions and queued steering still run before the
+session completes.
+
+Sessions retain recent per-submission results for the `wait` and result
+surfaces: 32 on Duroxide (`session::SESSION_RESULT_RETENTION`) and 16 on
+Temporal (`temporal::SESSION_RESULT_RETENTION`). An older result is gone, but
+its receipt stays `Answered`.
+
+```rust,ignore
+let session = orchestrator.agent("calculator")?.open_session("support-42").await?;
+let receipt = session.submit(SubmitInput::new("req-1", "What is 20 + 22?")).await?;
+let detailed = session.wait(&receipt.request_id).await?;
+let rejected = session
+    .submit(SubmitInput::new("req-2", "urgent").mode(SubmissionMode::RejectIfBusy))
+    .await;
+```
+
+The Duroxide `DurableSession::submit` returns on admission and `wait` returns
+the answer; the Temporal `submit` update returns when the prompt answers.
+
+### Compaction
+
+`compaction(CompactionPolicy::new(max_context_messages, keep_recent_messages))`
+bounds the active context a session sends to the model. After a prompt answers,
+if the active context has more than `max_context_messages` messages, the
+session runs one summarization activity over the oldest messages up to the
+latest prompt boundary that keeps at least `keep_recent_messages`. A cutoff
+never splits a tool exchange, so the request stays canonical. The summary
+replaces that prefix as a user message that names the policy version; later
+summaries build on the earlier one. The audit transcript keeps every message,
+and `SessionResult`/`TemporalAgentSessionResult` carry both the transcript and
+the `CompactionRecord` (cutoff, policy version, summary, usage).
+
+A failed or stale summary leaves the context in place and does not fail the
+session; the session retries after the next prompt grows the transcript.
+Compaction runs between prompts: a Duroxide session processes it as the next
+command, and a Temporal session treats it as busy for submissions while the
+legacy `prompt` update waits for it. Compaction bounds the model context;
+continue-as-new and checkpoints bound event history. Both backends serialize
+the transcript, so `session_history_max_bytes` still applies to it.
+
+### Detailed results
+
+`PromptResponse` stays the result of `prompt`, `DurableRun::wait`, and the
+Temporal `TemporalAgentWorkflow::run` result. The crate-owned
+`DurableResponse` wraps it with ordered `ToolOutcome`s: one per tool call, in
+dispatch order, with `prompt_index`, 1-based model `turn`, `call_index`, the
+`ToolDisposition`, and whether it was `Retained` from the activity output or
+`Derived` from the legacy error flag. Read it from
+`DurableRun::wait_detailed`/`tool_outcomes`, `DurableSession::wait`, the
+Temporal `submit` update, or the Temporal `tool_outcomes` and `result`
+queries. Tool results with equal content and different dispositions stay
+distinct.
 
 ## Streaming completion
 
