@@ -25,9 +25,13 @@ use thiserror::Error;
 
 use crate::{
     AgentInput, ApprovalDecision, ApprovalRequest, CheckpointConfig, CompletionMode,
-    CompletionSettings, DurableAgentConfig,
+    CompletionSettings, DurableAgentConfig, InvocationContract,
+    activities::tool::ToolExecutor,
+    config::ConfigSnapshot,
+    guard::InvocationGuardStore,
     names::RuntimeNames,
-    orchestration::{STEERING_QUEUE_NAME, SteeringCommand},
+    orchestration::{STEERING_QUEUE_NAME, SteeringCommand, check_route_policy},
+    policy::{ReplaySafety, ToolPolicy},
     registry::{activity_registry_with_names, orchestration_registry_with_names},
     tools::{ToolCatalog, ToolEntry, durable_agent_tool},
 };
@@ -60,6 +64,18 @@ pub enum AgentOrchestratorError {
     },
     #[error("durable sub-agent `{0}` requires approval, which parent run handles cannot route")]
     SubAgentApprovalUnsupported(String),
+    #[error(
+        "tool `{0}` declares a replay policy, which requires `InvocationContract::Logical`; \
+         select it with `invocation_contract` under a new agent version"
+    )]
+    InvocationContractRequired(String),
+    #[error(
+        "tool `{0}` never repeats an uncertain effect and requires an invocation guard store; \
+         supply one with `invocation_guard`"
+    )]
+    GuardStoreRequired(String),
+    #[error("invalid tool policy: {0}")]
+    InvalidToolPolicy(String),
     #[error("registry error: {0}")]
     Registry(String),
     #[error("agent run failed: {0}")]
@@ -80,11 +96,24 @@ pub struct ToolOptions {
     pub retry: RetryPolicy,
     pub tag: Option<String>,
     pub requires_approval: bool,
+    /// Replay safety, implementation version, and metadata retention. Any
+    /// setting other than the default requires [`InvocationContract::Logical`].
+    pub policy: ToolPolicy,
 }
 
 impl ToolOptions {
     pub fn retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
+        self
+    }
+
+    pub fn policy(mut self, policy: ToolPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn replay_safety(mut self, safety: ReplaySafety) -> Self {
+        self.policy = self.policy.replay_safety(safety);
         self
     }
 
@@ -107,6 +136,8 @@ struct AgentMetadata {
     orchestration: String,
     approval_queue: String,
     checkpoint_target: Option<String>,
+    /// Attached to new runs under the logical contract.
+    snapshot: Option<ConfigSnapshot>,
 }
 
 pub struct AgentDefinition {
@@ -137,6 +168,7 @@ pub struct DurableAgentBuilder {
     routed_tools: ToolCatalog,
     children: Vec<AgentDefinition>,
     config: DurableAgentConfig,
+    guard: Option<Arc<dyn InvocationGuardStore>>,
 }
 
 impl DurableAgentBuilder {
@@ -151,7 +183,23 @@ impl DurableAgentBuilder {
             routed_tools: ToolCatalog::default(),
             children: Vec::new(),
             config: DurableAgentConfig::default(),
+            guard: None,
         }
+    }
+
+    /// Select the wire contract between this agent version and its tool
+    /// activities. Switching an existing version's contract breaks replay of
+    /// its in-flight runs; select it together with a new version.
+    pub fn invocation_contract(mut self, contract: InvocationContract) -> Self {
+        self.config.contract = contract;
+        self
+    }
+
+    /// Supply the store that tools with
+    /// [`ReplaySafety::InterruptOnUncertain`] claim and settle against.
+    pub fn invocation_guard(mut self, store: Arc<dyn InvocationGuardStore>) -> Self {
+        self.guard = Some(store);
+        self
     }
 
     pub fn version(mut self, version: impl Into<String>) -> Result<Self, AgentOrchestratorError> {
@@ -284,13 +332,31 @@ impl DurableAgentBuilder {
                 retry: options.retry,
                 tag: options.tag,
                 requires_approval: options.requires_approval,
+                policy: options.policy,
             });
         }
         self.config.tools = self.routed_tools;
+        for entry in self.config.tools.0.values() {
+            let name = &entry.definition.name;
+            if self.config.contract == InvocationContract::Legacy
+                && entry.policy != ToolPolicy::default()
+            {
+                return Err(AgentOrchestratorError::InvocationContractRequired(
+                    name.clone(),
+                ));
+            }
+            check_route_policy(entry, name).map_err(AgentOrchestratorError::InvalidToolPolicy)?;
+            if entry.policy.safety().requires_guard() && self.guard.is_none() {
+                return Err(AgentOrchestratorError::GuardStoreRequired(name.clone()));
+            }
+        }
 
         let version = self.version.to_string();
         let names = RuntimeNames::for_agent(&self.name, &version);
-        let activities = activity_registry_with_names(self.model, self.tools, &names);
+        let executor = ToolExecutor::new(Arc::new(self.tools))
+            .with_guard(self.guard)
+            .with_registered_policies(self.config.tools.policies());
+        let activities = activity_registry_with_names(self.model, executor, &names);
         let orchestrations =
             orchestration_registry_with_names(self.config.clone(), names.clone(), Some(&version));
         let description = self.description.unwrap_or_else(|| self.name.clone());
@@ -302,8 +368,12 @@ impl DurableAgentBuilder {
                 version: self.version,
                 description,
                 orchestration: names.orchestration,
-                approval_queue: self.config.approval.queue_name,
+                approval_queue: self.config.approval.queue_name.clone(),
                 checkpoint_target: self.config.checkpoint.target_version.clone(),
+                snapshot: match self.config.contract {
+                    InvocationContract::Legacy => None,
+                    InvocationContract::Logical => Some(self.config.snapshot()),
+                },
             },
             activities,
             orchestrations,
@@ -564,6 +634,7 @@ impl DurableAgent {
         let instance_id = instance_id(&self.metadata, &run_id);
         let mut input = AgentInput::new(prompt);
         input.history = history;
+        input.snapshot = self.metadata.snapshot.clone();
         self.client
             .start_orchestration_versioned_typed(
                 &instance_id,

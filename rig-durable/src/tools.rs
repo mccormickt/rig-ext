@@ -2,8 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use duroxide::RetryPolicy;
 use rig::{completion::ToolDefinition, tool::ToolSet};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug)]
+use crate::policy::ToolPolicy;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolRoute {
     RigTool,
     Activity {
@@ -26,6 +30,16 @@ pub struct ToolEntry {
     pub retry: RetryPolicy,
     pub tag: Option<String>,
     pub requires_approval: bool,
+    /// Replay safety, implementation version, and metadata retention. Applied
+    /// only under [`InvocationContract::Logical`](crate::InvocationContract).
+    pub policy: ToolPolicy,
+}
+
+impl ToolEntry {
+    pub fn with_policy(mut self, policy: ToolPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -40,6 +54,13 @@ impl ToolCatalog {
     }
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.0.values().map(|e| e.definition.clone()).collect()
+    }
+    /// Replay policies by tool name, for the worker-side executor.
+    pub fn policies(&self) -> Vec<(String, ToolPolicy)> {
+        self.0
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.policy.clone()))
+            .collect()
     }
     pub fn executable_names(&self) -> BTreeSet<String> {
         self.0.keys().cloned().collect()
@@ -73,6 +94,7 @@ pub async fn catalog_from_toolset(toolset: &ToolSet, retry: RetryPolicy) -> Tool
                         retry: retry.clone(),
                         tag: None,
                         requires_approval: false,
+                        policy: ToolPolicy::default(),
                     },
                 )
             })
@@ -93,6 +115,7 @@ pub fn activity_tool(
         retry,
         tag: None,
         requires_approval: false,
+        policy: ToolPolicy::default(),
     }
 }
 
@@ -115,6 +138,7 @@ pub fn sub_orchestration_tool(
         retry: RetryPolicy::new(1),
         tag: None,
         requires_approval: false,
+        policy: ToolPolicy::default(),
     }
 }
 
@@ -132,6 +156,7 @@ pub(crate) fn durable_agent_tool(
         retry: RetryPolicy::new(1),
         tag: None,
         requires_approval: false,
+        policy: ToolPolicy::default(),
     }
 }
 

@@ -4,9 +4,7 @@
 //! persisted: deploy catalog and orchestration changes under a new orchestration
 //! version, and keep old versions registered while instances can replay.
 
-#[cfg(any(feature = "duroxide", feature = "temporal"))]
 pub mod activities;
-#[cfg(any(feature = "duroxide", feature = "temporal"))]
 pub mod activity_types;
 pub mod approval;
 #[cfg(feature = "duroxide")]
@@ -15,12 +13,16 @@ pub mod config;
 mod driver;
 #[cfg(feature = "duroxide")]
 mod facade;
+pub mod guard;
+pub mod identity;
 #[cfg(feature = "duroxide")]
 pub mod names;
 #[cfg(feature = "duroxide")]
 pub mod orchestration;
+pub mod policy;
 #[cfg(feature = "duroxide")]
 pub mod registry;
+pub mod result;
 #[cfg(feature = "duroxide")]
 pub mod streaming;
 #[cfg(feature = "temporal")]
@@ -30,10 +32,12 @@ pub mod tools;
 #[cfg(feature = "duroxide")]
 pub mod types;
 
+pub use activities::tool::ToolExecutor;
 #[cfg(feature = "duroxide")]
 pub use activity_types::StreamingCompletionOutput;
-#[cfg(any(feature = "duroxide", feature = "temporal"))]
-pub use activity_types::{ToolActivityInput, ToolActivityOutput, ToolInvocation};
+pub use activity_types::{
+    InvocationContract, ToolActivityInput, ToolActivityOutput, ToolInvocation,
+};
 pub use approval::{ApprovalDecision, ApprovalRequest};
 #[cfg(feature = "duroxide")]
 pub use config::{
@@ -45,8 +49,12 @@ pub use facade::{
     AgentDefinition, AgentOrchestrator, AgentOrchestratorBuilder, AgentOrchestratorError,
     DurableAgent, DurableAgentBuilder, DurableRun, ToolOptions,
 };
+pub use guard::{InMemoryGuardStore, InvocationGuardStore};
+pub use identity::{AttemptMetadata, LogicalCallKey};
+pub use policy::{MetadataRetention, ReplaySafety, ToolPolicy};
 #[cfg(feature = "duroxide")]
 pub use registry::{activity_registry, orchestration_registry};
+pub use result::{DurableToolResult, InterruptionReason, ToolDisposition};
 #[cfg(feature = "duroxide")]
 pub use streaming::{StreamItem, StreamTranscript};
 #[cfg(feature = "duroxide")]

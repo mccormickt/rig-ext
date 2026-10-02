@@ -1,6 +1,8 @@
 use rig::{agent::AgentRun, completion::Message};
 use serde::{Deserialize, Serialize};
 
+use crate::config::ConfigSnapshot;
+
 const CONTINUATION_FORMAT_VERSION: u32 = 1;
 
 /// Persisted orchestration input.
@@ -9,6 +11,12 @@ pub struct AgentInput {
     pub prompt: Message,
     #[serde(default)]
     pub history: Vec<Message>,
+    /// Configuration retained for this execution. When present, the worker
+    /// resolves it against its registration and fails closed on drift. The
+    /// orchestration adds its live configuration at the first checkpoint when
+    /// the client supplied none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<ConfigSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     continuation: Option<ContinuationEnvelope>,
 }
@@ -28,29 +36,43 @@ enum ContinuationEnvelope {
     },
 }
 
+/// State restored from a continuation.
+pub(crate) struct ResumedRun {
+    pub agent: AgentRun,
+    pub generation: u32,
+    pub last_model_turn: usize,
+    pub prompt_index: u64,
+}
+
 impl AgentInput {
     pub fn new(prompt: impl Into<Message>) -> Self {
         Self {
             prompt: prompt.into(),
             history: Vec::new(),
+            snapshot: None,
             continuation: None,
         }
+    }
+
+    pub fn with_snapshot(mut self, snapshot: ConfigSnapshot) -> Self {
+        self.snapshot = Some(snapshot);
+        self
     }
 
     pub(crate) fn is_resume(&self) -> bool {
         self.continuation.is_some()
     }
 
-    pub(crate) fn into_run(self, max_turns: usize) -> Result<(AgentRun, u32, usize, u64), String> {
+    pub(crate) fn into_run(self, max_turns: usize) -> Result<ResumedRun, String> {
         match self.continuation {
-            None => Ok((
-                AgentRun::new(self.prompt)
+            None => Ok(ResumedRun {
+                agent: AgentRun::new(self.prompt)
                     .with_history(self.history)
                     .max_turns(max_turns),
-                0,
-                0,
-                0,
-            )),
+                generation: 0,
+                last_model_turn: 0,
+                prompt_index: 0,
+            }),
             Some(ContinuationEnvelope::V1 {
                 format_version,
                 generation,
@@ -58,9 +80,12 @@ impl AgentInput {
                 last_model_turn,
                 prompt_index,
                 agent_run,
-            }) if format_version == CONTINUATION_FORMAT_VERSION => {
-                Ok((agent_run, generation, last_model_turn, prompt_index))
-            }
+            }) if format_version == CONTINUATION_FORMAT_VERSION => Ok(ResumedRun {
+                agent: agent_run,
+                generation,
+                last_model_turn,
+                prompt_index,
+            }),
             Some(_) => Err("unsupported agent continuation format version".into()),
         }
     }
@@ -71,11 +96,13 @@ impl AgentInput {
         operations: u32,
         last_model_turn: usize,
         prompt_index: u64,
+        snapshot: Option<ConfigSnapshot>,
     ) -> Self {
         Self {
             // Start-only fields are retained for a stable, human-readable wire shape.
             prompt: Message::user(""),
             history: Vec::new(),
+            snapshot,
             continuation: Some(ContinuationEnvelope::V1 {
                 format_version: CONTINUATION_FORMAT_VERSION,
                 generation,

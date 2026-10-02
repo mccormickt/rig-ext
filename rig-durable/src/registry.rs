@@ -4,10 +4,12 @@ use duroxide::runtime::registry::{ActivityRegistry, OrchestrationRegistry};
 use rig::{DynModel, operation::Completion, tool::ToolSet};
 
 use crate::{
-    activities,
+    activities::{self, tool::ToolExecutor},
     activity_types::{ToolActivityInput, ToolActivityOutput},
     config::DurableAgentConfig,
+    guard::InvocationGuardStore,
     names::RuntimeNames,
+    tools::ToolCatalog,
     types::AgentInput,
 };
 
@@ -15,20 +17,41 @@ pub fn activity_registry(
     model: impl Into<DynModel<Completion>>,
     tools: ToolSet,
 ) -> ActivityRegistry {
-    activity_registry_with_names(model.into(), tools, &RuntimeNames::legacy())
+    activity_registry_with_names(
+        model.into(),
+        ToolExecutor::new(Arc::new(tools)),
+        &RuntimeNames::legacy(),
+    )
+}
+
+/// Like [`activity_registry`], with the catalog's tool policies and an
+/// invocation guard store for tools whose policy never repeats an uncertain
+/// effect.
+pub fn activity_registry_with_guard(
+    model: impl Into<DynModel<Completion>>,
+    tools: ToolSet,
+    catalog: &ToolCatalog,
+    guard: Arc<dyn InvocationGuardStore>,
+) -> ActivityRegistry {
+    let executor = ToolExecutor::new(Arc::new(tools))
+        .with_guard(Some(guard))
+        .with_registered_policies(catalog.policies());
+    activity_registry_with_names(model.into(), executor, &RuntimeNames::legacy())
 }
 
 pub(crate) fn activity_registry_with_names(
     model: DynModel<Completion>,
-    tools: ToolSet,
+    executor: ToolExecutor,
     names: &RuntimeNames,
 ) -> ActivityRegistry {
     let model = Arc::new(model);
     let completion_model = Arc::clone(&model);
-    let tools = Arc::new(tools);
+    let executor = Arc::new(executor);
+    let logical_executor = Arc::clone(&executor);
     let completion_activity = names.completion_activity.clone();
     let streaming_completion_activity = names.streaming_completion_activity.clone();
     let tool_activity = names.tool_activity.clone();
+    let logical_tool_activity = names.logical_tool_activity.clone();
     ActivityRegistry::builder()
         .register_typed(completion_activity, move |_ctx, request| {
             let model = Arc::clone(&completion_model);
@@ -39,9 +62,16 @@ pub(crate) fn activity_registry_with_names(
             async move { activities::completion::stream(model.as_ref(), request).await }
         })
         .register_typed(tool_activity, move |_ctx, input: ToolActivityInput| {
-            let tools = Arc::clone(&tools);
-            async move { activities::tool::execute(&tools, input).await }
+            let executor = Arc::clone(&executor);
+            async move { executor.execute(input).await }
         })
+        .register_typed(
+            logical_tool_activity,
+            move |_ctx, input: ToolActivityInput| {
+                let executor = Arc::clone(&logical_executor);
+                async move { executor.execute(input).await }
+            },
+        )
         .build()
 }
 

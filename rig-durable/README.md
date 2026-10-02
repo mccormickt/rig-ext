@@ -105,10 +105,17 @@ cargo run -p rig-durable --no-default-features --features temporal \
   --example temporal_retrying_tool
 ```
 
+New `TemporalAgent` inputs use the `Logical` invocation contract (see
+[Tool replay safety](#tool-replay-safety)). Workflow inputs recorded before
+the contract existed deserialize as `Legacy` and keep their activity name and
+payloads. `register` returns `TemporalAgentError` when a tool policy needs an
+invocation guard that was not supplied.
+
 The ignored live suite covers happy-path model and tool activities, retries,
 stable invocation identity, exhausted retries, approval and denial, long-lived
-history, idle steering, closing, and payload limits. Configure a server with
-the standard Temporal environment variables before running it:
+history, idle steering, closing, payload limits, registration validation, and
+guarded and idempotent writes across an activity timeout. Configure a server
+with the standard Temporal environment variables before running it:
 
 ```bash
 TEMPORAL_ADDRESS=temporal.example.com:443 TEMPORAL_TLS=true \
@@ -206,14 +213,17 @@ agents. Rig memory, retrieval, hooks, structured output, and arbitrary per-run
 `ToolContext` values are not yet mirrored. Activity-backed Rig tools receive a
 durable `ToolInvocation` in their context.
 
-Configuration and retry policies are captured at registration time rather than
-serialized. Tool calls are checked against the exact advertised and
-`ToolChoice`-allowed names, and unknown calls fail closed. Treat changes to tool
-definitions, routing, prompts, retry policy, or control flow as orchestration
-version changes. Keep every version needed by live histories registered; replay
-must observe the same configuration and activity names. Activities themselves
-must be idempotent because retries can repeat I/O. Use `ToolInvocation` as the
-idempotency key for side effects.
+Under the default `Legacy` contract, configuration and retry policies are
+captured at registration time rather than serialized. Under the `Logical`
+contract, each new run records a configuration snapshot in its input and
+carries it across continue-as-new; see
+[Tool replay safety](#tool-replay-safety). Tool calls are checked against the
+exact advertised and `ToolChoice`-allowed names, and unknown calls fail closed.
+Treat changes to tool definitions, routing, prompts, retry policy, or control
+flow as orchestration version changes. Keep every version needed by live
+histories registered; replay must observe the same configuration and activity
+names. Activities themselves must be idempotent because retries can repeat
+I/O. Use `ToolInvocation` as the idempotency key for side effects.
 
 Timeouts add durable timer events, and worker tags are part of an activity's
 event identity. Adding or changing either for a live orchestration version will
@@ -343,3 +353,111 @@ unflagged calls fan out together. A denial is returned to the model as a
 correlated synthetic tool result, so it can recover. Flagged tools fail closed
 if approval is disabled, and preresolved Rig calls bypass both approval and
 execution. See `examples/human_approval.rs` for a local, API-key-free flow.
+
+## Tool replay safety
+
+Both backends deliver tool activities at least once. A worker can lose its
+lease or die after the external service accepted an effect and before the
+activity recorded a result; the backend then redelivers the same attempt.
+Retry policy decides how often a *returned* failure is retried. Replay safety
+decides whether a redelivered attempt may run the tool again:
+
+| `ReplaySafety` | Redelivered attempt | Requirement |
+|---|---|---|
+| `ApplicationManaged` (default) | Runs the tool again | The application owns idempotency. This is the policy of every registration made before replay safety existed. |
+| `ReadOnly` | Runs the tool again | No external write. A durably recorded result is never replaced by a new read. |
+| `Idempotent` | Runs the tool again with the same `LogicalCallKey` | The tool keys its effect on `ToolInvocation::logical_key`, so attempts have one effect. |
+| `InterruptOnUncertain` | Does not run the tool | An `InvocationGuardStore` shared by every worker that can receive the activity. |
+
+Declare a policy per tool. An explicit `retryable = false` on a returned
+`ToolExecutionError` is always honored and records the error without a retry,
+whatever the replay safety:
+
+```rust,ignore
+let agent = DurableAgent::builder("payments", model)
+    .invocation_contract(InvocationContract::Logical)
+    .invocation_guard(Arc::new(InMemoryGuardStore::new()))
+    .tool_with(LookupBalance, ToolOptions::default().policy(ToolPolicy::read_only()))
+    .tool_with(
+        Transfer,
+        ToolOptions::default()
+            .retry(RetryPolicy::new(3))
+            .policy(ToolPolicy::interrupt_on_uncertain().implementation_version("2")),
+    )
+    .build()?;
+
+let agent = TemporalAgent::new(model)
+    .invocation_guard(guard)
+    .tool_with_policy(Transfer, ToolPolicy::interrupt_on_uncertain());
+```
+
+### Invocation contracts
+
+`InvocationContract` selects the activity payloads an agent version produces:
+
+- `Legacy` keeps the byte-identical payloads and activity names of
+  registrations made before tool policies existed. Every tool runs with
+  `ApplicationManaged` safety; the builder rejects any other policy.
+- `Logical` adds the `LogicalCallKey`, attempt metadata, and the tool policy to
+  each payload, and records results as `DurableToolResult` with a
+  `ToolDisposition`.
+
+The Duroxide builder defaults to `Legacy`. Switching an agent to `Logical`
+changes its activity name and payloads, so give it a new version and keep the
+old version registered while its histories are live. New `TemporalAgent`
+inputs default to `Logical`; inputs recorded before the field existed
+deserialize as `Legacy`.
+
+### Logical call identity
+
+Under `Logical`, `ToolInvocation::logical_key` identifies one tool call across
+retries, redelivery, and continue-as-new: the logical execution ID (the
+Duroxide instance ID or the Temporal workflow ID), the submission ID
+(`prompt-{index}`), the model turn, and the call index. The same tool called
+from two prompts gets two keys; a retry keeps its key. `ToolInvocation::attempt`
+carries the physical execution ID and activity attempt for diagnosis only.
+Provider tool-call IDs can repeat across prompts and are not an idempotency key.
+
+### Invocation guard
+
+`InterruptOnUncertain` tools claim their logical key in the guard store before
+any I/O, and settle the claim with the result before returning it. A
+redelivered attempt that finds a `Claimed` record returns an `Interrupted`
+result with `InterruptionReason::ClaimHeld` instead of running the tool. A
+record whose arguments, policy, or implementation version differ returns
+`ClaimMismatch`. Settlement is conditional on the claim token, so a worker
+that resumes after its lease expired cannot overwrite a newer result.
+
+The guard gives up automatic progress after a crash between claim and I/O:
+the call stays interrupted until an operator or a tool-specific status lookup
+resolves it. Registration fails with `GuardStoreRequired` when a tool needs a
+guard and none was supplied. `InMemoryGuardStore` is process-local and only
+suitable for tests and single-worker deployments. Run
+`guard::conformance::run` against any other store before using it.
+
+### Result dispositions
+
+The model always receives canonical `ToolResultContent`. An interrupted call is
+reported to the model as text that states the effect may have happened and was
+not repeated, so the model does not treat it as a definite failure. The
+activity output retains the exact `ToolDisposition` (`Success`, `Error`,
+`Refused`, `Skipped`, `Interrupted`) and only the `ToolResultContext` keys the
+tool's `MetadataRetention` approved, within its size limit. Inbound
+`ToolContext` values are never persisted.
+
+### Configuration snapshots
+
+Under `Logical`, a new Duroxide run stores a `ConfigSnapshot` in its input:
+ordered tool definitions, routes, retry settings, approval flags, tool
+policies, completion settings, and checkpoint policy. Continuations carry it
+forward. On replay, the worker resolves the snapshot against its registration
+and fails the run closed when a snapshot tool is missing, routed differently,
+or registered with another implementation version. The tool executor refuses a
+payload recorded for another implementation version for the same reason. A
+worker whose live settings drifted in other ways replays the retained
+configuration.
+
+Approval requests bind to the logical call, the final argument digest, and the
+tool implementation version. A decision recorded in history is reused after a
+restart without a new request, and a decision recorded for other arguments does
+not release a rewritten call.

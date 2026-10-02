@@ -9,14 +9,16 @@ use rig::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    activity_types::{ToolActivityInput, ToolActivityOutput, ToolInvocation},
+    activity_types::{InvocationContract, ToolActivityInput, ToolActivityOutput, ToolInvocation},
     approval::ApprovalDecision,
-    config::{CheckpointPolicy, CompletionMode, DurableAgentConfig},
+    config::{CheckpointPolicy, CompletionMode, ConfigSnapshot, DurableAgentConfig},
     driver::{self, CompletionOptions},
+    identity::{AttemptMetadata, LogicalCallKey},
     names::RuntimeNames,
+    policy::ReplaySafety,
     streaming::StreamTranscript,
-    tools::ToolRoute,
-    types::AgentInput,
+    tools::{ToolEntry, ToolRoute},
+    types::{AgentInput, ResumedRun},
 };
 
 type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<UserContent, String>> + Send + 'a>>;
@@ -44,8 +46,23 @@ pub(crate) async fn run_with_names(
     names: RuntimeNames,
 ) -> Result<PromptResponse, String> {
     let is_resume = input.is_resume();
-    let (mut agent, generation, mut model_turn, mut prompt_index) =
-        input.into_run(config.max_turns)?;
+    let config = match &input.snapshot {
+        Some(snapshot) => config
+            .resolve(snapshot)
+            .map_err(|error| error.to_string())?,
+        None => config,
+    };
+    let snapshot = match (input.snapshot.clone(), config.contract) {
+        (Some(snapshot), _) => Some(snapshot),
+        (None, InvocationContract::Logical) => Some(config.snapshot()),
+        (None, InvocationContract::Legacy) => None,
+    };
+    let ResumedRun {
+        mut agent,
+        generation,
+        last_model_turn: mut model_turn,
+        mut prompt_index,
+    } = input.into_run(config.max_turns)?;
     if !is_resume && let Some(tool_choice) = config.completion.tool_choice.clone() {
         agent = agent.with_tool_choice(tool_choice);
     }
@@ -110,6 +127,7 @@ pub(crate) async fn run_with_names(
                         model_turn,
                         prompt_index,
                         &config,
+                        snapshot.as_ref(),
                         last_steering_id.as_deref(),
                     )
                     .await;
@@ -165,6 +183,7 @@ pub(crate) async fn run_with_names(
                         model_turn,
                         prompt_index,
                         &config,
+                        snapshot.as_ref(),
                         last_steering_id.as_deref(),
                     )
                     .await;
@@ -197,6 +216,7 @@ pub(crate) async fn run_with_names(
                             model_turn,
                             prompt_index,
                             &config,
+                            snapshot.as_ref(),
                             last_steering_id.as_deref(),
                         )
                         .await;
@@ -309,6 +329,7 @@ async fn take_steering(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn checkpoint(
     ctx: &OrchestrationContext,
     agent: AgentRun,
@@ -316,6 +337,7 @@ async fn checkpoint(
     model_turn: usize,
     prompt_index: u64,
     config: &DurableAgentConfig,
+    snapshot: Option<&ConfigSnapshot>,
     last_steering_id: Option<&str>,
 ) -> Result<PromptResponse, String> {
     let generation = generation
@@ -326,7 +348,14 @@ async fn checkpoint(
         serde_json::json!({"phase":"checkpoint","generation":generation}),
         last_steering_id,
     );
-    let input = AgentInput::resume(agent, generation, 0, model_turn, prompt_index);
+    let input = AgentInput::resume(
+        agent,
+        generation,
+        0,
+        model_turn,
+        prompt_index,
+        snapshot.cloned(),
+    );
     let payload = serde_json::to_string(&input).map_err(|error| error.to_string())?;
     let raw = match &config.checkpoint.target_version {
         Some(version) => ctx.continue_as_new_versioned(version, payload).await?,
@@ -361,7 +390,16 @@ async fn resolve_approval(
         ));
     }
 
-    let request = driver::approval_request(call, prompt_index, turn, call_index)?;
+    let request = match config.contract {
+        InvocationContract::Legacy => {
+            driver::approval_request(call, prompt_index, turn, call_index)?
+        }
+        InvocationContract::Logical => driver::logical_approval_request(
+            call,
+            &logical_key(ctx, prompt_index, turn, call_index),
+            entry.policy.version(),
+        )?,
+    };
     let mut status = serde_json::json!({"phase":"approval","request":request});
     if let Some(last_steering_id) = ctx
         .get_custom_status()
@@ -429,22 +467,43 @@ async fn execute_tool_call(
         .get(&call.function.name)
         .ok_or_else(|| format!("tool `{}` is not in catalog", call.function.name))?;
     let arguments = serde_json::to_string(&call.function.arguments).map_err(|e| e.to_string())?;
+    check_route_policy(entry, &call.function.name)?;
     let content = match &entry.route {
         ToolRoute::RigTool => {
-            let payload = serde_json::to_string(&ToolActivityInput {
-                name: call.function.name.to_string(),
-                arguments,
-                invocation: ToolInvocation {
-                    execution_id: format!("{}:{}", ctx.instance_id(), ctx.execution_id()),
-                    prompt_index,
-                    turn,
-                    call_index,
-                },
-            })
-            .map_err(|e| e.to_string())?;
+            let name = call.function.name.to_string();
+            let execution_id = format!("{}:{}", ctx.instance_id(), ctx.execution_id());
+            let payload = |attempt: u32| {
+                let invocation = match config.contract {
+                    InvocationContract::Legacy => {
+                        ToolInvocation::legacy(execution_id.clone(), prompt_index, turn, call_index)
+                    }
+                    InvocationContract::Logical => ToolInvocation {
+                        execution_id: execution_id.clone(),
+                        prompt_index,
+                        turn,
+                        call_index,
+                        logical_key: Some(logical_key(ctx, prompt_index, turn, call_index)),
+                        attempt: Some(AttemptMetadata {
+                            backend_execution_id: execution_id.clone(),
+                            activity_attempt: Some(attempt),
+                        }),
+                    },
+                };
+                let policy = match config.contract {
+                    InvocationContract::Legacy => None,
+                    InvocationContract::Logical => Some(entry.policy.clone()),
+                };
+                serde_json::to_string(&ToolActivityInput {
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                    invocation,
+                    policy,
+                })
+                .map_err(|e| e.to_string())
+            };
             let raw = schedule_with_retry(
                 ctx,
-                &names.tool_activity,
+                names.tool_activity(config.contract),
                 payload,
                 entry.retry.clone(),
                 entry.tag.as_deref(),
@@ -458,7 +517,7 @@ async fn execute_tool_call(
             let raw = schedule_with_retry(
                 ctx,
                 activity_name,
-                arguments,
+                |_attempt| Ok(arguments.clone()),
                 entry.retry.clone(),
                 entry.tag.as_deref(),
             )
@@ -535,15 +594,49 @@ async fn execute_tool_call(
     Ok(driver::tool_result(&call, content))
 }
 
+fn logical_key(
+    ctx: &OrchestrationContext,
+    prompt_index: u64,
+    turn: usize,
+    call_index: usize,
+) -> LogicalCallKey {
+    LogicalCallKey {
+        logical_execution_id: ctx.instance_id(),
+        submission_id: LogicalCallKey::submission_for_prompt(prompt_index),
+        model_turn: turn,
+        call_index,
+    }
+}
+
+/// Routes other than Rig tools receive raw arguments, so they cannot use a
+/// logical key or an invocation guard.
+pub(crate) fn check_route_policy(entry: &ToolEntry, name: &str) -> Result<(), String> {
+    if matches!(entry.route, ToolRoute::RigTool) {
+        return Ok(());
+    }
+    match entry.policy.safety() {
+        ReplaySafety::ApplicationManaged | ReplaySafety::ReadOnly => Ok(()),
+        ReplaySafety::Idempotent => Err(format!(
+            "tool `{name}` declares idempotent replay safety, but its route cannot deliver a \
+             logical call key"
+        )),
+        ReplaySafety::InterruptOnUncertain => Err(format!(
+            "tool `{name}` declares interrupt-on-uncertain replay safety, but its route cannot \
+             use an invocation guard"
+        )),
+    }
+}
+
 async fn schedule_with_retry(
     ctx: &OrchestrationContext,
     name: &str,
-    input: String,
+    payload: impl Fn(u32) -> Result<String, String>,
     policy: RetryPolicy,
     tag: Option<&str>,
 ) -> Result<String, String> {
     let mut last_error = String::new();
     for attempt in 1..=policy.max_attempts {
+        let input = payload(attempt)?;
         let activity = ctx.schedule_activity(name, &input);
         let activity = match tag {
             Some(tag) => activity.with_tag(tag),

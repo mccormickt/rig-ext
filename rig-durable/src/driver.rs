@@ -5,7 +5,10 @@ use rig::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::approval::ApprovalRequest;
+use crate::{
+    approval::ApprovalRequest,
+    identity::{LogicalCallKey, arguments_digest},
+};
 
 pub(crate) struct CompletionOptions {
     pub preamble: Option<String>,
@@ -66,6 +69,26 @@ pub(crate) fn approval_request(
             "prompt-{prompt_index}-turn-{turn}-call-{call_index}-{}-{digest:x}",
             call.id
         ),
+        tool_name: call.function.name.to_string(),
+        arguments,
+        tool_call_id: call.id.to_string(),
+        call_id: call.id.provider().map(|id| id.call_id.clone()),
+    })
+}
+
+/// Approval bound to the logical call, the final argument digest, and the
+/// tool implementation version. Rewritten arguments or a new implementation
+/// version produce a new request, so an old decision cannot authorize them.
+pub(crate) fn logical_approval_request(
+    call: &ToolCall,
+    key: &LogicalCallKey,
+    implementation_version: &str,
+) -> Result<ApprovalRequest, String> {
+    let arguments = call.function.arguments.clone();
+    let digest = arguments_digest(&arguments).map_err(|error| error.to_string())?;
+    let binding = format!("{}\n{digest}\n{implementation_version}", key.canonical());
+    Ok(ApprovalRequest {
+        approval_id: format!("approval-v2-{:x}", Sha256::digest(binding.as_bytes())),
         tool_name: call.function.name.to_string(),
         arguments,
         tool_call_id: call.id.to_string(),

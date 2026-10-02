@@ -23,15 +23,20 @@ use temporalio_sdk::{
 };
 
 use crate::{
-    activities,
-    activity_types::{ToolActivityInput, ToolActivityOutput, ToolInvocation},
+    activities::{self, tool::ToolExecutor},
+    activity_types::{InvocationContract, ToolActivityInput, ToolActivityOutput, ToolInvocation},
     approval::{ApprovalDecision, ApprovalRequest},
     driver::{self, CompletionOptions},
+    guard::InvocationGuardStore,
+    identity::{AttemptMetadata, LogicalCallKey},
+    policy::ToolPolicy,
 };
 
 const DEFAULT_ACTIVITY_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_SESSION_HISTORY_MAX_BYTES: usize = 1_000_000;
 
+/// Request configuration. It travels in the workflow input, so a running
+/// workflow keeps the configuration it started with across continue-as-new.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TemporalAgentConfig {
     pub preamble: Option<String>,
@@ -44,6 +49,11 @@ pub struct TemporalAgentConfig {
     pub activity_timeout_secs: u64,
     pub activity_max_attempts: u32,
     pub session_history_max_bytes: usize,
+    /// Tool activity contract. Inputs recorded before this field existed
+    /// deserialize as [`InvocationContract::Legacy`]; new inputs built by
+    /// [`TemporalAgent`] use [`InvocationContract::Logical`].
+    #[serde(default)]
+    pub contract: InvocationContract,
 }
 
 impl Default for TemporalAgentConfig {
@@ -59,6 +69,7 @@ impl Default for TemporalAgentConfig {
             activity_timeout_secs: DEFAULT_ACTIVITY_TIMEOUT_SECS,
             activity_max_attempts: 3,
             session_history_max_bytes: DEFAULT_SESSION_HISTORY_MAX_BYTES,
+            contract: InvocationContract::Logical,
         }
     }
 }
@@ -67,6 +78,25 @@ impl Default for TemporalAgentConfig {
 pub struct TemporalTool {
     pub definition: ToolDefinition,
     pub requires_approval: bool,
+    /// Replay policy the tool activity enforces under the logical contract.
+    #[serde(default)]
+    pub policy: ToolPolicy,
+}
+
+/// Errors from [`TemporalAgent::register`].
+#[derive(Debug, thiserror::Error)]
+pub enum TemporalAgentError {
+    #[error(transparent)]
+    Registration(#[from] WorkflowRegistrationError),
+    #[error(
+        "tool `{0}` declares a replay policy, but the agent uses the legacy invocation contract"
+    )]
+    InvocationContractRequired(String),
+    #[error(
+        "tool `{0}` never repeats an uncertain effect and requires an invocation guard store; \
+         supply one with `invocation_guard`"
+    )]
+    GuardStoreRequired(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -429,7 +459,7 @@ fn history_payload_too_large(config: &TemporalAgentConfig, history: &[Message]) 
 
 struct TemporalActivities {
     model: DynModel<Completion>,
-    tools: Arc<ToolSet>,
+    tools: ToolExecutor,
 }
 
 #[activities]
@@ -445,15 +475,31 @@ impl TemporalActivities {
             .map_err(activity_error)
     }
 
+    /// Legacy contract: payloads are byte-identical to registrations made
+    /// before tool policies existed.
     #[activity(name = "RigTemporalToolExecutionV1")]
     async fn execute_tool(
         self: Arc<Self>,
         _ctx: ActivityContext,
         input: ToolActivityInput,
     ) -> Result<ToolActivityOutput, ActivityError> {
-        activities::tool::execute(&self.tools, input)
-            .await
-            .map_err(activity_error)
+        self.tools.execute(input).await.map_err(activity_error)
+    }
+
+    /// Logical contract: the input carries the logical call key and policy;
+    /// the activity adds the physical attempt Temporal reports.
+    #[activity(name = "RigTemporalToolExecutionV2")]
+    async fn execute_logical_tool(
+        self: Arc<Self>,
+        ctx: ActivityContext,
+        mut input: ToolActivityInput,
+    ) -> Result<ToolActivityOutput, ActivityError> {
+        let attempt = input
+            .invocation
+            .attempt
+            .get_or_insert_with(Default::default);
+        attempt.activity_attempt = Some(ctx.info().attempt);
+        self.tools.execute(input).await.map_err(activity_error)
     }
 }
 
@@ -465,6 +511,7 @@ fn activity_error(message: String) -> ActivityError {
 pub struct TemporalAgent {
     model: DynModel<Completion>,
     tools: Arc<ToolSet>,
+    guard: Option<Arc<dyn InvocationGuardStore>>,
     config: TemporalAgentConfig,
 }
 
@@ -473,8 +520,23 @@ impl TemporalAgent {
         Self {
             model: model.into(),
             tools: Arc::new(ToolSet::default()),
+            guard: None,
             config: TemporalAgentConfig::default(),
         }
+    }
+
+    /// Select the tool activity contract for inputs this agent builds.
+    pub fn invocation_contract(mut self, contract: InvocationContract) -> Self {
+        self.config.contract = contract;
+        self
+    }
+
+    /// Store that tools with [`crate::ReplaySafety::InterruptOnUncertain`]
+    /// claim before they run. Share one store across the workers that may
+    /// pick up the same activity.
+    pub fn invocation_guard(mut self, guard: Arc<dyn InvocationGuardStore>) -> Self {
+        self.guard = Some(guard);
+        self
     }
 
     pub fn preamble(mut self, preamble: impl Into<String>) -> Self {
@@ -521,17 +583,33 @@ impl TemporalAgent {
     where
         T: Tool + 'static,
     {
-        self.tool_with_approval(tool, false)
+        self.tool_with_options(tool, false, ToolPolicy::default())
     }
 
     pub fn approval_tool<T>(self, tool: T) -> Self
     where
         T: Tool + 'static,
     {
-        self.tool_with_approval(tool, true)
+        self.tool_with_options(tool, true, ToolPolicy::default())
     }
 
-    fn tool_with_approval<T>(mut self, tool: T, requires_approval: bool) -> Self
+    /// Register a tool with a replay policy. Requires the logical contract.
+    pub fn tool_with_policy<T>(self, tool: T, policy: ToolPolicy) -> Self
+    where
+        T: Tool + 'static,
+    {
+        self.tool_with_options(tool, false, policy)
+    }
+
+    /// Register an approval-gated tool with a replay policy.
+    pub fn approval_tool_with_policy<T>(self, tool: T, policy: ToolPolicy) -> Self
+    where
+        T: Tool + 'static,
+    {
+        self.tool_with_options(tool, true, policy)
+    }
+
+    fn tool_with_options<T>(mut self, tool: T, requires_approval: bool, policy: ToolPolicy) -> Self
     where
         T: Tool + 'static,
     {
@@ -544,21 +622,20 @@ impl TemporalAgent {
             .into_iter()
             .find(|definition| definition.name == name)
             .expect("newly added tool has a definition");
+        let tool = TemporalTool {
+            definition,
+            requires_approval,
+            policy,
+        };
         if let Some(existing) = self
             .config
             .tools
             .iter_mut()
             .find(|existing| existing.definition.name == name)
         {
-            *existing = TemporalTool {
-                definition,
-                requires_approval,
-            };
+            *existing = tool;
         } else {
-            self.config.tools.push(TemporalTool {
-                definition,
-                requires_approval,
-            });
+            self.config.tools.push(tool);
         }
         self
     }
@@ -595,12 +672,31 @@ impl TemporalAgent {
     /// Register the workflow and this agent's model and tools on a worker.
     ///
     /// Registration consumes the agent because the worker retains its model and tool set.
-    pub fn register(self, options: &mut WorkerOptions) -> Result<(), WorkflowRegistrationError> {
+    /// It fails closed when a tool policy needs a contract or guard store the agent lacks.
+    pub fn register(self, options: &mut WorkerOptions) -> Result<(), TemporalAgentError> {
+        for tool in &self.config.tools {
+            let name = &tool.definition.name;
+            if self.config.contract == InvocationContract::Legacy
+                && tool.policy != ToolPolicy::default()
+            {
+                return Err(TemporalAgentError::InvocationContractRequired(name.clone()));
+            }
+            if tool.policy.safety().requires_guard() && self.guard.is_none() {
+                return Err(TemporalAgentError::GuardStoreRequired(name.clone()));
+            }
+        }
         options.register_workflow::<TemporalAgentWorkflow>()?;
         options.register_workflow::<TemporalAgentSessionWorkflow>()?;
+        let policies = self
+            .config
+            .tools
+            .iter()
+            .map(|tool| (tool.definition.name.clone(), tool.policy.clone()));
         options.register_activities(TemporalActivities {
             model: self.model,
-            tools: self.tools,
+            tools: ToolExecutor::new(self.tools)
+                .with_guard(self.guard)
+                .with_registered_policies(policies),
         });
         Ok(())
     }
@@ -679,8 +775,17 @@ where
                                 ))
                             })?;
                         if tool.requires_approval {
-                            pending = await_approval(ctx, pending, prompt_index, model_turn, index)
-                                .await?;
+                            let version = tool.policy.version().to_string();
+                            pending = await_approval(
+                                ctx,
+                                pending,
+                                config.contract,
+                                &version,
+                                prompt_index,
+                                model_turn,
+                                index,
+                            )
+                            .await?;
                         }
                     }
                     resolved.push(pending);
@@ -747,9 +852,28 @@ where
     })
 }
 
+/// Identity of one logical tool call. The workflow ID survives
+/// continue-as-new, so the key stays fixed across runs of one execution.
+fn logical_key<W>(
+    ctx: &WorkflowContext<W>,
+    prompt_index: u64,
+    turn: usize,
+    call_index: usize,
+) -> LogicalCallKey {
+    LogicalCallKey {
+        logical_execution_id: ctx.workflow_id().to_string(),
+        submission_id: LogicalCallKey::submission_for_prompt(prompt_index),
+        model_turn: turn,
+        call_index,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn await_approval<W>(
     ctx: &mut WorkflowContext<W>,
     mut pending: rig::agent::PendingToolCall,
+    contract: InvocationContract,
+    implementation_version: &str,
     prompt_index: u64,
     turn: usize,
     call_index: usize,
@@ -758,8 +882,17 @@ where
     W: TemporalWorkflowState,
 {
     let call = &pending.tool_call;
-    let request =
-        driver::approval_request(call, prompt_index, turn, call_index).map_err(workflow_error)?;
+    let request = match contract {
+        InvocationContract::Legacy => {
+            driver::approval_request(call, prompt_index, turn, call_index)
+        }
+        InvocationContract::Logical => driver::logical_approval_request(
+            call,
+            &logical_key(ctx, prompt_index, turn, call_index),
+            implementation_version,
+        ),
+    }
+    .map_err(workflow_error)?;
     ctx.state_mut(|workflow| {
         let runtime = workflow.runtime_mut();
         runtime
@@ -806,23 +939,58 @@ async fn execute_tool<W>(
         return Ok(result);
     }
     let call = pending.tool_call;
-    let output = ctx
-        .execute_activity(
-            TemporalActivities::execute_tool,
-            ToolActivityInput {
-                name: call.function.name.to_string(),
-                arguments: serde_json::to_string(&call.function.arguments)
-                    .map_err(workflow_error)?,
-                invocation: ToolInvocation {
-                    execution_id: format!("{}:{}", ctx.workflow_id(), ctx.run_id()),
-                    prompt_index,
-                    turn,
-                    call_index,
+    let name = call.function.name.to_string();
+    let arguments = serde_json::to_string(&call.function.arguments).map_err(workflow_error)?;
+    let execution_id = format!("{}:{}", ctx.workflow_id(), ctx.run_id());
+    let output = match config.contract {
+        InvocationContract::Legacy => {
+            ctx.execute_activity(
+                TemporalActivities::execute_tool,
+                ToolActivityInput {
+                    name,
+                    arguments,
+                    invocation: ToolInvocation::legacy(
+                        execution_id,
+                        prompt_index,
+                        turn,
+                        call_index,
+                    ),
+                    policy: None,
                 },
-            },
-            activity_options(config),
-        )
-        .await?;
+                activity_options(config),
+            )
+            .await?
+        }
+        InvocationContract::Logical => {
+            let policy = config
+                .tools
+                .iter()
+                .find(|tool| tool.definition.name == name)
+                .map(|tool| tool.policy.clone())
+                .ok_or_else(|| workflow_error(format!("tool `{name}` is not registered")))?;
+            ctx.execute_activity(
+                TemporalActivities::execute_logical_tool,
+                ToolActivityInput {
+                    name,
+                    arguments,
+                    invocation: ToolInvocation {
+                        execution_id: execution_id.clone(),
+                        prompt_index,
+                        turn,
+                        call_index,
+                        logical_key: Some(logical_key(ctx, prompt_index, turn, call_index)),
+                        attempt: Some(AttemptMetadata {
+                            backend_execution_id: execution_id,
+                            activity_attempt: None,
+                        }),
+                    },
+                    policy: Some(policy),
+                },
+                activity_options(config),
+            )
+            .await?
+        }
+    };
     Ok(driver::tool_result(&call, output.content))
 }
 
