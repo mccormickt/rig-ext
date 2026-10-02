@@ -33,6 +33,23 @@ pub enum CheckpointPolicy {
     Every(NonZeroU32),
 }
 
+/// Bound each Duroxide event-history window with continue-as-new.
+///
+/// Each completed model activity or tool batch counts as one operation.
+/// The checkpoint retains agent state, usage, and pending decisions; it does
+/// not shrink the conversation payload. Pass this value to
+/// [`crate::DurableAgentBuilder::checkpoint`].
+///
+/// ```
+/// use std::num::NonZeroU32;
+/// use rig_durable::{CheckpointConfig, CheckpointPolicy};
+///
+/// let checkpoint = CheckpointConfig {
+///     policy: CheckpointPolicy::Every(NonZeroU32::new(20).unwrap()),
+///     target_version: None,
+/// };
+/// assert!(matches!(checkpoint.policy, CheckpointPolicy::Every(_)));
+/// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointConfig {
     pub policy: CheckpointPolicy,

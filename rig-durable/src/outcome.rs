@@ -155,6 +155,8 @@ impl DurableResponse {
 
     /// Drop outcomes from the end until the serialized response fits
     /// `max_bytes`, and record that it happened.
+    /// Returns `None` if the response still exceeds the limit with no outcomes.
+    /// The Rig response text, history, and usage are never shortened.
     pub fn fit_within(mut self, max_bytes: usize) -> Option<Self> {
         while serialized_len(&self) > max_bytes && !self.tool_outcomes.is_empty() {
             self.tool_outcomes.pop();

@@ -111,6 +111,10 @@ pub enum AgentOrchestratorError {
     Sqlite(String),
 }
 
+/// Duroxide retry, routing, approval, and replay settings for one Rig tool.
+///
+/// Pass these settings to [`DurableAgentBuilder::tool_with`]. Approval pauses
+/// before execution; it does not make a tool safe to retry.
 #[derive(Clone, Debug, Default)]
 pub struct ToolOptions {
     pub retry: RetryPolicy,
@@ -161,6 +165,11 @@ struct AgentMetadata {
     snapshot: Option<ConfigSnapshot>,
 }
 
+/// Built agent registration, including its model, tools, and child agents.
+///
+/// Create it with [`DurableAgent::builder`] and pass it to
+/// [`AgentOrchestratorBuilder::register`]. It contains worker-side objects and
+/// is not a serializable workflow input.
 pub struct AgentDefinition {
     metadata: AgentMetadata,
     activities: ActivityRegistry,
@@ -179,6 +188,30 @@ impl AgentDefinition {
     }
 }
 
+/// Configure a durable agent from a Rig completion model and tools.
+///
+/// Call [`build`](Self::build) to validate tool policies and create an
+/// [`AgentDefinition`]. Non-default tool policies require the logical contract.
+/// The supplied `lookup` in this example must perform no external write.
+///
+/// ```no_run
+/// use rig::{DynModel, operation::Completion, tool::Tool};
+/// use rig_durable::{
+///     AgentDefinition, AgentOrchestratorError, DurableAgent, InvocationContract,
+///     ToolOptions, ToolPolicy,
+/// };
+///
+/// fn define(
+///     model: DynModel<Completion>,
+///     lookup: impl Tool + 'static,
+/// ) -> Result<AgentDefinition, AgentOrchestratorError> {
+///     DurableAgent::builder("support", model)
+///         .invocation_contract(InvocationContract::Logical)
+///         .preamble("Use the lookup tool to check facts.")
+///         .tool_with(lookup, ToolOptions::default().policy(ToolPolicy::read_only()))
+///         .build()
+/// }
+/// ```
 pub struct DurableAgentBuilder {
     name: String,
     version: Version,
@@ -225,6 +258,8 @@ impl DurableAgentBuilder {
         self
     }
 
+    /// Set the semantic version of the agent's orchestration, not the crate.
+    /// Use a new version when configuration changes affect recorded history.
     pub fn version(mut self, version: impl Into<String>) -> Result<Self, AgentOrchestratorError> {
         let version = version.into();
         self.version =
@@ -265,6 +300,8 @@ impl DurableAgentBuilder {
         self
     }
 
+    /// Start a new history window at the configured operation boundary.
+    /// See [`CheckpointConfig`] for an example and payload limits.
     pub fn checkpoint(mut self, checkpoint: CheckpointConfig) -> Self {
         self.config.checkpoint = checkpoint;
         self
@@ -285,6 +322,8 @@ impl DurableAgentBuilder {
         self
     }
 
+    /// Register a Rig tool with default retries and application-managed safety.
+    /// Use [`Self::tool_with`] to require approval or declare a replay policy.
     pub fn tool<T>(self, tool: T) -> Self
     where
         T: Tool + 'static,
@@ -292,6 +331,7 @@ impl DurableAgentBuilder {
         self.tool_with(tool, ToolOptions::default())
     }
 
+    /// Register a Rig tool with explicit durable execution settings.
     pub fn tool_with<T>(mut self, tool: T, options: ToolOptions) -> Self
     where
         T: Tool + 'static,
@@ -317,6 +357,25 @@ impl DurableAgentBuilder {
         Ok(self)
     }
 
+    /// Expose a child agent as a tool with a single string `prompt` argument.
+    ///
+    /// The parent registers the child automatically. Approval-enabled children
+    /// are rejected because the parent cannot route decisions to their run IDs.
+    /// Keep each child version's configuration fixed while its histories live.
+    ///
+    /// ```no_run
+    /// # use rig::{DynModel, operation::Completion};
+    /// # use rig_durable::{DurableAgent, AgentDefinition, AgentOrchestratorError};
+    /// # fn define(model: DynModel<Completion>) -> Result<AgentDefinition, AgentOrchestratorError> {
+    /// let researcher = DurableAgent::builder("researcher", model.clone())
+    ///     .description("Analyze a question and report the supporting facts.")
+    ///     .build()?;
+    /// let assistant = DurableAgent::builder("assistant", model)
+    ///     .sub_agent("research", researcher)?
+    ///     .build()?;
+    /// # Ok(assistant)
+    /// # }
+    /// ```
     pub fn sub_agent(
         mut self,
         tool_name: impl Into<String>,
@@ -349,6 +408,9 @@ impl DurableAgentBuilder {
         Ok(self)
     }
 
+    /// Validate policies and prepare registries without starting a runtime.
+    /// Returns an error for duplicate tools, unsupported routes, or missing
+    /// logical-contract or invocation-guard requirements.
     pub fn build(mut self) -> Result<AgentDefinition, AgentOrchestratorError> {
         for definition in self.tools.tool_definitions() {
             if self.routed_tools.get(&definition.name).is_some() {
@@ -417,6 +479,7 @@ impl DurableAgentBuilder {
     }
 }
 
+/// Collect agent registrations and runtime options before starting Duroxide.
 pub struct AgentOrchestratorBuilder {
     provider: Arc<dyn Provider>,
     activities: ActivityRegistry,
@@ -530,6 +593,11 @@ impl AgentOrchestratorBuilder {
     }
 }
 
+/// Own the Duroxide runtime, storage provider, and registered agent versions.
+///
+/// Use `AgentOrchestrator::sqlite` with the `sqlite` feature, or [`Self::builder`] with
+/// another Duroxide provider. Call [`Self::shutdown`] when the worker should
+/// stop. See the [crate example](crate) for a complete SQLite setup.
 pub struct AgentOrchestrator {
     provider: Arc<dyn Provider>,
     client: Client,
@@ -558,6 +626,8 @@ impl AgentOrchestrator {
         Ok(Self::builder(Arc::new(provider)))
     }
 
+    /// Select the highest registered semantic version of a named agent.
+    /// Use [`Self::agent_version`] to reconnect to a run of a specific version.
     pub fn agent(&self, name: &str) -> Result<DurableAgent, AgentOrchestratorError> {
         let metadata = self
             .agents
@@ -613,6 +683,11 @@ impl AgentOrchestrator {
     }
 }
 
+/// Client handle for one registered agent version.
+///
+/// [`Self::prompt`] returns answer text. [`Self::start`] returns a [`DurableRun`]
+/// for control and detailed results. [`Self::open_session`] retains a
+/// conversation across prompts. Cloning a handle does not start another run.
 #[derive(Clone)]
 pub struct DurableAgent {
     client: Client,
@@ -620,6 +695,7 @@ pub struct DurableAgent {
 }
 
 impl DurableAgent {
+    /// Define an agent from a Rig model before registering it with a runtime.
     pub fn builder(
         name: impl Into<String>,
         model: impl Into<DynModel<Completion>>,
@@ -635,6 +711,8 @@ impl DurableAgent {
         &self.metadata.version
     }
 
+    /// Start an independent run and wait for its answer text.
+    /// Each call gets a fresh run ID and no prior conversation history.
     pub async fn prompt(
         &self,
         prompt: impl Into<Message>,
@@ -650,6 +728,8 @@ impl DurableAgent {
             .await
     }
 
+    /// Start or reconnect using an ID scoped to this agent name and version.
+    /// Reusing an ID keeps the first submitted input; use a new ID for new work.
     pub async fn start_with_id(
         &self,
         run_id: impl Into<String>,
@@ -680,6 +760,7 @@ impl DurableAgent {
         Ok(self.run(run_id))
     }
 
+    /// Get a handle to an existing run without starting or validating it.
     pub fn run(&self, run_id: impl Into<String>) -> DurableRun {
         let run_id = run_id.into();
         DurableRun {
@@ -754,6 +835,29 @@ fn instance_id(metadata: &AgentMetadata, prefix: &str, id: &str) -> String {
     format!("{prefix}-{:x}", digest.finalize())
 }
 
+/// Control a single durable run and read its results.
+///
+/// The ordinary result is Rig's [`PromptResponse`]. A detailed result also
+/// records each tool's disposition, including denial and uncertain effects.
+/// Tool outcomes are bounded independently of the answer text; check
+/// [`DurableResponse::tool_outcomes_truncated`] before treating them as complete.
+///
+/// ```no_run
+/// use rig_durable::{DurableAgent, AgentOrchestratorError};
+///
+/// async fn run(agent: &DurableAgent) -> Result<(), AgentOrchestratorError> {
+///     let run = agent.start_with_id("report-42", "Prepare the report.").await?;
+///     let result = run.wait_detailed().await?;
+///     println!("{}", result.output());
+///     for outcome in &result.tool_outcomes {
+///         println!("{}: {:?}", outcome.tool_call_id, outcome.disposition);
+///     }
+///     // Reconnect with the same agent version after a client restart.
+///     let retained = agent.run("report-42").result_detailed().await?;
+///     assert_eq!(retained.output(), result.output());
+///     Ok(())
+/// }
+/// ```
 #[derive(Clone)]
 pub struct DurableRun {
     client: Client,
@@ -813,11 +917,28 @@ impl DurableRun {
             .ok_or_else(|| AgentOrchestratorError::OutcomesUnavailable(self.run_id.clone()))
     }
 
-    /// Retained response and tool dispositions of a completed run.
+    /// Read a completed run's response and retained tool dispositions.
+    /// Uses a zero wait timeout; use [`Self::wait_detailed`] for an active run.
     pub async fn result_detailed(&self) -> Result<DurableResponse, AgentOrchestratorError> {
         self.wait_detailed_timeout(Duration::ZERO).await
     }
 
+    /// Wait for a tool approval request. The decision must use its exact ID.
+    ///
+    /// Register the tool with [`ToolOptions::require_approval`]. Obtain a human
+    /// decision before calling `approve` or `deny`; do not approve automatically.
+    /// Handle further requests if the model calls more approval-gated tools.
+    ///
+    /// ```no_run
+    /// use rig_durable::{DurableRun, AgentOrchestratorError};
+    ///
+    /// async fn review(run: &DurableRun) -> Result<(), AgentOrchestratorError> {
+    ///     let request = run.next_approval().await?;
+    ///     println!("Requested tool: {}", request.tool_name);
+    ///     run.deny(&request, "Not authorized").await?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub async fn next_approval(&self) -> Result<ApprovalRequest, AgentOrchestratorError> {
         let deadline = tokio::time::Instant::now() + DEFAULT_WAIT_TIMEOUT;
         loop {
@@ -966,6 +1087,32 @@ fn orchestration_status_value_is(status: &OrchestrationStatus, key: &str, expect
 /// Submissions are deduplicated on `request_id` for the life of the session.
 /// A retried request receives its original receipt; the same `request_id`
 /// with a different message or mode is rejected.
+///
+/// [`Self::submit`] returns after admission, not completion. [`Self::wait`]
+/// returns the retained answer. Old or oversized results can return
+/// [`AgentOrchestratorError::ResultNotRetained`] while their receipts remain
+/// answered. The full audit transcript stays in the session result.
+///
+/// ```no_run
+/// use rig_durable::{DurableAgent, SubmitInput, AgentOrchestratorError};
+///
+/// async fn converse(agent: &DurableAgent) -> Result<(), AgentOrchestratorError> {
+///     let session = agent.open_session("support-42").await?;
+///     let input = SubmitInput::new("request-1", "Explain the installation steps.");
+///     let receipt = session.submit(input.clone()).await?;
+///     let retry = session.submit(input).await?;
+///     assert_eq!(receipt.submission_id, retry.submission_id);
+///     let answer = session.wait(&receipt.request_id).await?;
+///     println!("{}", answer.output());
+///     println!("{}", session.prompt("What should I check next?").await?.output());
+///     session.close().await?;
+///     Ok(())
+/// }
+/// ```
+///
+/// Closing drains accepted work. A failed prompt closes the session and cancels
+/// queued submissions instead. Active or admitted queued work counts as busy
+/// for [`crate::SubmissionMode::RejectIfBusy`].
 #[derive(Clone)]
 pub struct DurableSession {
     run: DurableRun,

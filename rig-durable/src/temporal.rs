@@ -2,6 +2,70 @@
 //!
 //! The workflow owns Rig's deterministic [`AgentRun`] state machine. Model and
 //! tool I/O runs in Temporal activities registered from [`TemporalAgent`].
+//! Enable the `temporal` Cargo feature. Use `default-features = false` if the
+//! application does not use Duroxide or SQLite.
+//!
+//! # Run a worker
+//!
+//! This example requires a Temporal server, its client configuration, and
+//! `OPENAI_API_KEY`. Register one agent definition per task queue. Create inputs
+//! before registration, which moves the model and tools into the worker.
+//!
+//! ```no_run
+//! use rig::providers::openai::{self, OpenAI};
+//! use rig_durable::temporal::TemporalAgent;
+//! use temporalio_client::{
+//!     Client, ClientOptions, Connection, envconfig::LoadClientConfigProfileOptions,
+//! };
+//! use temporalio_sdk::{Runtime, Worker, WorkerOptions};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let runtime = Runtime::from_current_tokio(Default::default())?;
+//!     let (connection_options, client_options) =
+//!         ClientOptions::load_from_config(LoadClientConfigProfileOptions::default())?;
+//!     let client = Client::new(Connection::connect(connection_options).await?, client_options)?;
+//!     let model = OpenAI::from_env()?.completion(openai::GPT_4O_MINI);
+//!     let agent = TemporalAgent::new(model).preamble("Answer briefly.");
+//!     let mut options = WorkerOptions::new("rig-assistant").build();
+//!     agent.register(&mut options)?;
+//!     let mut worker = Worker::new(&runtime, client, options)?;
+//!     worker.run().await?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Start a run from a client
+//!
+//! Build an input with [`TemporalAgent::input`] using the configuration for the
+//! registered worker. Use the same namespace and task queue as that worker.
+//! The result is Rig's [`PromptResponse`]; query `tool_outcomes` for the ordered
+//! tool dispositions. This client function requires a worker running separately.
+//!
+//! ```no_run
+//! use rig_durable::temporal::{TemporalAgentInput, TemporalAgentWorkflow};
+//! use temporalio_client::{Client, WorkflowGetResultOptions, WorkflowStartOptions};
+//!
+//! async fn prompt(client: &Client, input: TemporalAgentInput)
+//!     -> Result<(), Box<dyn std::error::Error>>
+//! {
+//!     let handle = client.start_workflow(
+//!         TemporalAgentWorkflow::run,
+//!         input,
+//!         WorkflowStartOptions::new("rig-assistant", "report-42").build(),
+//!     ).await?;
+//!     let response = handle.get_result(WorkflowGetResultOptions::default()).await?;
+//!     println!("{}", response.output);
+//!     Ok(())
+//! }
+//! ```
+//!
+//! Activities are delivered at least once. [`ToolPolicy`] declares whether a
+//! tool may repeat an uncertain effect; retry limits alone cannot prevent
+//! duplicate writes. New inputs use [`InvocationContract::Logical`]. Logical
+//! keys include the namespace and first execution run ID, so they survive
+//! continue-as-new without colliding with later starts that reuse a workflow ID.
+//! Keep worker implementations compatible with their recorded configuration.
 
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
@@ -114,6 +178,8 @@ pub enum TemporalAgentError {
     GuardStoreRequired(String),
 }
 
+/// Serializable prompt, Rig history, and recorded worker configuration.
+/// Create it with [`TemporalAgent::input`] or [`TemporalAgent::input_with_history`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TemporalAgentInput {
     pub prompt: Message,
@@ -170,6 +236,9 @@ trait TemporalWorkflowState {
     }
 }
 
+/// Single-run workflow. Start [`Self::run`] with a [`TemporalAgentInput`].
+/// Query [`Self::status`] for progress and send [`Self::approval`] with the
+/// exact request ID when a registered approval tool pauses execution.
 #[derive(Default)]
 #[workflow]
 pub struct TemporalAgentWorkflow {
@@ -222,6 +291,9 @@ impl TemporalAgentWorkflow {
     }
 }
 
+/// Session startup or continuation state.
+/// Use [`TemporalAgent::session_input`] for a new session rather than constructing
+/// continuation fields by hand.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TemporalAgentSessionInput {
     /// Audit transcript. Compaction never removes messages from it.
@@ -294,6 +366,45 @@ pub struct TemporalAgentSessionSnapshot {
     pub compaction_error: Option<String>,
 }
 
+/// Long-lived conversation with deduplicated submissions and full audit history.
+///
+/// Start the workflow with [`TemporalAgent::session_input`]. The `submit` update
+/// returns after the prompt answers, unlike Duroxide's admission-only `submit`.
+/// Retry the same request ID, message, and mode to get the original receipt.
+/// The response can be absent after result retention expires; the receipt stays.
+///
+/// ```no_run
+/// use rig_durable::{SubmitInput, temporal::{TemporalAgentSessionInput, TemporalAgentSessionWorkflow}};
+/// use temporalio_client::{
+///     Client, WorkflowExecuteUpdateOptions, WorkflowSignalOptions, WorkflowStartOptions,
+/// };
+///
+/// async fn converse(client: &Client, input: TemporalAgentSessionInput)
+///     -> Result<(), Box<dyn std::error::Error>>
+/// {
+///     let handle = client.start_workflow(
+///         TemporalAgentSessionWorkflow::run,
+///         input,
+///         WorkflowStartOptions::new("rig-assistant", "support-42").build(),
+///     ).await?;
+///     let answer = handle.execute_update(
+///         TemporalAgentSessionWorkflow::submit,
+///         SubmitInput::new("request-1", "Explain the installation steps."),
+///         WorkflowExecuteUpdateOptions::default(),
+///     ).await?;
+///     if let Some(response) = answer.response {
+///         println!("{}", response.output());
+///     }
+///     handle.signal(
+///         TemporalAgentSessionWorkflow::close, (), WorkflowSignalOptions::default(),
+///     ).await?;
+///     Ok(())
+/// }
+/// ```
+///
+/// Closing drains accepted work; failure cancels it. Compaction runs between
+/// prompts, including queued submissions and steering. The history byte limit
+/// applies to the full transcript, not just the compacted model context.
 #[workflow]
 pub struct TemporalAgentSessionWorkflow {
     runtime: TemporalRuntimeState,
@@ -1000,7 +1111,11 @@ fn activity_error(message: String) -> ActivityError {
     ApplicationFailure::new(message).into()
 }
 
-/// A worker-side Temporal agent definition.
+/// A worker-side Rig model, tool set, and serializable workflow configuration.
+///
+/// See the [module examples](self) for worker and client setup. Configure tool
+/// policies before calling [`Self::register`]; registration rejects guarded
+/// tools unless [`Self::invocation_guard`] supplies a shared store.
 pub struct TemporalAgent {
     model: DynModel<Completion>,
     tools: Arc<ToolSet>,
@@ -1010,6 +1125,7 @@ pub struct TemporalAgent {
 }
 
 impl TemporalAgent {
+    /// Use a Rig completion model with the logical invocation contract.
     pub fn new(model: impl Into<DynModel<Completion>>) -> Self {
         Self {
             model: model.into(),
@@ -1069,6 +1185,8 @@ impl TemporalAgent {
         self
     }
 
+    /// Limit the serialized full session transcript, including compacted messages.
+    /// An oversized input is rejected; an oversized completed turn fails the session.
     pub fn session_history_max_bytes(mut self, bytes: usize) -> Self {
         self.config.session_history_max_bytes = bytes.max(1);
         self
@@ -1090,6 +1208,9 @@ impl TemporalAgent {
         self.tool_with_options(tool, false, ToolPolicy::default())
     }
 
+    /// Pause for an approval decision before executing this Rig tool.
+    /// Read the request from the workflow status query and send its exact ID
+    /// through the approval signal. Approval does not change replay safety.
     pub fn approval_tool<T>(self, tool: T) -> Self
     where
         T: Tool + 'static,
@@ -1144,6 +1265,7 @@ impl TemporalAgent {
         self
     }
 
+    /// Capture the configuration for one independent prompt with no prior history.
     pub fn input(&self, prompt: impl Into<Message>) -> TemporalAgentInput {
         TemporalAgentInput {
             prompt: prompt.into(),
@@ -1152,6 +1274,7 @@ impl TemporalAgent {
         }
     }
 
+    /// Capture a prompt and canonical Rig history for an independent run.
     pub fn input_with_history(
         &self,
         prompt: impl Into<Message>,
@@ -1164,6 +1287,7 @@ impl TemporalAgent {
         }
     }
 
+    /// Capture the configuration and optional Rig history for a new session.
     pub fn session_input(&self, history: Vec<Message>) -> TemporalAgentSessionInput {
         TemporalAgentSessionInput {
             history,

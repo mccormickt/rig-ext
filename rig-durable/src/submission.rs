@@ -38,6 +38,21 @@ pub enum SubmissionMode {
 }
 
 /// A client request to run one message in a session.
+///
+/// Request IDs must contain 1–256 UTF-8 bytes. Reuse an ID only for the same
+/// message and mode; changing either produces [`SubmissionError::Conflict`].
+/// [`SubmissionMode::RejectIfBusy`] also rejects when admitted work is queued,
+/// even if no prompt has started. The default queues a follow-up instead.
+///
+/// ```
+/// use rig_durable::{SubmissionMode, SubmitInput};
+///
+/// let request = SubmitInput::new("request-42", "Check the order status.")
+///     .mode(SubmissionMode::RejectIfBusy);
+/// let retry = request.clone();
+/// assert_eq!(request.payload_digest()?, retry.payload_digest()?);
+/// # Ok::<(), serde_json::Error>(())
+/// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SubmitInput {
     /// Client-chosen identity. Retries reuse it; distinct intents must not.

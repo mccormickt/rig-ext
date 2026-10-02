@@ -1,8 +1,123 @@
-//! Durable, replay-safe execution of Rig's sans-I/O agent state machine.
+//! Run Rig agents as durable Duroxide orchestrations or Temporal workflows.
 //!
-//! Model and tool I/O occurs only in activities. Registry configuration is not
-//! persisted: deploy catalog and orchestration changes under a new orchestration
-//! version, and keep old versions registered while instances can replay.
+//! Pass a Rig completion model and Rig [`Tool`](rig::tool::Tool) implementations
+//! to a backend's agent builder. The backend records model responses and tool
+//! results. Replay uses those records instead of repeating completed I/O.
+//! Activities can still be retried: tools that write to external systems must
+//! declare and implement an appropriate [`ToolPolicy`].
+//!
+//! # Choose a backend
+//!
+//! | Cargo features | Entry point | Storage and worker |
+//! |---|---|---|
+//! | Default: `duroxide`, `sqlite` | `DurableAgent::builder` | Embedded Duroxide runtime and SQLite |
+//! | `duroxide` without defaults | `AgentOrchestrator::builder` | Application-supplied Duroxide provider |
+//! | `temporal` without defaults | `temporal::TemporalAgent::new` | Temporal server and activity worker |
+//! | No features | Shared policy, identity, result, and compaction types | No runtime |
+//!
+//! Enable `temporal` with the default features to use both backends. Use Rig
+//! 0.43 models and tools directly; an already-built `rig::Agent` cannot be
+//! converted because it does not expose all required configuration.
+//!
+//! # Run a Rig model with SQLite
+//!
+//! This example requires the default features and `OPENAI_API_KEY`. The SQLite
+//! file retains execution history. The model and its credentials stay on the
+//! worker; they are not serialized into workflow input.
+//!
+//! ```no_run
+//! # #[cfg(feature = "sqlite")]
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! use rig::providers::openai::{self, OpenAI};
+//! use rig_durable::{AgentOrchestrator, DurableAgent, InvocationContract};
+//!
+//! let model = OpenAI::from_env()?.completion(openai::GPT_4O_MINI);
+//! let definition = DurableAgent::builder("assistant", model)
+//!     .invocation_contract(InvocationContract::Logical)
+//!     .preamble("Answer briefly and state any uncertainty.")
+//!     .max_turns(8)
+//!     .build()?;
+//! let orchestrator = AgentOrchestrator::sqlite("sqlite://agents.db?mode=rwc")
+//!     .await?
+//!     .register(definition)?
+//!     .start()
+//!     .await?;
+//! let answer = orchestrator.agent("assistant")?.prompt("Explain durable execution.").await?;
+//! println!("{answer}");
+//! orchestrator.shutdown(None).await;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Use `start` instead of `prompt` to get a run handle for approvals, steering,
+//! cancellation, and detailed results. Use `open_session` for a conversation
+//! that retains history across prompts. See `DurableRun`, `DurableSession`, and
+//! the `temporal` module for the corresponding examples.
+//!
+//! # Add a Rig tool
+//!
+//! A durable tool implements the standard Rig trait. Register this tool with
+//! `.tool(Add)` on either backend's builder. Use `.tool_with` on Duroxide or
+//! `.tool_with_policy` on Temporal to declare [`ToolPolicy::read_only`].
+//!
+//! ```
+//! use std::convert::Infallible;
+//! use rig::tool::{Tool, ToolContext};
+//! use serde::Deserialize;
+//!
+//! struct Add;
+//!
+//! #[derive(Deserialize)]
+//! struct AddArgs { left: i64, right: i64 }
+//!
+//! impl Tool for Add {
+//!     const NAME: &'static str = "add";
+//!     type Args = AddArgs;
+//!     type Output = i128;
+//!     type Error = Infallible;
+//!
+//!     fn description(&self) -> String { "Add two integers".into() }
+//!
+//!     fn parameters(&self) -> serde_json::Value {
+//!         serde_json::json!({
+//!             "type": "object",
+//!             "properties": {
+//!                 "left": {"type": "integer"},
+//!                 "right": {"type": "integer"}
+//!             },
+//!             "required": ["left", "right"]
+//!         })
+//!     }
+//!
+//!     async fn call(&self, _: &mut ToolContext, args: AddArgs) -> Result<i128, Infallible> {
+//!         Ok(i128::from(args.left) + i128::from(args.right))
+//!     }
+//! }
+//! ```
+//!
+//! # Control execution and history
+//!
+//! - [`ToolPolicy`] selects replay safety and retained result metadata. An
+//!   idempotent tool uses [`ToolInvocation::logical_key`] from its Rig context.
+//!   [`InvocationGuardStore`] is required for uncertain-effect protection.
+//! - [`SubmitInput`] gives a session request a stable client ID. Reuse the ID
+//!   only when retrying the same message and mode.
+//! - [`DurableResponse`] adds ordered tool dispositions to Rig's unchanged
+//!   [`PromptResponse`](rig::agent::PromptResponse).
+//! - [`Compaction`] combines a Rig memory policy and compactor. It limits the
+//!   active model context between prompts, not the full audit transcript.
+//! - Duroxide checkpoints and Temporal continue-as-new limit event-history
+//!   windows. They do not remove the transcript or deduplication receipts.
+//!
+//! # Preserve recorded histories
+//!
+//! [`InvocationContract::Logical`] records configuration snapshots for new
+//! top-level Duroxide runs and is the default for new Temporal inputs.
+//! Duroxide defaults to [`InvocationContract::Legacy`] for recorded-history
+//! replay. Keep the required agent versions and tool implementations registered
+//! while their histories are live. Child and raw Duroxide starts resolve their
+//! registered configuration until a checkpoint captures a snapshot; raw callers
+//! can also supply one explicitly. The crate is unreleased at version `0.1.0`.
 
 pub mod activities;
 pub mod activity_types;

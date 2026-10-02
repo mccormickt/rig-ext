@@ -37,6 +37,24 @@ pub struct ToolActivityInput {
 }
 
 /// Stable identity for one logical tool call. Retries receive the same value.
+///
+/// Durable Rig tools receive this value through their [`rig::tool::ToolContext`].
+/// For idempotent external writes, use the logical key, not the physical
+/// execution ID or the provider's tool-call ID. The logical contract is required.
+///
+/// ```
+/// use rig::tool::ToolContext;
+/// use rig_durable::ToolInvocation;
+///
+/// fn idempotency_key(context: &ToolContext) -> Result<String, String> {
+///     let invocation = context.require::<ToolInvocation>().map_err(|e| e.to_string())?;
+///     let key = invocation.logical_key.as_ref().ok_or("logical contract required")?;
+///     Ok(key.digest())
+/// }
+/// ```
+///
+/// Pass the digest to the external service's idempotency mechanism. Merely
+/// reading it does not prevent repeated effects.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolInvocation {
     /// Backend execution identity; changes across continue-as-new.

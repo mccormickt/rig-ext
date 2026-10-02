@@ -11,10 +11,13 @@
 Use only Temporal with `default-features = false, features = ["temporal"]`.
 Use both backends with `features = ["temporal"]`.
 
-This crate is unreleased and remains at version `0.1.0`. Its Rust API can change
-before release. Legacy recorded-history replay is tested separately from Rust
-source compatibility. Keep the required workflow and orchestration versions
-registered while their recorded histories remain live.
+This crate is unreleased and remains at version `0.1.0`. The Rust API docs include
+checked examples for Rig models and tools, sessions, approvals, compaction, and
+both backends. Build and open them with:
+
+```bash
+cargo doc -p rig-durable --features temporal --no-deps --open
+```
 
 ## Temporal
 

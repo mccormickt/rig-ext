@@ -51,6 +51,30 @@ pub struct CompactionConfig {
 ///
 /// The compactor's artifact must serialize, because the workflow retains it
 /// and passes it back as `carry_over` on the next round.
+///
+/// Use Rig's [`rig_memory::SlidingWindowMemory`] to select the retained window
+/// and [`ModelCompactor`] to summarize the removed prefix. Pass this value to
+/// either backend's `.compaction(...)` builder method. It applies to sessions,
+/// not independent single runs.
+///
+/// ```no_run
+/// use rig::{DynModel, operation::Completion};
+/// use rig_durable::{Compaction, ModelCompactor};
+/// use rig_memory::SlidingWindowMemory;
+///
+/// fn summaries(model: DynModel<Completion>) -> Compaction {
+///     Compaction::new(
+///         SlidingWindowMemory::last_messages(40),
+///         ModelCompactor::new(model),
+///     ).version("summary-v1")
+/// }
+/// ```
+///
+/// Change the version when the policy or artifact format changes. The worker
+/// rejects mismatched versions before running the policy or model. A failed
+/// summary leaves the context intact and does not fail the session; the next
+/// completed prompt can trigger another attempt. Compaction does not remove
+/// messages from the audit transcript or reduce its serialized byte count.
 #[derive(Clone)]
 pub struct Compaction {
     policy: Arc<dyn MemoryPolicy>,

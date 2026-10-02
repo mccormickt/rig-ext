@@ -101,6 +101,26 @@ impl MetadataRetention {
 }
 
 /// Backend-neutral policy for one tool registration.
+///
+/// This policy declares requirements; it does not add idempotency to a Rig tool.
+/// An idempotent tool must use [`crate::ToolInvocation::logical_key`] when it
+/// sends an external request. A guarded tool needs an [`crate::InvocationGuardStore`]
+/// shared by all workers that can execute it. Do not use a process-local store
+/// for effects that must remain guarded after a worker restart.
+///
+/// ```
+/// use rig_durable::{MetadataRetention, ReplaySafety, ToolPolicy};
+///
+/// let policy = ToolPolicy::idempotent()
+///     .implementation_version("payments-v1")
+///     .retain_metadata(MetadataRetention::none().key("receipt_id").max_bytes(1024));
+/// assert_eq!(policy.safety(), ReplaySafety::Idempotent);
+/// assert!(policy.metadata().retains("receipt_id"));
+/// assert!(!policy.metadata().retains("authorization"));
+/// ```
+///
+/// Use `.tool_with(tool, ToolOptions::default().policy(policy))` on Duroxide
+/// with the logical contract, or `.tool_with_policy(tool, policy)` on Temporal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolPolicy {
     replay_safety: ReplaySafety,
