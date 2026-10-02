@@ -1,0 +1,51 @@
+[package]
+name = "rig-codemode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Compose Rig tools with model-written JavaScript in a bounded sandbox"
+readme = "README.md"
+
+[[example]]
+name = "explicit_host"
+required-features = ["quickjs"]
+
+[[example]]
+name = "mcp_tools"
+required-features = ["quickjs", "mcp"]
+
+[[test]]
+name = "acceptance"
+required-features = ["quickjs"]
+
+[[test]]
+name = "mcp"
+required-features = ["quickjs", "mcp"]
+
+[dependencies]
+jsonschema = { version = "0.58", default-features = false }
+rig-core.workspace = true
+rig-rmcp = { version = "0.43.0", default-features = false, optional = true }
+rquickjs = { version = "0.14", default-features = false, features = ["std"], optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+rmcp = { version = "2", features = ["server", "client"] }
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+[features]
+default = []
+# Native QuickJS backend. Runs the script on a dedicated worker thread inside
+# the host process; see the README for its threat model.
+quickjs = ["dep:rquickjs"]
+# Catalog entries with output schemas from `rig-rmcp` tools, plus output-schema
+# validation at the dispatch boundary.
+mcp = ["dep:rig-rmcp"]
+
+[lints]
+workspace = true

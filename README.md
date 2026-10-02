@@ -9,6 +9,7 @@ Extensions and integrations for the [Rig](https://github.com/0xPlaygrounds/rig) 
 | [`rig-durable`](rig-durable/README.md) | Durable execution for Rig agents. Uses Duroxide by default. Temporal support is behind the `temporal` feature. |
 | [`rig-a2a`](rig-a2a/README.md) | Uses remote Agent2Agent (A2A) services as Rig completion models and agents. |
 | [`rig-celld`](rig-celld/README.md) | Storage contracts and a `sqlite-vec` vector-store adapter for celld Durable Objects. |
+| [`rig-codemode`](rig-codemode/README.md) | Runs model-written JavaScript that composes approved Rig tools in a bounded QuickJS sandbox. Optional `mcp` feature for `rig-rmcp` tools. |
 
 ## Build
 

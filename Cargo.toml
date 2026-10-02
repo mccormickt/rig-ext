@@ -5,6 +5,7 @@ members = [
   "rig-celld",
   "rig-celld/examples/celld-agent",
   "rig-celld/examples/celld-conformance",
+  "rig-codemode",
   "rig-durable",
 ]
 
