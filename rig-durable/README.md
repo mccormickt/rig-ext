@@ -11,6 +11,31 @@
 Use only Temporal with `default-features = false, features = ["temporal"]`.
 Use both backends with `features = ["temporal"]`.
 
+## 0.2 source migration
+
+This is a **breaking Rust API release**, not an additive 0.1 update. Persisted
+Legacy activity payloads and names remain supported. Rig's `PromptResponse`
+and the ordinary prompt and wait return types do not change.
+
+- Replace `activities::tool::execute` with `ToolExecutor::new(Arc::new(tools))`
+  and its `execute` method. Supply registered policies and a shared guard when
+  required.
+- Use builders or `..Default::default()` where available. Public input,
+  configuration, tool, and continuation struct literals need the new policy,
+  snapshot, result, and compaction fields.
+- Handle `TemporalAgentError` from `TemporalAgent::register`, including policy
+  validation failures, rather than only `WorkflowRegistrationError`.
+- `DurableResponse::fit_within` returns `None` if the response cannot fit.
+  Compaction requests and application require the expected policy version.
+- Prefer `DurableRun::result_detailed` for a completed detailed response.
+  `tool_outcomes` remains a compatibility alias. Temporal queries named
+  `tool_outcomes` return only the outcome vector.
+
+The unreleased Logical contract and compaction payloads are not upgrade
+contracts for live histories from development snapshots. Drain those histories
+with their original workers. Keep Legacy workflow/orchestration versions
+registered for supported recorded histories.
+
 ## Temporal
 
 The Temporal integration runs Rig's `AgentRun` state machine as a workflow.
@@ -129,7 +154,15 @@ guarded and idempotent writes across an activity timeout, submission
 deduplication, follow-up and reject-if-busy admission during a tool round,
 completed-prompt compaction, a failed summary, ordered tool dispositions, and
 a failed submission closing the session. Configure a server
-with the standard Temporal environment variables before running it:
+with the standard Temporal environment variables before running it. The live
+continuation test also needs a disposable server with a low continuation
+threshold (default address `http://localhost:7234`, overridden by
+`TEMPORAL_CONTINUATION_ADDRESS`):
+
+```bash
+temporal server start-dev --port 7234 --headless \
+  --dynamic-config-value limit.historyCount.suggestContinueAsNew=12
+```
 
 ```bash
 TEMPORAL_ADDRESS=temporal.example.com:443 TEMPORAL_TLS=true \
@@ -264,11 +297,17 @@ Each admitted submission gets the next `prompt_index`, which is the
 `submission_id` that tool calls carry in their `LogicalCallKey`. The ledger is
 capped at 48 KiB by default (`submission::DEFAULT_LEDGER_MAX_BYTES`); a session whose ledger
 is full rejects new requests with `LedgerFull` instead of evicting receipts.
+Request IDs contain 1–256 UTF-8 bytes. Failure text is capped at 256 bytes;
+admission reserves the largest JSON encoding for every pending receipt's
+terminal transition. Duroxide rejection retention is capped by count and bytes.
+Oversized rejection identifiers use a SHA-256 representation. Receipts are
+never evicted, and terminal receipt states do not change.
 
 Busy is evaluated at operation boundaries: a request that arrives during a tool
 round is admitted or rejected after that round's results return. A queued
 follow-up never enters the active prompt's tool round. Post-tool steering of an
 active prompt and compaction of an active prompt stay out of scope.
+Admitted queued work counts as busy, even before execution starts.
 
 A failed prompt closes the session and cancels queued submissions. `close`
 stops admission; admitted submissions and queued steering still run before the
@@ -278,6 +317,11 @@ Sessions retain recent per-submission results for the `wait` and result
 surfaces: 32 on Duroxide (`session::SESSION_RESULT_RETENTION`) and 16 on
 Temporal (`temporal::SESSION_RESULT_RETENTION`). An older result is gone, but
 its receipt stays `Answered`.
+On Duroxide, a detailed result that cannot fit in the 60 KiB retention budget
+is not written to KV. Its receipt stays `Answered`, `wait` returns
+`ResultNotRetained`, and the full answer stays in the audit transcript.
+Single-run `wait` and `wait_detailed` return the full orchestration response;
+only the bounded tool outcomes are stored separately in KV.
 
 ```rust,ignore
 let session = orchestrator.agent("calculator")?.open_session("support-42").await?;
@@ -340,9 +384,16 @@ session runs again after the next prompt grows the transcript. Compaction
 runs between prompts: a Duroxide session processes it as the next command,
 and a Temporal session treats it as busy for submissions while the legacy
 `prompt` update waits for it. A worker without a registered `Compaction`
-fails the activity closed. Compaction bounds the model context;
+fails the activity closed. The recorded expected version must match the worker
+and any carry-over artifact before policy or model execution. A mismatch is a
+nonfatal compaction failure. Applied outputs also require that version.
+Temporal carries the last attempted transcript length and error across
+continue-as-new, so unchanged input does not retry a failed round.
+Compaction is a mandatory gate before the next queued or steering prompt.
+Compaction bounds the model context;
 continue-as-new and checkpoints bound event history. Both backends serialize
-the transcript, so `session_history_max_bytes` still applies to it.
+the full transcript. Temporal's `session_history_max_bytes` applies to that
+transcript, not only the compacted active context.
 
 ### Detailed results
 
@@ -352,7 +403,7 @@ Temporal `TemporalAgentWorkflow::run` result. The crate-owned
 dispatch order, with `prompt_index`, 1-based model `turn`, `call_index`, the
 `ToolDisposition`, and whether it was `Retained` from the activity output or
 `Derived` from the legacy error flag. Read it from
-`DurableRun::wait_detailed`/`tool_outcomes`, `DurableSession::wait`, the
+`DurableRun::wait_detailed`/`result_detailed`, `DurableSession::wait`, the
 Temporal `submit` update, or the Temporal `tool_outcomes` and `result`
 queries. Tool results with equal content and different dispositions stay
 distinct.
@@ -538,11 +589,13 @@ deserialize as `Legacy`.
 
 Under `Logical`, `ToolInvocation::logical_key` identifies one tool call across
 retries, redelivery, and continue-as-new: the logical execution ID (the
-Duroxide instance ID or the Temporal workflow ID), the submission ID
+Duroxide instance ID or the Temporal namespace and first execution run ID), the submission ID
 (`prompt-{index}`), the model turn, and the call index. The same tool called
 from two prompts gets two keys; a retry keeps its key. `ToolInvocation::attempt`
 carries the physical execution ID and activity attempt for diagnosis only.
 Provider tool-call IDs can repeat across prompts and are not an idempotency key.
+Independent Temporal starts that reuse a closed workflow ID get different keys.
+Continue-as-new retains the execution-chain identity and ledger identity.
 
 ### Invocation guard
 
@@ -573,7 +626,8 @@ tool's `MetadataRetention` approved, within its size limit. Inbound
 
 ### Configuration snapshots
 
-Under `Logical`, a new Duroxide run stores a `ConfigSnapshot` in its input:
+Under `Logical`, a new top-level Duroxide run started through the facade stores
+a `ConfigSnapshot` in its input:
 ordered tool definitions, routes, retry settings, approval flags, tool
 policies, completion settings, and checkpoint policy. Continuations carry it
 forward. On replay, the worker resolves the snapshot against its registration
@@ -582,6 +636,15 @@ or registered with another implementation version. The tool executor refuses a
 payload recorded for another implementation version for the same reason. A
 worker whose live settings drifted in other ways replays the retained
 configuration.
+
+**Child agents and raw orchestration starts do not have this automatic input
+snapshot guarantee.** Child starts retain the versioned `AgentInput` payload
+and resolve configuration from that registered child version until their first
+checkpoint. That checkpoint carries the resolved snapshot. Keep each child
+registration unchanged for its live histories; deploy changed configuration
+under a new child orchestration version. Raw callers can attach an explicit
+snapshot with `AgentInput::with_snapshot`. This limit preserves recorded child
+start payloads rather than changing the Legacy route contract.
 
 Approval requests bind to the logical call, the final argument digest, and the
 tool implementation version. A decision recorded in history is reused after a

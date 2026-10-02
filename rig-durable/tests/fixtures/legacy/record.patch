@@ -1,0 +1,45 @@
+diff --git a/rig-durable/tests/checkpointing.rs b/rig-durable/tests/checkpointing.rs
+index 36b2446..2a6db1c 100644
+--- a/rig-durable/tests/checkpointing.rs
++++ b/rig-durable/tests/checkpointing.rs
+@@ -45,6 +45,12 @@ async fn run(checkpoint: CheckpointPolicy, instance: &str) -> (PromptResponse, V
+         .unwrap()
+         .unwrap();
+     let executions = client.list_executions(instance).await.unwrap();
++    if instance == "checkpointed" {
++        for execution in &executions {
++            let history = client.read_execution_history(instance, *execution).await.unwrap();
++            std::fs::write(format!("/tmp/legacy-histories/duroxide-continuation-{execution}.json"), serde_json::to_vec(&history).unwrap()).unwrap();
++        }
++    }
+     let requests = model.requests().len();
+     runtime.shutdown(None).await;
+     (response, executions, requests)
+diff --git a/rig-durable/tests/temporal.rs b/rig-durable/tests/temporal.rs
+index 5b232cb..c03087b 100644
+--- a/rig-durable/tests/temporal.rs
++++ b/rig-durable/tests/temporal.rs
+@@ -302,6 +302,7 @@ async fn temporal_retries_tools_with_stable_invocation_identity() {
+             .get_result(WorkflowGetResultOptions::default())
+             .await
+             .unwrap();
++        std::fs::write("/tmp/legacy-histories/temporal-retry.json", handle.fetch_history(Default::default()).to_json().await.unwrap()).unwrap();
+         shutdown();
+         result
+     };
+@@ -433,6 +434,7 @@ async fn temporal_approval_executes_only_approved_tools() {
+             .get_result(WorkflowGetResultOptions::default())
+             .await
+             .unwrap();
++        std::fs::write("/tmp/legacy-histories/temporal-approval.json", approved.fetch_history(Default::default()).to_json().await.unwrap()).unwrap();
+ 
+         let denied = client
+             .start_workflow(
+@@ -639,6 +641,7 @@ async fn temporal_session_serializes_updates_and_drains_active_steering_on_close
+             .get_result(WorkflowGetResultOptions::default())
+             .await
+             .unwrap();
++        std::fs::write("/tmp/legacy-histories/temporal-steering.json", handle.fetch_history(Default::default()).to_json().await.unwrap()).unwrap();
+         shutdown();
+         (response, result)
+     };

@@ -294,6 +294,86 @@ async fn durable_sub_agent_is_registered_and_called_as_a_tool() {
 }
 
 #[tokio::test]
+async fn logical_child_uses_versioned_registration_until_its_first_checkpoint() {
+    let child = DurableAgent::builder(
+        "child",
+        MockCompletionModel::from_turns([
+            MockTurn::tool_call("add", "add", serde_json::json!({"x":1,"y":2})),
+            MockTurn::text("report"),
+        ]),
+    )
+    .invocation_contract(rig_durable::InvocationContract::Logical)
+    .preamble("registered child config")
+    .tool(MockAddTool)
+    .checkpoint(CheckpointConfig {
+        policy: CheckpointPolicy::Every(NonZeroU32::new(1).unwrap()),
+        target_version: None,
+    })
+    .build()
+    .unwrap();
+    let parent = DurableAgent::builder(
+        "parent",
+        MockCompletionModel::from_turns([
+            MockTurn::tool_call("child", "child", serde_json::json!({"prompt":"work"})),
+            MockTurn::text("done"),
+        ]),
+    )
+    .invocation_contract(rig_durable::InvocationContract::Logical)
+    .sub_agent("child", child)
+    .unwrap()
+    .build()
+    .unwrap();
+    let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+    let orchestrator = AgentOrchestrator::builder(store)
+        .register(parent)
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let run = orchestrator
+        .agent("parent")
+        .unwrap()
+        .start("delegate")
+        .await
+        .unwrap();
+    assert_eq!(run.wait().await.unwrap().output, "done");
+    let history = orchestrator
+        .client()
+        .read_execution_history(run.instance_id(), 1)
+        .await
+        .unwrap();
+    let input = history
+        .iter()
+        .find_map(|event| match &event.kind {
+            duroxide::EventKind::SubOrchestrationScheduled { input, .. } => Some(input),
+            _ => None,
+        })
+        .unwrap();
+    let input: rig_durable::AgentInput = serde_json::from_str(input).unwrap();
+    assert!(input.snapshot.is_none());
+    let instances = orchestrator.client().list_all_instances().await.unwrap();
+    assert_eq!(instances.len(), 2);
+    let child_id = instances
+        .iter()
+        .find(|id| id.as_str() != run.instance_id())
+        .unwrap();
+    let history = orchestrator
+        .client()
+        .read_execution_history(child_id, 2)
+        .await
+        .unwrap();
+    let duroxide::EventKind::OrchestrationStarted { input, .. } = &history[0].kind else {
+        panic!("missing child input")
+    };
+    let input: rig_durable::AgentInput = serde_json::from_str(input).unwrap();
+    assert_eq!(
+        input.snapshot.unwrap().preamble.as_deref(),
+        Some("registered child config")
+    );
+    orchestrator.shutdown(None).await;
+}
+
+#[tokio::test]
 async fn caller_run_ids_are_scoped_by_agent_and_version() {
     let first = DurableAgent::builder(
         "first",
