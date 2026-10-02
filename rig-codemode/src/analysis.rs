@@ -36,6 +36,22 @@ impl ScriptAnalysis {
 /// not recognized and can cause both missed names and spurious references.
 /// Sources over 64 KiB or templates nested more than 64 levels stop analysis
 /// and set `dynamic_tool_access`. No result proves complete tool coverage.
+///
+/// ```
+/// use rig_codemode::analyze;
+///
+/// let review = analyze(r#"
+///     await tools.lookup({ id: "order-17" });
+///     const name = "archive";
+///     await tools[name]({});
+/// "#);
+/// assert!(review.tools.contains("lookup"));
+/// assert!(!review.tools.contains("archive"));
+/// assert!(review.dynamic_tool_access);
+/// ```
+///
+/// Use the result for review hints or [`crate::ScriptReview::grant_referenced`].
+/// Enforce permissions with a [`crate::ScriptGrant`], not a source denylist.
 pub fn analyze(source: &str) -> ScriptAnalysis {
     if source.len() > 64 * 1024 {
         return ScriptAnalysis {

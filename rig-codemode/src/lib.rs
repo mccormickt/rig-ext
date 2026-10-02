@@ -9,32 +9,117 @@
 //! The crate owns execution, discovery, and bounded results. The host owns
 //! tool authority through a [`HostDispatcher`]. Tools own their external I/O.
 //!
-//! ```no_run
-//! # #[cfg(feature = "quickjs")]
-//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+//! # Add the crate
+//!
+//! Enable `quickjs` to run scripts. Use Rig 0.43 for compatible tool types.
+//!
+//! ```toml
+//! [dependencies]
+//! rig-codemode = { version = "0.1", features = ["quickjs"] }
+//! rig-core = { version = "0.43", default-features = false }
+//! serde_json = "1"
+//! tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+//! ```
+//!
+//! # Run a Rig tool from JavaScript
+//!
+//! Register tools in a [`DynamicToolDispatcher`], then build a [`Catalog`]
+//! from their definitions. The dispatcher validates arguments against each
+//! tool's input schema before it calls the tool.
+//!
+//! ```
 //! use std::sync::Arc;
 //! use rig_codemode::{Catalog, CatalogEntry, CodeMode, DynamicToolDispatcher, ExecutionRequest};
 //! use rig_core::tool::{DynamicTool, ToolOutput};
 //!
-//! let echo = DynamicTool::new("echo", "Echo arguments", serde_json::json!({"type": "object"}),
-//!     |args| Box::pin(async move { Ok(ToolOutput::json(args)) }));
-//! let dispatcher = DynamicToolDispatcher::new([echo.clone()])?;
-//! let catalog = Catalog::new([CatalogEntry::from_definition(&echo.definition())])?;
-//! let codemode = CodeMode::builder(catalog, Arc::new(dispatcher)).build()?;
+//! # #[cfg(feature = "quickjs")]
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let echo = DynamicTool::new(
+//!         "echo",
+//!         "Return the supplied object",
+//!         serde_json::json!({"type": "object"}),
+//!         |args| Box::pin(async move { Ok(ToolOutput::json(args)) }),
+//!     );
+//!     let dispatcher = DynamicToolDispatcher::new([echo])?;
+//!     let catalog = Catalog::new(
+//!         dispatcher.definitions().iter().map(CatalogEntry::from_definition),
+//!     )?;
+//!     let codemode = CodeMode::builder(catalog, Arc::new(dispatcher)).build()?;
 //!
-//! let report = codemode
-//!     .execute(ExecutionRequest::new(r#"text(await tools["echo"]({ a: 1 }));"#))
-//!     .await?;
-//! assert_eq!(report.output.text, "{\"a\":1}\n");
-//! # Ok(()) }
+//!     let report = codemode
+//!         .execute(ExecutionRequest::new(r#"
+//!             const result = await tools.echo({ greeting: "hello" });
+//!             text(result.greeting);
+//!             return result;
+//!         "#))
+//!         .await?;
+//!     assert!(report.is_completed());
+//!     assert_eq!(report.output.text, "hello\n");
+//!     assert_eq!(report.returned, Some(serde_json::json!({"greeting": "hello"})));
+//!     Ok(())
+//! }
+//! # #[cfg(not(feature = "quickjs"))]
+//! # fn main() {}
 //! ```
+//!
+//! To let a Rig agent write scripts, register [`CodeMode::tool()`] with
+//! `AgentBuilder::dynamic_tool`. See that method's complete agent example.
+//! Register only the outer tool with the agent if all nested calls must use
+//! code-mode policy. Registering the underlying tools separately gives the
+//! agent a path that does not use that policy.
+//!
+//! # JavaScript API
+//!
+//! The source is an async function body, not a module. Use `await` and
+//! `return` directly; do not wrap the source in another function.
+//!
+//! | Operation | Result |
+//! | --- | --- |
+//! | `await tools["name"](args)` | JSON, literal text, or `{ content: [...] }` for mixed content. Tool failures reject with `CodeModeToolError`. |
+//! | `await tools["name"].raw(args)` | A **new call** that returns `{ status, name, content, error? }` for tool outcomes. Argument and size errors can still reject. |
+//! | `text(value)` | Append text or JSON plus a newline to the bounded output. |
+//! | `searchTools(query, { limit: 10 })` | Discover catalog entries by name and description, up to 50 results. |
+//! | `describeTool(name)` | Read input/output schemas, or `null` for an unknown name. |
+//! | `return value` | Include a JSON-serializable value in the report and model output. |
+//!
+//! Await calls that must finish before the script ends. For independent
+//! calls, use `Promise.all`; the host still enforces [`Limits::max_in_flight`].
+//! Catch individual tool errors when the script can continue:
+//!
+//! ```javascript
+//! try {
+//!     text(await tools["lookup"]({ id: "order-17" }));
+//! } catch (error) {
+//!     text({ tool: error.tool, status: error.status, kind: error.kind });
+//! }
+//! ```
+//!
+//! # Configure authority and limits
+//!
+//! - [`policy`]: approve a script with an enforced tool allowlist. Lexical
+//!   [`analyze`] results are hints, not proof of all possible calls.
+//! - [`dispatch`]: authorize each call, rewrite arguments, and filter results.
+//!   Nested calls do **not** inherit Rig agent hooks; the supplied dispatcher
+//!   must enforce the required policy.
+//! - [`limits`]: set host ceilings and lower them for an individual request.
+//!   Script-policy approval waits are outside the execution deadline.
+//! - [`catalog`]: defer large tool descriptions to runtime discovery.
+//! - [`report`]: retain partial output and inspect script and call outcomes.
+//!
+//! QuickJS runs on a worker thread in the host process. Each execution has a
+//! fresh heap with no network, filesystem, module loader, or timers. Resource
+//! limits do not provide a process or WASM security boundary. Host tools can
+//! still perform external I/O. Dropping a dispatch future requests
+//! cancellation; it does not prove that an external effect stopped.
 //!
 //! # Features
 //!
 //! - `quickjs`: the native QuickJS backend. Without a backend feature the
 //!   crate builds catalog and contract code but [`CodeModeBuilder::build`]
-//!   fails with [`BuildError::NoBackend`].
-//! - `mcp`: catalog entries and output-schema validation for `rig-rmcp` tools.
+//!   fails with [`BuildError::NoBackend`]. A native C compiler is required.
+//! - `mcp`: catalog entries and output-schema validation for `rig-rmcp` 0.43
+//!   tools. Enable both `quickjs` and `mcp` to execute MCP-backed scripts.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -196,7 +281,36 @@ impl ExecutionRequest {
         self
     }
 
-    /// Set the inbound context.
+    /// Set the inbound context for child calls. Context values stay on the
+    /// host unless a tool puts them in its output. A [`ScriptPolicy`] can
+    /// change this context before returning its grant.
+    ///
+    /// Use Rig's [`rig_core::tool::ContextValue`] for typed host data. Add
+    /// `serde = { version = "1", features = ["derive"] }` for the derives.
+    /// A `DynamicTool::new_with_context` callback can read the value with
+    /// `context.get::<Tenant>()?`.
+    ///
+    /// ```
+    /// use rig_codemode::ExecutionRequest;
+    /// use rig_core::tool::{ContextValue, ToolContext};
+    ///
+    /// #[derive(serde::Serialize, serde::Deserialize)]
+    /// struct Tenant(String);
+    ///
+    /// impl ContextValue for Tenant {
+    ///     const KEY: &'static str = "app.tenant";
+    /// }
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut context = ToolContext::new();
+    /// context.insert(Tenant("tenant-17".into()))?;
+    /// let request = ExecutionRequest::new("text(await tools.lookup({ id: 'order-17' }));")
+    ///     .with_context(context);
+    /// assert_eq!(request.context.get::<Tenant>()?.map(|tenant| tenant.0),
+    ///            Some("tenant-17".into()));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_context(mut self, context: ToolContext) -> Self {
         self.context = context;
         self
@@ -445,6 +559,32 @@ impl CodeMode {
     /// Expose the executor as a Rig tool with `{ "code": string }` input.
     /// Completed scripts return text; other statuses return typed errors whose
     /// model output keeps the partial text and call summary.
+    ///
+    /// The tool forwards its inbound [`ToolContext`] to child calls. It does
+    /// not forward the Rig agent's hooks. Configure nested-call policy in the
+    /// [`HostDispatcher`] and script approval with [`CodeModeBuilder::script_policy`].
+    ///
+    /// # Register with a Rig agent
+    ///
+    /// Add `rig = "0.43"` with its default features to use `AgentBuilder` and
+    /// the OpenAI client. This example accepts the configured executor from
+    /// the [crate-level example](crate). It needs `OPENAI_API_KEY` at runtime.
+    ///
+    /// ```no_run
+    /// use rig::{AgentBuilder, providers::openai::{self, OpenAI}};
+    /// use rig_codemode::CodeMode;
+    ///
+    /// async fn ask(codemode: CodeMode) -> Result<String, Box<dyn std::error::Error>> {
+    ///     let client = OpenAI::from_env()?;
+    ///     let agent = AgentBuilder::new(client.completion(openai::GPT_4O))
+    ///         .dynamic_tool(codemode.tool())
+    ///         .build();
+    ///     let response = agent
+    ///         .prompt("Use codemode to call echo with a greeting, then show the greeting.")
+    ///         .await?;
+    ///     Ok(response.output)
+    /// }
+    /// ```
     pub fn tool(&self) -> DynamicTool {
         let this = self.clone();
         DynamicTool::new_with_context(

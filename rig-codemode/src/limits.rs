@@ -1,4 +1,45 @@
 //! Host-configured resource ceilings and per-request restrictions.
+//!
+//! Pass [`Limits`] to [`crate::CodeModeBuilder::limits`]. Each request can
+//! lower these ceilings with [`crate::ExecutionRequest::with_limits`]. A
+//! request cannot raise them. Lowering `max_calls` also lowers concurrency
+//! when needed; it never increases the host's `max_in_flight`.
+//!
+//! ```
+//! use std::time::Duration;
+//! use rig_codemode::{ExecutionRequest, LimitOverrides, Limits, LimitsError};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let host_limits = Limits {
+//!     wall_time: Duration::from_secs(5),
+//!     max_calls: 16,
+//!     max_in_flight: 4,
+//!     ..Limits::default()
+//! };
+//! let request = ExecutionRequest::new("text('ready');")
+//!     .with_parent_call_id("request-17")
+//!     .with_limits(LimitOverrides {
+//!         wall_time: Some(Duration::from_secs(1)),
+//!         max_calls: Some(2),
+//!         ..LimitOverrides::default()
+//!     });
+//! let effective = host_limits.restrict(&request.limits)?;
+//! assert_eq!(effective.max_calls, 2);
+//! assert_eq!(effective.max_in_flight, 2);
+//! assert!(matches!(
+//!     host_limits.restrict(&LimitOverrides {
+//!         max_calls: Some(17),
+//!         ..LimitOverrides::default()
+//!     }),
+//!     Err(LimitsError::AboveCeiling { .. })
+//! ));
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Wall time includes queued and in-flight tool calls, but excludes
+//! [`crate::ScriptPolicy`] review. Guest heap limits do not bound memory used
+//! inside host tools. Host tools must also bound their own I/O and allocation.
 
 use std::time::Duration;
 

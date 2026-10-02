@@ -5,6 +5,45 @@
 //! `searchTools` and `describeTool`; execution rejects names outside the
 //! snapshot. Membership is not authorization: the host dispatcher still
 //! decides every call.
+//!
+//! # Defer a tool description to discovery
+//!
+//! [`Presentation::Deferred`] keeps a tool out of inline prompt declarations,
+//! not out of the catalog. Names are exact: a namespace groups search results
+//! but does not add a prefix to the callable name.
+//!
+//! ```
+//! use rig_codemode::{Catalog, CatalogEntry, Presentation};
+//! use serde_json::json;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let entry = CatalogEntry::new(
+//!     "order-details", "Read an order by ID",
+//!     json!({"type": "object", "properties": {"id": {"type": "string"}},
+//!            "required": ["id"]}),
+//! )
+//! .with_namespace("sales")
+//! .with_presentation(Presentation::Deferred);
+//! let catalog = Catalog::new([entry])?;
+//! assert!(catalog.contains("order-details"));
+//! assert!(!catalog.contains("sales.order-details"));
+//! assert_eq!(catalog.search("sales order", 10).len(), 1);
+//! assert!(catalog.render_declarations(512).len() <= 512);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! With the same tool registered in the dispatcher, a script can discover
+//! its schema and call it. Bracket syntax supports names with punctuation.
+//!
+//! ```javascript
+//! const matches = searchTools("sales order", { limit: 5 });
+//! if (matches.length > 0) {
+//!     const definition = describeTool(matches[0].name);
+//!     text(definition.inputSchema);
+//! }
+//! text(await tools["order-details"]({ id: "order-17" }));
+//! ```
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;

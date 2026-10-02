@@ -1,6 +1,47 @@
 //! Host-owned tool authority. The script runtime asks a [`HostDispatcher`]
 //! for every call; the dispatcher validates, authorizes, runs the tool, and
 //! applies result policy before anything reaches the script.
+//!
+//! # Use the same policy for direct and script calls
+//!
+//! Pass a [`DynamicToolDispatcher`] to [`crate::CodeMode::builder`] for
+//! script calls. Use [`HostDispatcher::dispatch`] for direct calls that need
+//! the same checks. Calling `DynamicTool::execute` directly bypasses this
+//! dispatcher's policies and schema validation.
+//!
+//! ```
+//! use rig_codemode::{DynamicToolDispatcher, HostDispatcher, Invocation};
+//! use rig_core::tool::{DynamicTool, ToolContext, ToolExecutionError, ToolOutput};
+//! use serde_json::json;
+//!
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let lookup = DynamicTool::new(
+//!     "lookup", "Look up a record by ID",
+//!     json!({"type": "object", "properties": {"id": {"type": "string"}},
+//!            "required": ["id"], "additionalProperties": false}),
+//!     |args| Box::pin(async move { Ok(ToolOutput::json(args)) }),
+//! );
+//! let dispatcher = DynamicToolDispatcher::new([lookup])?
+//!     .with_call_policy(|call| {
+//!         if call.arguments.get("id").and_then(|id| id.as_str()) == Some("private") {
+//!             return Err(ToolExecutionError::refused("record access denied"));
+//!         }
+//!         Ok(())
+//!     });
+//! let result = dispatcher.dispatch(Invocation::new(
+//!     "request-17", 0, "lookup", json!({"id": "public"}), ToolContext::new(),
+//! )).await;
+//! assert!(result.result.is_success());
+//! assert_eq!(result.result.output().as_json(), Some(&json!({"id": "public"})));
+//!
+//! let denied = dispatcher.dispatch(Invocation::new(
+//!     "request-17", 1, "lookup", json!({"id": "private"}), ToolContext::new(),
+//! )).await;
+//! assert!(!denied.result.is_success());
+//! # Ok(())
+//! # }
+//! ```
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -167,7 +208,37 @@ impl DynamicToolDispatcher {
         })
     }
 
-    /// Install a call policy; see [`CallPolicy`].
+    /// Install a call policy; see [`CallPolicy`]. Input validation runs after
+    /// this policy, so rewritten arguments must still match the tool schema.
+    ///
+    /// ```
+    /// use rig_codemode::{DynamicToolDispatcher, HostDispatcher, Invocation};
+    /// use rig_core::tool::{DynamicTool, ToolContext, ToolExecutionError, ToolOutput};
+    /// use serde_json::json;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let tool = DynamicTool::new(
+    ///     "echo", "Return the effective arguments",
+    ///     json!({"type": "object", "properties": {"tenant": {"type": "string"}},
+    ///            "required": ["tenant"]}),
+    ///     |args| Box::pin(async move { Ok(ToolOutput::json(args)) }),
+    /// );
+    /// let dispatcher = DynamicToolDispatcher::new([tool])?
+    ///     .with_call_policy(|call| {
+    ///         let object = call.arguments.as_object_mut()
+    ///             .ok_or_else(|| ToolExecutionError::invalid_args("expected an object"))?;
+    ///         // The host chooses the tenant, not the script.
+    ///         object.insert("tenant".into(), json!("tenant-17"));
+    ///         Ok(())
+    ///     });
+    /// let outcome = dispatcher.dispatch(Invocation::new(
+    ///     "request-17", 0, "echo", json!({"tenant": "untrusted"}), ToolContext::new(),
+    /// )).await;
+    /// assert_eq!(outcome.result.output().as_json(), Some(&json!({"tenant": "tenant-17"})));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_call_policy<F>(mut self, policy: F) -> Self
     where
         F: Fn(&mut Invocation) -> Result<(), ToolExecutionError> + Send + Sync + 'static,
@@ -176,7 +247,40 @@ impl DynamicToolDispatcher {
         self
     }
 
-    /// Install a result policy; see [`ResultPolicy`].
+    /// Install a result policy; see [`ResultPolicy`]. Apply redaction here
+    /// before normal and `.raw()` calls can observe the output. This policy
+    /// does not filter [`DispatchOutcome::metadata`].
+    ///
+    /// ```
+    /// use rig_codemode::{DynamicToolDispatcher, HostDispatcher, Invocation};
+    /// use rig_core::tool::{DynamicTool, ToolContext, ToolOutput};
+    /// use serde_json::json;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let tool = DynamicTool::new(
+    ///     "profile", "Read the current profile", json!({"type": "object"}),
+    ///     |_| Box::pin(async { Ok(ToolOutput::json(json!({
+    ///         "name": "Ada", "internal_note": "host-only detail"
+    ///     }))) }),
+    /// );
+    /// let dispatcher = DynamicToolDispatcher::new([tool])?
+    ///     .with_result_policy(|_call, result| {
+    ///         let Some(mut value) = result.output().as_json().cloned() else {
+    ///             return result;
+    ///         };
+    ///         if let Some(object) = value.as_object_mut() {
+    ///             object.remove("internal_note");
+    ///         }
+    ///         result.with_output(ToolOutput::json(value))
+    ///     });
+    /// let outcome = dispatcher.dispatch(Invocation::new(
+    ///     "request-17", 0, "profile", json!({}), ToolContext::new(),
+    /// )).await;
+    /// assert_eq!(outcome.result.output().as_json(), Some(&json!({"name": "Ada"})));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_result_policy<F>(mut self, policy: F) -> Self
     where
         F: Fn(&Invocation, ToolResult) -> ToolResult + Send + Sync + 'static,

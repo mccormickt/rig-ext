@@ -3,6 +3,56 @@
 //! may call and the context every child call receives. The runtime refuses
 //! calls outside the grant, so the grant holds even when the script computes
 //! tool names at run time.
+//!
+//! # Grant an explicit allowlist
+//!
+//! Use host permissions to select names. Do not treat [`crate::analyze`] as
+//! a complete list of possible calls. A fixed grant also applies to computed
+//! names and `.raw()` calls.
+//!
+//! ```
+//! # #[cfg(feature = "quickjs")]
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::sync::Arc;
+//! use rig_codemode::{
+//!     Catalog, CatalogEntry, CodeMode, DynamicToolDispatcher, ExecutionRequest,
+//!     CallStatus, ScriptGrant, ScriptReview,
+//! };
+//! use rig_core::tool::{DynamicTool, ToolOutput};
+//!
+//! let tools = ["lookup", "delete"].map(|name| DynamicTool::new(
+//!     name, "Example operation", serde_json::json!({"type": "object"}),
+//!     |args| Box::pin(async move { Ok(ToolOutput::json(args)) }),
+//! ));
+//! let dispatcher = DynamicToolDispatcher::new(tools)?;
+//! let catalog = Catalog::new(
+//!     dispatcher.definitions().iter().map(CatalogEntry::from_definition),
+//! )?;
+//! let codemode = CodeMode::builder(catalog, Arc::new(dispatcher))
+//!     .script_policy(|review: ScriptReview<'_>| {
+//!         Ok(ScriptGrant::only(["lookup"], review.context))
+//!     })
+//!     .build()?;
+//! let report = codemode.execute(ExecutionRequest::new(r#"
+//!     const operation = "delete";
+//!     try { await tools[operation]({}); }
+//!     catch (error) { text(error.status); }
+//! "#)).await?;
+//! assert!(report.is_completed());
+//! assert_eq!(report.output.text, "denied\n");
+//! assert_eq!(report.calls.first().map(|call| call.status), Some(CallStatus::Refused));
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "quickjs"))]
+//! # fn main() {}
+//! ```
+//!
+//! Return [`ToolExecutionError::refused`] to reject the entire script before
+//! execution. To allow only names found by the scanner, return
+//! [`ScriptReview::grant_referenced`]; valid calls missed by the scanner will
+//! be refused. Approval waits are outside [`crate::Limits::wall_time`]. Bound
+//! asynchronous review separately, for example with `tokio::time::timeout`.
 
 use std::collections::BTreeSet;
 use std::future::Future;

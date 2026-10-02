@@ -1,5 +1,45 @@
 //! What one script execution produced: status, bounded output, return value,
 //! ordered child-call records, and a safe script diagnostic.
+//!
+//! # Keep partial output when a script fails
+//!
+//! [`crate::CodeMode::execute`] returns `Err` only when execution cannot
+//! start. A script exception, timeout, or stalled promise produces an `Ok`
+//! report with a non-completed [`ExecutionStatus`]. Check the status instead
+//! of treating every `Ok` as success.
+//!
+//! ```
+//! # #[cfg(feature = "quickjs")]
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::sync::Arc;
+//! use rig_codemode::{
+//!     Catalog, CodeMode, DynamicToolDispatcher, ExecutionRequest, ExecutionStatus,
+//! };
+//!
+//! let codemode = CodeMode::builder(
+//!     Catalog::default(), Arc::new(DynamicToolDispatcher::new([])?),
+//! ).build()?;
+//! let report = codemode.execute(ExecutionRequest::new(r#"
+//!     text("first step finished");
+//!     throw new Error("second step failed");
+//! "#)).await?;
+//! assert_eq!(report.status, ExecutionStatus::ScriptError);
+//! assert_eq!(report.output.text, "first step finished\n");
+//! assert!(report.diagnostic.is_some());
+//! println!("{}", report.render_text());
+//! assert!(report.into_tool_result().is_err());
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "quickjs"))]
+//! # fn main() {}
+//! ```
+//!
+//! [`CallRecord::status`] describes the tool outcome, while
+//! [`CallRecord::delivery`] describes the reply sent to the worker. A
+//! successful tool can have discarded delivery if the script ends first.
+//! `Delivered` is not proof that script code observed the result. If the
+//! caller drops the execution future, no report is returned to that caller.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -78,7 +118,7 @@ pub struct CallRecord {
     /// Normalized error kind for failures, refusals, and rejections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<ToolErrorKind>,
-    /// Whether the script received the result.
+    /// What happened to the reply; not proof that the script received it.
     pub delivery: ScriptDelivery,
 }
 

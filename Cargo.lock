@@ -6499,6 +6499,7 @@ name = "rig-codemode"
 version = "0.1.0"
 dependencies = [
  "jsonschema",
+ "rig",
  "rig-core",
  "rig-rmcp",
  "rmcp",

@@ -37,9 +37,15 @@ Two `rquickjs` facts shaped the implementation. `set_memory_limit` is only effec
 
 ## Use
 
+The crate's rustdocs contain checked examples for direct execution, Rig 0.43 agent registration, typed context, policies, limits, reports, discovery, and MCP integration. Build them with:
+
+```sh
+cargo doc -p rig-codemode --no-deps --features quickjs,mcp --open
+```
+
 ```rust,ignore
 use std::sync::Arc;
-use rig_codemode::{Catalog, CatalogEntry, CodeMode, DynamicToolDispatcher, ExecutionRequest, Limits};
+use rig_codemode::{Catalog, CatalogEntry, CodeMode, DynamicToolDispatcher, ExecutionRequest, Limits, ScriptReview};
 
 let dispatcher = DynamicToolDispatcher::new(tools)?
     .with_call_policy(|invocation| { /* deny or rewrite arguments */ Ok(()) })

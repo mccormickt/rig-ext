@@ -6,6 +6,42 @@
 //! this crate: `rig-rmcp` already turns `isError` results into failed calls
 //! whose model output keeps the permitted content, so a normal call rejects
 //! and `.raw` mode returns the sanitized envelope with that content.
+//!
+//! # Build an executor from MCP tools
+//!
+//! Enable `rig-codemode` features `quickjs,mcp` and add `rig-rmcp = "0.43"`.
+//! Obtain tools with [`rig_rmcp::tools_from_server`] from a connected client's
+//! definitions and peer. Keep that client connection open during execution.
+//! Build the catalog **before** converting the tools to Rig `DynamicTool`s:
+//! the Rig definitions do not retain MCP output schemas.
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use rig_codemode::{Catalog, CatalogEntry, CodeMode, DynamicToolDispatcher};
+//! use rig_codemode::mcp::OutputSchemaValidator;
+//! use rig_rmcp::McpTool;
+//!
+//! fn executor(tools: Vec<McpTool>) -> Result<CodeMode, Box<dyn std::error::Error>> {
+//!     let catalog = Catalog::new(
+//!         tools.iter().map(McpTool::definition).map(CatalogEntry::from_mcp_definition),
+//!     )?;
+//!     let dispatcher = DynamicToolDispatcher::new(tools.into_iter().map(Into::into))?;
+//!     let dispatcher = OutputSchemaValidator::new(dispatcher, &catalog)?;
+//!     Ok(CodeMode::builder(catalog, Arc::new(dispatcher)).build()?)
+//! }
+//! ```
+//!
+//! The wrapper checks successful `structuredContent` against the declared
+//! output schema. Mismatches are non-retryable failures with generic feedback;
+//! validation never logs instance values or unexpected property names. Raw
+//! response metadata remains host-only. `.raw()` does not bypass validation
+//! or result policy, and makes a separate call rather than reading a cache.
+//!
+//! For a complete example with an in-process server and no network access:
+//!
+//! ```sh
+//! cargo run -p rig-codemode --example mcp_tools --features quickjs,mcp
+//! ```
 
 use std::collections::HashMap;
 
