@@ -105,6 +105,7 @@ pub(crate) fn apply_model_turn(agent: &mut AgentRun, turn: ModelTurn) -> Result<
     Ok(())
 }
 
+#[cfg(any(feature = "duroxide", feature = "temporal"))]
 pub(crate) fn approval_request(
     call: &ToolCall,
     prompt_index: u64,

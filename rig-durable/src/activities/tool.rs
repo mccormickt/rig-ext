@@ -70,6 +70,16 @@ impl ToolExecutor {
         if policy.safety().requires_guard() {
             return self.execute_guarded(input, &policy).await;
         }
+        self.execute_committed(input).await
+    }
+
+    /// Execute an intent already claimed by the backend's transaction.
+    #[cfg_attr(not(feature = "durable-object"), allow(dead_code))]
+    pub(crate) async fn execute_committed(
+        &self,
+        input: ToolActivityInput,
+    ) -> Result<ToolActivityOutput, String> {
+        let policy = input.policy.clone().unwrap_or_default();
         let result = self.run_tool(&input, &policy).await?;
         if let Some(error) = result.result.as_ref().and_then(|result| result.error())
             && error_handling(error, policy.safety()) == ErrorHandling::Retry

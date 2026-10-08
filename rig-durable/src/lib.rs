@@ -1,4 +1,4 @@
-//! Run Rig agents as durable Duroxide orchestrations or Temporal workflows.
+//! Run Rig agents on Duroxide, Temporal, or SQLite Durable Objects.
 //!
 //! Pass a Rig completion model and Rig [`Tool`](rig::tool::Tool) implementations
 //! to a backend's agent builder. The backend records model responses and tool
@@ -13,9 +13,10 @@
 //! | Default: `duroxide`, `sqlite` | `DurableAgent::builder` | Embedded Duroxide runtime and SQLite |
 //! | `duroxide` without defaults | `AgentOrchestrator::builder` | Application-supplied Duroxide provider |
 //! | `temporal` without defaults | `temporal::TemporalAgent::new` | Temporal server and activity worker |
+//! | `durable-object` without defaults | `durable_object::Builder::new` | Cloudflare or celld SQLite Durable Objects |
 //! | No features | Shared configuration, policy, identity, result, and compaction types | Native and WASM; no runtime |
 //!
-//! Enable `temporal` with the default features to use both backends. Use Rig
+//! Enable `temporal` with the default features to use both native backends. Use Rig
 //! 0.43 models and tools directly; an already-built `rig::Agent` cannot be
 //! converted because it does not expose all required configuration.
 //!
@@ -124,8 +125,10 @@ pub mod activity_types;
 pub mod approval;
 pub mod compaction;
 pub mod config;
-#[cfg(any(feature = "duroxide", feature = "temporal"))]
+#[cfg(any(feature = "duroxide", feature = "temporal", feature = "durable-object"))]
 mod driver;
+#[cfg(feature = "durable-object")]
+pub mod durable_object;
 #[cfg(feature = "duroxide")]
 mod facade;
 pub mod guard;
