@@ -22,7 +22,7 @@ use rig::{
     memory::{Compactor, MemoryError},
     operation::Completion,
     transcript::{TranscriptError, validate_canonical},
-    wasm_compat::WasmBoxedFuture,
+    wasm_compat::{WasmBoxedFuture, WasmCompatSend, WasmCompatSync},
 };
 use rig_memory::MemoryPolicy;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -160,7 +160,7 @@ impl fmt::Debug for Compaction {
 
 /// Object-safe view of a [`Compactor`] whose artifact round-trips through
 /// JSON.
-trait ErasedCompactor: Send + Sync {
+trait ErasedCompactor: WasmCompatSend + WasmCompatSync {
     fn compact<'a>(
         &'a self,
         conversation_id: &'a ConversationId,
@@ -171,7 +171,7 @@ trait ErasedCompactor: Send + Sync {
 
 impl<C> ErasedCompactor for C
 where
-    C: Compactor + Send + Sync,
+    C: Compactor,
     C::Artifact: Serialize + DeserializeOwned,
 {
     fn compact<'a>(

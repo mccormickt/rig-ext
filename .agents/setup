@@ -13,6 +13,7 @@ if ! command -v cargo >/dev/null; then
   rm "$installer"
 fi
 rustup component add clippy rustfmt
+rustup target add wasm32-unknown-unknown
 if ! command -v temporal >/dev/null; then
   archive=$(mktemp)
   mkdir -p "$HOME/.local/bin"

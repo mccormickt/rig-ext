@@ -21,7 +21,7 @@
 
 use std::{collections::HashMap, sync::Mutex};
 
-use futures::future::BoxFuture;
+use rig::wasm_compat::{WasmBoxedFuture as BoxFuture, WasmCompatSend, WasmCompatSync};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -80,7 +80,7 @@ pub enum SettleOutcome {
 }
 
 /// Atomic create-if-absent claims with conditional settlement.
-pub trait InvocationGuardStore: Send + Sync {
+pub trait InvocationGuardStore: WasmCompatSend + WasmCompatSync {
     /// Create the claim if no record exists for `claim.key`. Must be atomic
     /// with respect to concurrent claims for the same key.
     fn claim(&self, claim: ClaimRequest) -> BoxFuture<'_, Result<ClaimOutcome, GuardError>>;
