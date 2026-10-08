@@ -1,0 +1,9 @@
+{
+  "name": "rig-durable-object",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": {
+    "bindings": [{ "name": "AGENTS", "class_name": "AgentSession" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AgentSession"] }]
+}

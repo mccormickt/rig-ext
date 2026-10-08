@@ -1,0 +1,22 @@
+[package]
+name = "durable-object-example"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+futures = "0.3"
+rig.workspace = true
+rig-core = { workspace = true, features = ["test-utils"] }
+rig-durable = { path = "../..", default-features = false, features = ["durable-object"] }
+rig-celld = { path = "../../../rig-celld", features = ["storage"] }
+serde.workspace = true
+serde_json.workspace = true
+worker.workspace = true
+
+[lints]
+workspace = true

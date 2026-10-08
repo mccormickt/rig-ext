@@ -1,23 +1,102 @@
 # rig-durable
 
-`rig-durable` supports two independent durable execution backends:
+`rig-durable` supports three independent durable execution backends:
 
 | Cargo feature | Backend | Default |
 |---|---|---|
 | `duroxide` | Duroxide orchestration and activities | yes |
 | `sqlite` | Duroxide SQLite provider | yes |
 | `temporal` | Temporal workflows and activities | no |
+| `durable-object` | Cloudflare and celld SQLite Durable Objects | no |
 
 Use only Temporal with `default-features = false, features = ["temporal"]`.
-Use both backends with `features = ["temporal"]`.
+Use both native backends with `features = ["temporal"]`.
+Use Workers with `default-features = false, features = ["durable-object"]`.
+The backend-neutral core also builds without any features on WASM.
 
 This crate is unreleased and remains at version `0.1.0`. The Rust API docs include
 checked examples for Rig models and tools, sessions, approvals, compaction, and
-both backends. Build and open them with:
+the native backends. Build and open them with:
 
 ```bash
 cargo doc -p rig-durable --features temporal --no-deps --open
 ```
+
+## Durable Objects
+
+One SQLite Durable Object owns one agent session. The application owns the
+`#[durable_object]` class, routes, authentication, and model credentials. Keep
+one `durable_object::Engine` per object and pass its ID as the session ID:
+
+```rust,ignore
+let storage = rig_celld::CellStorage::from(state);
+let engine = rig_durable::durable_object::Builder::new(model)
+    .preamble("Use the calculator for arithmetic.")
+    .tool_with(Add, ToolOptions::default().policy(ToolPolicy::read_only()))
+    .build(storage.clone(), storage, object_id)?;
+
+let receipt = engine.submit(SubmitInput::new("req-1", "What is 20 + 22?")).await?;
+let response = engine.wait(&receipt.request_id).await?;
+```
+
+`submit` commits admission and arms an alarm. It does not wait for an answer.
+`wait` drives the session and returns `Option<DurableResponse>`; `None` means
+the request is not answered yet. `result` reads a committed answer without
+driving. `status` exposes receipts, pending approvals, and retry deadlines.
+Call `approve` or `deny` with the exact approval ID. Delegate the object's
+alarm handler to `engine.alarm()`. `close` stops admission and drains work
+already accepted. A failed prompt closes the session and cancels queued work.
+
+The engine commits model intent before provider I/O, then commits the model
+turn. It commits all tool intents before it starts the concurrent tool batch.
+Each result commits separately; final outcomes retain model emission order.
+After a restart, an incomplete model call runs again. An incomplete tool call
+runs again only when its stored and registered replay policies agree and permit
+repetition. Otherwise the model receives an `Interrupted` result. An
+implementation-version change fails the session closed. The SQL tool-call
+table is the invocation guard; no separate guard store is needed.
+
+The object uses the `Logical` contract. Existing Duroxide, Temporal, and tool
+policy defaults do not change. Approval resolves the whole tool batch before
+execution. Submissions received during I/O only commit to the queue; one local
+driver owns the active turn. There is no post-tool steering.
+
+Schema-versioned SQL tables hold the append-only transcript, chunked run
+checkpoints, tool intents, and submission ledger. Checkpoints replace the
+active `AgentRun`; past completion requests are not retained. Model context
+comes from the transcript and compaction cutoff. Compaction runs between
+prompts and uses the same validation as the native backends. Mutations reload
+SQL inside a synchronous transaction, so an uncertain write cannot leave an
+in-memory candidate visible. Use a new object ID for a new session.
+
+Retry deadlines are persisted. Short waits use `worker::Delay`; the single
+alarm tracks the earliest deadline or a 30-second recovery heartbeat. The
+alarm handler explicitly re-arms after errors. Idle alarms do not recur.
+The driver yields between operations after 60 seconds. Tools and model calls
+must still fit the platform's invocation and CPU limits. Tool worker tags,
+sub-orchestrations, and explicit per-call timeouts are not supported.
+Streaming completion commits after EOF; it is not a live token feed.
+
+Checkpoints and results use 512 KiB chunks. Individual transcript messages and
+tool records are capped at 1 MiB. `session_history_max_bytes` caps each full
+checkpoint, result, and transcript (8 MiB by default), not only model context.
+The submission ledger retains receipts within its 48 KiB limit. Results remain
+available for the life of the object. Start another object when a limit is
+reached; compaction does not delete the audit transcript.
+
+Build the core, backend, and API-key-free example:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo check -p rig-durable --no-default-features --target wasm32-unknown-unknown
+cargo check -p rig-durable --no-default-features --features durable-object --target wasm32-unknown-unknown
+cargo build -p durable-object-example --target wasm32-unknown-unknown
+cargo test -p rig-durable --no-default-features --features durable-object --lib durable_object
+```
+
+The [example](examples/durable-object/README.md) runs on celld or Wrangler
+without `sqlite-vec`. Native conformance tests use the same engine with
+`rusqlite`; production uses `rig-celld/storage` and `transactionSync()`.
 
 ## Temporal
 
@@ -263,7 +342,7 @@ with the number of turns.
 
 ## Sessions
 
-Both backends run a long-lived session as one durable execution that admits
+All backends run a long-lived session as one durable execution that admits
 prompts one at a time. `SubmitInput` carries the client's `request_id`, the
 message, and a `SubmissionMode`:
 
@@ -286,8 +365,8 @@ terminal transition. Duroxide rejection retention is capped by count and bytes.
 Oversized rejection identifiers use a SHA-256 representation. Receipts are
 never evicted, and terminal receipt states do not change.
 
-Busy is evaluated at operation boundaries: a request that arrives during a tool
-round is admitted or rejected after that round's results return. A queued
+On the native backends, busy is evaluated at operation boundaries: a request
+that arrives during a tool round is admitted or rejected after its results return. A queued
 follow-up never enters the active prompt's tool round. Post-tool steering of an
 active prompt and compaction of an active prompt stay out of scope.
 Admitted queued work counts as busy, even before execution starts.
@@ -412,11 +491,12 @@ example.
 
 ## Architecture
 
-The backend-neutral driver owns Rig policy: completion request construction,
-`AgentRun` transitions, prompt-scoped approval identities and denials, and
-tool-result correlation. Both adapters use the same follow-up-turn steering
-semantics. Backend adapters only schedule activities, wait for durable control
-messages, expose status, and apply backend retry and checkpoint rules.
+The backend-neutral driver plans model, tool, and done effects. It owns
+completion requests, `AgentRun` transitions, prompt-scoped approval identities
+and denials, and tool-result correlation. The native adapters use the same
+follow-up-turn steering semantics. Backend adapters schedule activities, wait
+for durable control messages, expose status, and apply backend retry and
+checkpoint rules.
 
 ```text
 Rig model + ToolSet
@@ -426,12 +506,14 @@ shared durable driver ── AgentRun + pure policy
         │
         ├── Duroxide adapter ── orchestration, events, timers, continue-as-new
         │
-        └── Temporal adapter ── workflow, signals, queries, activity policies
+        ├── Temporal adapter ── workflow, signals, queries, activity policies
+        │
+        └── Durable Object engine ── SQL checkpoints, tool intents, alarms
 ```
 
 This boundary keeps the public API Rig-first and avoids a generic async runtime
 trait. Hooks that perform durable control belong at this driver boundary. Rig's
-current high-level `AgentRunner` hooks are not replayed because both adapters
+current high-level `AgentRunner` hooks are not replayed because the backends
 drive `AgentRun` directly. A future Rig effect API can replace this narrow seam
 without changing backend scheduling.
 
