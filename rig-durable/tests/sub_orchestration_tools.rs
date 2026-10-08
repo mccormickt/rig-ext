@@ -131,9 +131,11 @@ async fn unsupported_configuration_fails_before_child_is_scheduled() {
     assert!(result.unwrap_err().contains("does not support worker tags"));
 
     let mut entry = sub_orchestration_tool(definition(), "Child", None);
-    entry.retry = RetryPolicy::new(2).with_backoff(BackoffStrategy::Fixed {
-        delay: Duration::from_millis(1),
-    });
+    entry.retry = RetryPolicy::new(2)
+        .with_backoff(BackoffStrategy::Fixed {
+            delay: Duration::from_millis(1),
+        })
+        .into();
     let (result, _) = run_child_tool(
         |_ctx, _input| async { panic!("child must not be scheduled") },
         entry,
@@ -142,7 +144,9 @@ async fn unsupported_configuration_fails_before_child_is_scheduled() {
     assert!(result.unwrap_err().contains("parent-side retries"));
 
     let mut entry = sub_orchestration_tool(definition(), "Child", None);
-    entry.retry = RetryPolicy::new(1).with_timeout(Duration::from_secs(1));
+    entry.retry = RetryPolicy::new(1)
+        .with_timeout(Duration::from_secs(1))
+        .into();
     let (result, _) = run_child_tool(
         |_ctx, _input| async { panic!("child must not be scheduled") },
         entry,

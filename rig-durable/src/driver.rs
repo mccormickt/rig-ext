@@ -1,5 +1,8 @@
 use rig::{
-    agent::{AgentRun, InvalidToolCallAction, ModelTurn, ModelTurnOutcome, PendingToolCall},
+    agent::{
+        AgentRun, AgentRunStep, InvalidToolCallAction, ModelTurn, ModelTurnOutcome,
+        PendingToolCall, PromptResponse,
+    },
     completion::{CompletionRequest, Message, ToolDefinition},
     message::{ToolCall, ToolChoice, ToolResultContent, UserContent},
 };
@@ -17,6 +20,52 @@ pub(crate) struct CompletionOptions {
     pub max_tokens: Option<u64>,
     pub tool_choice: Option<ToolChoice>,
     pub additional_params: Option<serde_json::Value>,
+}
+
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Effect {
+    Model {
+        request: CompletionRequest,
+        turn: usize,
+    },
+    Tools {
+        calls: Vec<PendingToolCall>,
+    },
+    Done(PromptResponse),
+}
+
+/// Advance Rig's pure state machine to the next external operation.
+pub(crate) fn next_effect(
+    agent: &mut AgentRun,
+    options: CompletionOptions,
+) -> Result<Effect, String> {
+    Ok(
+        match agent.next_step().map_err(|error| error.to_string())? {
+            AgentRunStep::CallModel {
+                prompt,
+                history,
+                turn,
+            } => Effect::Model {
+                request: completion_request(prompt, history, options),
+                turn,
+            },
+            AgentRunStep::CallTools { calls } => Effect::Tools { calls },
+            AgentRunStep::Done(response) => Effect::Done(response),
+        },
+    )
+}
+
+impl From<&crate::DurableAgentConfig> for CompletionOptions {
+    fn from(config: &crate::DurableAgentConfig) -> Self {
+        Self {
+            preamble: config.preamble.clone(),
+            tools: config.tools.definitions(),
+            temperature: config.completion.temperature,
+            max_tokens: config.completion.max_tokens,
+            tool_choice: config.completion.tool_choice.clone(),
+            additional_params: config.completion.additional_params.clone(),
+        }
+    }
 }
 
 pub(crate) fn completion_request(

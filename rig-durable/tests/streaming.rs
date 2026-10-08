@@ -29,7 +29,7 @@ async fn run(
         orchestration_registry(DurableAgentConfig {
             tools: catalog,
             completion_mode: CompletionMode::Streaming,
-            completion_retry: retry,
+            completion_retry: retry.into(),
             ..Default::default()
         }),
     )

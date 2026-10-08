@@ -1,9 +1,8 @@
-use std::{collections::BTreeSet, future::Future, pin::Pin, time::Duration};
+use std::{future::Future, pin::Pin, time::Duration};
 
-use duroxide::{Either2, OrchestrationContext, RetryPolicy};
+use duroxide::{Either2, OrchestrationContext};
 use rig::{
-    agent::{AgentRun, AgentRunStep, PendingToolCall, PromptResponse, run::StreamedTurn},
-    completion::{CompletionRequest, ResponseIdentity},
+    agent::{AgentRun, AgentRunStep, PendingToolCall, PromptResponse},
     message::{ToolResultContent, UserContent},
 };
 use serde::{Deserialize, Serialize};
@@ -17,7 +16,7 @@ use crate::{
     names::RuntimeNames,
     outcome::{CallPosition, RetainedOutcomes, ToolOutcome},
     policy::ReplaySafety,
-    streaming::StreamTranscript,
+    streaming::apply as apply_streamed_turn,
     tools::{ToolEntry, ToolRoute},
     types::{AgentInput, ResumedRun},
 };
@@ -211,29 +210,13 @@ impl Engine<'_> {
     ) -> Result<Step, String> {
         let ctx = self.ctx;
         let config = self.config;
-        match agent.next_step().map_err(|error| error.to_string())? {
-            AgentRunStep::CallModel {
-                prompt,
-                history,
-                turn,
-            } => {
+        match driver::next_effect(agent, CompletionOptions::from(config))? {
+            driver::Effect::Model { request, turn } => {
                 cursor.model_turn = turn;
                 set_status(
                     ctx,
                     serde_json::json!({"phase":"model","turn":turn}),
                     decorate,
-                );
-                let request = driver::completion_request(
-                    prompt,
-                    history,
-                    CompletionOptions {
-                        preamble: config.preamble.clone(),
-                        tools: config.tools.definitions(),
-                        temperature: config.completion.temperature,
-                        max_tokens: config.completion.max_tokens,
-                        tool_choice: config.completion.tool_choice.clone(),
-                        additional_params: config.completion.additional_params.clone(),
-                    },
                 );
                 match config.completion_mode {
                     CompletionMode::Blocking => {
@@ -241,7 +224,7 @@ impl Engine<'_> {
                             .schedule_activity_with_retry_typed(
                                 &self.names.completion_activity,
                                 &request,
-                                config.completion_retry.clone(),
+                                config.completion_retry.clone().into(),
                             )
                             .await?;
                         driver::apply_model_turn(agent, turn)?;
@@ -251,7 +234,7 @@ impl Engine<'_> {
                             .schedule_activity_with_retry_typed(
                                 &self.names.streaming_completion_activity,
                                 &request,
-                                config.completion_retry.clone(),
+                                config.completion_retry.clone().into(),
                             )
                             .await?;
                         apply_streamed_turn(agent, &request, transcript)?;
@@ -259,7 +242,7 @@ impl Engine<'_> {
                 }
                 Ok(Step::Continue)
             }
-            AgentRunStep::CallTools { calls } => {
+            driver::Effect::Tools { calls } => {
                 let mut resolved = Vec::with_capacity(calls.len());
                 for (call_index, pending) in calls.into_iter().enumerate() {
                     resolved.push(
@@ -293,7 +276,7 @@ impl Engine<'_> {
                 agent.tool_results(contents).map_err(|e| e.to_string())?;
                 Ok(Step::Continue)
             }
-            AgentRunStep::Done(response) => Ok(Step::Done(Box::new(response))),
+            driver::Effect::Done(response) => Ok(Step::Done(Box::new(response))),
         }
     }
 
@@ -555,64 +538,6 @@ struct ResolvedCall {
     denied: bool,
 }
 
-fn apply_streamed_turn(
-    agent: &mut AgentRun,
-    request: &CompletionRequest,
-    transcript: StreamTranscript,
-) -> Result<(), String> {
-    let executable: BTreeSet<_> = request.tools.iter().map(|tool| tool.name.clone()).collect();
-    let allowed = match request.tool_choice.as_ref() {
-        Some(rig::message::ToolChoice::None) => BTreeSet::new(),
-        Some(rig::message::ToolChoice::Specific { function_names }) => function_names
-            .iter()
-            .filter(|name| executable.contains(*name))
-            .cloned()
-            .collect(),
-        Some(rig::message::ToolChoice::Auto | rig::message::ToolChoice::Required) | None => {
-            executable.clone()
-        }
-    };
-    // A provider may emit tool calls this run cannot execute: a name that is
-    // not registered, or one `tool_choice` does not authorize. Fail the run
-    // rather than silently dropping the call.
-    for content in &transcript.response.choice {
-        if let rig::completion::AssistantContent::ToolCall(call) = content {
-            let name = call.function.name.as_str();
-            if !executable.contains(name) {
-                return Err(format!(
-                    "provider streamed a call to tool `{name}`, which is not registered"
-                ));
-            }
-            if !allowed.contains(name) {
-                return Err(format!(
-                    "provider streamed a call to tool `{name}`, which `tool_choice` does not authorize"
-                ));
-            }
-        }
-    }
-    let response = &transcript.response;
-    agent
-        .record_streamed_completion_call(
-            response.usage,
-            ResponseIdentity {
-                message_id: response.message_id.clone(),
-                response_id: response.response_id.clone(),
-                provider_request_id: response.provider_request_id.clone(),
-            },
-            response.finish_reason(),
-            response.raw.clone(),
-        )
-        .map_err(|error| error.to_string())?;
-    let turn = StreamedTurn {
-        message_id: response.message_id.clone(),
-        choice: response.choice.clone(),
-        executable_tool_names: executable,
-        allowed_tool_names: allowed,
-        finish_reason: response.finish_reason(),
-    };
-    agent.streamed_turn(turn).map_err(|error| error.to_string())
-}
-
 pub(crate) fn should_checkpoint(
     agent: &AgentRun,
     operations: u32,
@@ -730,7 +655,7 @@ async fn schedule_with_retry(
     ctx: &OrchestrationContext,
     name: &str,
     payload: impl Fn(u32) -> Result<String, String>,
-    policy: RetryPolicy,
+    policy: crate::RetryPolicy,
     tag: Option<&str>,
 ) -> Result<String, String> {
     let mut last_error = String::new();

@@ -13,7 +13,7 @@
 //! | Default: `duroxide`, `sqlite` | `DurableAgent::builder` | Embedded Duroxide runtime and SQLite |
 //! | `duroxide` without defaults | `AgentOrchestrator::builder` | Application-supplied Duroxide provider |
 //! | `temporal` without defaults | `temporal::TemporalAgent::new` | Temporal server and activity worker |
-//! | No features | Shared policy, identity, result, and compaction types | No runtime |
+//! | No features | Shared configuration, policy, identity, result, and compaction types | Native and WASM; no runtime |
 //!
 //! Enable `temporal` with the default features to use both backends. Use Rig
 //! 0.43 models and tools directly; an already-built `rig::Agent` cannot be
@@ -123,7 +123,6 @@ pub mod activities;
 pub mod activity_types;
 pub mod approval;
 pub mod compaction;
-#[cfg(feature = "duroxide")]
 pub mod config;
 #[cfg(any(feature = "duroxide", feature = "temporal"))]
 mod driver;
@@ -140,14 +139,13 @@ pub mod policy;
 #[cfg(feature = "duroxide")]
 pub mod registry;
 pub mod result;
+pub mod retry;
 #[cfg(feature = "duroxide")]
 pub mod session;
-#[cfg(feature = "duroxide")]
 pub mod streaming;
 pub mod submission;
 #[cfg(feature = "temporal")]
 pub mod temporal;
-#[cfg(feature = "duroxide")]
 pub mod tools;
 #[cfg(feature = "duroxide")]
 pub mod types;
@@ -163,7 +161,6 @@ pub use compaction::{
     Compaction, CompactionArtifact, CompactionConfig, CompactionRecord, ContextState,
     ModelCompactor, ModelSummary,
 };
-#[cfg(feature = "duroxide")]
 pub use config::{
     ApprovalConfig, CheckpointConfig, CheckpointPolicy, CompletionMode, CompletionSettings,
     DEFAULT_APPROVAL_QUEUE, DurableAgentConfig,
@@ -171,7 +168,7 @@ pub use config::{
 #[cfg(feature = "duroxide")]
 pub use facade::{
     AgentDefinition, AgentOrchestrator, AgentOrchestratorBuilder, AgentOrchestratorError,
-    DurableAgent, DurableAgentBuilder, DurableRun, DurableSession, ToolOptions,
+    DurableAgent, DurableAgentBuilder, DurableRun, DurableSession,
 };
 pub use guard::{InMemoryGuardStore, InvocationGuardStore};
 pub use identity::{AttemptMetadata, LogicalCallKey};
@@ -180,17 +177,17 @@ pub use policy::{MetadataRetention, ReplaySafety, ToolPolicy};
 #[cfg(feature = "duroxide")]
 pub use registry::{activity_registry, orchestration_registry};
 pub use result::{DurableToolResult, InterruptionReason, ToolDisposition};
+pub use retry::RetryPolicy;
 #[cfg(feature = "duroxide")]
 pub use session::{SessionInput, SessionResult};
-#[cfg(feature = "duroxide")]
 pub use streaming::{StreamItem, StreamTranscript};
 pub use submission::{
     Submission, SubmissionError, SubmissionLedger, SubmissionMode, SubmissionState, SubmitInput,
 };
+pub use tools::ToolOptions;
 #[cfg(feature = "duroxide")]
-pub use tools::{
-    ToolCatalog, ToolEntry, ToolRoute, activity_tool, catalog_from_toolset, sub_orchestration_tool,
-};
+pub use tools::sub_orchestration_tool;
+pub use tools::{ToolCatalog, ToolEntry, ToolRoute, activity_tool, catalog_from_toolset};
 #[cfg(feature = "duroxide")]
 pub use types::AgentInput;
 

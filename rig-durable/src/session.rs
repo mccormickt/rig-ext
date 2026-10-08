@@ -427,7 +427,7 @@ async fn run_prompt(
             .schedule_activity_with_retry_typed(
                 &engine.names.compaction_activity,
                 &request,
-                config.completion_retry.clone(),
+                config.completion_retry.clone().into(),
             )
             .await;
         // A round that fails, or that demotes nothing new, leaves the

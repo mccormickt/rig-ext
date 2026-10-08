@@ -1,10 +1,47 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use duroxide::RetryPolicy;
+use crate::retry::RetryPolicy;
 use rig::{completion::ToolDefinition, tool::ToolSet};
 use serde::{Deserialize, Serialize};
 
 use crate::policy::ToolPolicy;
+
+/// Retry, routing, approval, and replay settings for one Rig tool.
+/// Approval pauses execution; it does not make a tool safe to retry.
+#[derive(Clone, Debug, Default)]
+pub struct ToolOptions {
+    pub retry: RetryPolicy,
+    pub tag: Option<String>,
+    pub requires_approval: bool,
+    pub policy: ToolPolicy,
+}
+
+impl ToolOptions {
+    pub fn retry(mut self, retry: impl Into<RetryPolicy>) -> Self {
+        self.retry = retry.into();
+        self
+    }
+
+    pub fn policy(mut self, policy: ToolPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn replay_safety(mut self, safety: crate::ReplaySafety) -> Self {
+        self.policy = self.policy.replay_safety(safety);
+        self
+    }
+
+    pub fn tag(mut self, tag: impl Into<String>) -> Self {
+        self.tag = Some(tag.into());
+        self
+    }
+
+    pub fn require_approval(mut self) -> Self {
+        self.requires_approval = true;
+        self
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -13,10 +50,12 @@ pub enum ToolRoute {
     Activity {
         activity_name: String,
     },
+    #[cfg(feature = "duroxide")]
     SubOrchestration {
         orchestration_name: String,
         version: Option<String>,
     },
+    #[cfg(feature = "duroxide")]
     DurableAgent {
         orchestration_name: String,
         version: String,
@@ -79,7 +118,8 @@ impl ToolCatalog {
     }
 }
 
-pub async fn catalog_from_toolset(toolset: &ToolSet, retry: RetryPolicy) -> ToolCatalog {
+pub async fn catalog_from_toolset(toolset: &ToolSet, retry: impl Into<RetryPolicy>) -> ToolCatalog {
+    let retry = retry.into();
     ToolCatalog(
         toolset
             .tool_definitions()
@@ -105,14 +145,14 @@ pub async fn catalog_from_toolset(toolset: &ToolSet, retry: RetryPolicy) -> Tool
 pub fn activity_tool(
     definition: ToolDefinition,
     activity_name: impl Into<String>,
-    retry: RetryPolicy,
+    retry: impl Into<RetryPolicy>,
 ) -> ToolEntry {
     ToolEntry {
         definition,
         route: ToolRoute::Activity {
             activity_name: activity_name.into(),
         },
-        retry,
+        retry: retry.into(),
         tag: None,
         requires_approval: false,
         policy: ToolPolicy::default(),
@@ -124,6 +164,7 @@ pub fn activity_tool(
 /// The child receives the model arguments as JSON and owns any activity retry
 /// policy needed by its work. Duroxide 0.1.30 does not support parent-side
 /// retries, timeouts, or worker tags for child orchestration calls.
+#[cfg(feature = "duroxide")]
 pub fn sub_orchestration_tool(
     definition: ToolDefinition,
     orchestration_name: impl Into<String>,
@@ -142,6 +183,7 @@ pub fn sub_orchestration_tool(
     }
 }
 
+#[cfg(feature = "duroxide")]
 pub(crate) fn durable_agent_tool(
     definition: ToolDefinition,
     orchestration_name: String,

@@ -1,6 +1,6 @@
 use std::{num::NonZeroU32, time::Duration};
 
-use duroxide::{BackoffStrategy, RetryPolicy};
+use crate::retry::{BackoffStrategy, RetryPolicy};
 use rig::{completion::ToolDefinition, message::ToolChoice};
 use serde::{Deserialize, Serialize};
 
@@ -38,7 +38,7 @@ pub enum CheckpointPolicy {
 /// Each completed model activity or tool batch counts as one operation.
 /// The checkpoint retains agent state, usage, and pending decisions; it does
 /// not shrink the conversation payload. Pass this value to
-/// [`crate::DurableAgentBuilder::checkpoint`].
+/// `DurableAgentBuilder::checkpoint` with the `duroxide` feature.
 ///
 /// ```
 /// use std::num::NonZeroU32;
@@ -251,7 +251,7 @@ pub struct ToolSnapshot {
     pub policy: ToolPolicy,
 }
 
-/// Serializable form of Duroxide's [`RetryPolicy`].
+/// Serializable retry settings, with durations in milliseconds.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RetrySnapshot {
     pub max_attempts: u32,

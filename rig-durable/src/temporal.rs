@@ -71,7 +71,7 @@ use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use rig::{
     DynModel,
-    agent::{AgentRun, AgentRunStep, PromptResponse},
+    agent::{AgentRun, PromptResponse},
     completion::{CompletionRequest, Message, ToolDefinition},
     message::{ToolChoice, UserContent},
     operation::Completion,
@@ -1390,32 +1390,24 @@ where
     let mut model_turn = 0;
 
     loop {
-        match agent.next_step().map_err(workflow_error)? {
-            AgentRunStep::CallModel {
-                prompt,
-                history,
-                turn,
-            } => {
+        let options = CompletionOptions {
+            preamble: config.preamble.clone(),
+            tools: config
+                .tools
+                .iter()
+                .map(|tool| tool.definition.clone())
+                .collect(),
+            temperature: config.temperature,
+            max_tokens: config.max_tokens,
+            tool_choice: config.tool_choice.clone(),
+            additional_params: config.additional_params.clone(),
+        };
+        match driver::next_effect(&mut agent, options).map_err(workflow_error)? {
+            driver::Effect::Model { request, turn } => {
                 model_turn = turn;
                 ctx.state_mut(|workflow| {
                     workflow.runtime_mut().status = TemporalAgentStatus::Model { turn }
                 });
-                let request = driver::completion_request(
-                    prompt,
-                    history,
-                    CompletionOptions {
-                        preamble: config.preamble.clone(),
-                        tools: config
-                            .tools
-                            .iter()
-                            .map(|tool| tool.definition.clone())
-                            .collect(),
-                        temperature: config.temperature,
-                        max_tokens: config.max_tokens,
-                        tool_choice: config.tool_choice.clone(),
-                        additional_params: config.additional_params.clone(),
-                    },
-                );
                 let turn = ctx
                     .execute_activity(
                         TemporalActivities::complete,
@@ -1425,7 +1417,7 @@ where
                     .await?;
                 driver::apply_model_turn(&mut agent, turn).map_err(workflow_error)?;
             }
-            AgentRunStep::CallTools { calls } => {
+            driver::Effect::Tools { calls } => {
                 ctx.state_mut(|workflow| {
                     workflow.runtime_mut().status =
                         TemporalAgentStatus::Tools { count: calls.len() }
@@ -1487,7 +1479,7 @@ where
                 ctx.state_mut(|workflow| workflow.runtime_mut().outcomes.extend(outcomes));
                 agent.tool_results(results).map_err(workflow_error)?;
             }
-            AgentRunStep::Done(response) => {
+            driver::Effect::Done(response) => {
                 let history = agent.full_history();
                 ctx.state_mut(|workflow| workflow.record_history(history.clone()))
                     .map_err(workflow_error)?;

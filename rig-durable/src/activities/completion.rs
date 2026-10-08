@@ -2,9 +2,7 @@ use std::collections::BTreeSet;
 
 use rig::{DynModel, completion::CompletionRequest, message::ToolChoice, operation::Completion};
 
-#[cfg(feature = "duroxide")]
 use crate::streaming::{StreamItem, StreamTranscript};
-#[cfg(feature = "duroxide")]
 use futures::StreamExt;
 
 /// Execute a provider request and retain the exact tool authorization sets
@@ -45,7 +43,6 @@ pub async fn complete(
 
 /// Consume the provider stream to EOF inside one activity. The transcript is
 /// not visible to orchestration until this activity completes.
-#[cfg(feature = "duroxide")]
 pub async fn stream(
     model: &DynModel<Completion>,
     request: CompletionRequest,

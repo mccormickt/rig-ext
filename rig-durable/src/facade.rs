@@ -5,7 +5,7 @@ use std::{
 };
 
 use duroxide::{
-    Client, ClientError, OrchestrationStatus, RetryPolicy,
+    Client, ClientError, OrchestrationStatus,
     providers::Provider,
     runtime::{
         Runtime, RuntimeOptions,
@@ -25,7 +25,7 @@ use thiserror::Error;
 
 use crate::{
     AgentInput, ApprovalDecision, ApprovalRequest, CheckpointConfig, CompletionMode,
-    CompletionSettings, DurableAgentConfig, InvocationContract,
+    CompletionSettings, DurableAgentConfig, InvocationContract, RetryPolicy, ToolOptions,
     activities::tool::ToolExecutor,
     compaction::Compaction,
     config::ConfigSnapshot,
@@ -33,7 +33,7 @@ use crate::{
     names::RuntimeNames,
     orchestration::{RUN_RESULT_KEY, STEERING_QUEUE_NAME, SteeringCommand, check_route_policy},
     outcome::DurableResponse,
-    policy::{ReplaySafety, ToolPolicy},
+    policy::ToolPolicy,
     registry::{activity_registry_with_names, orchestration_registry_with_names},
     session::{
         SESSION_INBOX_QUEUE, SESSION_LEDGER_KEY, SESSION_REJECTIONS_KEY, SessionCommand,
@@ -109,47 +109,6 @@ pub enum AgentOrchestratorError {
     #[cfg(feature = "sqlite")]
     #[error("failed to open SQLite provider: {0}")]
     Sqlite(String),
-}
-
-/// Duroxide retry, routing, approval, and replay settings for one Rig tool.
-///
-/// Pass these settings to [`DurableAgentBuilder::tool_with`]. Approval pauses
-/// before execution; it does not make a tool safe to retry.
-#[derive(Clone, Debug, Default)]
-pub struct ToolOptions {
-    pub retry: RetryPolicy,
-    pub tag: Option<String>,
-    pub requires_approval: bool,
-    /// Replay safety, implementation version, and metadata retention. Any
-    /// setting other than the default requires [`InvocationContract::Logical`].
-    pub policy: ToolPolicy,
-}
-
-impl ToolOptions {
-    pub fn retry(mut self, retry: RetryPolicy) -> Self {
-        self.retry = retry;
-        self
-    }
-
-    pub fn policy(mut self, policy: ToolPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
-
-    pub fn replay_safety(mut self, safety: ReplaySafety) -> Self {
-        self.policy = self.policy.replay_safety(safety);
-        self
-    }
-
-    pub fn tag(mut self, tag: impl Into<String>) -> Self {
-        self.tag = Some(tag.into());
-        self
-    }
-
-    pub fn require_approval(mut self) -> Self {
-        self.requires_approval = true;
-        self
-    }
 }
 
 #[derive(Clone)]
@@ -252,7 +211,7 @@ impl DurableAgentBuilder {
     }
 
     /// Supply the store that tools with
-    /// [`ReplaySafety::InterruptOnUncertain`] claim and settle against.
+    /// [`crate::ReplaySafety::InterruptOnUncertain`] claim and settle against.
     pub fn invocation_guard(mut self, store: Arc<dyn InvocationGuardStore>) -> Self {
         self.guard = Some(store);
         self
@@ -295,8 +254,8 @@ impl DurableAgentBuilder {
         self
     }
 
-    pub fn completion_retry(mut self, retry: RetryPolicy) -> Self {
-        self.config.completion_retry = retry;
+    pub fn completion_retry(mut self, retry: impl Into<RetryPolicy>) -> Self {
+        self.config.completion_retry = retry.into();
         self
     }
 
