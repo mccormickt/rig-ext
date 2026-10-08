@@ -1,14 +1,15 @@
 //! Rig storage integrations for Rust Workers running on celld.
 //!
-//! Common memory contracts do not select a storage backend. Enable the
-//! `sqlite-vec` Cargo feature together with celld's `sqlite_vec` Wrangler
-//! compatibility flag to use [`SqliteVecIndex`].
+//! Common memory contracts do not select a storage backend. Enable `storage`
+//! for `CellStorage` on Cloudflare or celld SQLite Durable Objects. Enable
+//! `sqlite-vec` together with celld's `sqlite_vec` Wrangler compatibility flag
+//! to use `SqliteVecIndex`.
 
 mod capabilities;
 mod memory;
 mod vector;
 
-#[cfg(feature = "sqlite-vec")]
+#[cfg(feature = "storage")]
 mod storage;
 #[cfg(feature = "sqlite-vec")]
 mod vector_store;
@@ -22,7 +23,7 @@ pub use memory::{
 };
 pub use vector::VectorError;
 
-#[cfg(feature = "sqlite-vec")]
+#[cfg(feature = "storage")]
 pub use storage::CellStorage;
 #[cfg(feature = "sqlite-vec")]
 pub use vector_store::{

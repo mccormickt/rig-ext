@@ -7,7 +7,8 @@
 | Cargo features | Contents | Native | WASM runtime requirement |
 | --- | --- | --- | --- |
 | none | Memory models, logical cursors, backend contract, and capability types | Supported | No Workers binding |
-| `sqlite-vec` | `SqliteVecIndex<M>`, Rig `VectorStoreIndex`, Rig `InsertDocuments`, and `CellStorage` | Compiles for tests | celld 0.6.0 or later with the Wrangler `sqlite_vec` compatibility flag |
+| `storage` | `CellStorage`, SQL access, and synchronous transactions | Compiles for tests | Cloudflare or celld SQLite Durable Objects |
+| `sqlite-vec` | Includes `storage`; `SqliteVecIndex<M>`, Rig `VectorStoreIndex`, and Rig `InsertDocuments` | Compiles for tests | celld 0.6.0 or later with the Wrangler `sqlite_vec` compatibility flag |
 
 ## Configure celld
 
@@ -126,4 +127,4 @@ The examples are architecture references. Add authentication, history compaction
 
 ## Portability
 
-This implementation is specific to celld. Cloudflare Durable Object SQLite does not allow the `sqlite-vec` extension or the `vec0` virtual table. The remaining Rig agent code can use another `VectorStoreIndex` on Cloudflare.
+The `storage` feature works on Cloudflare and celld without a compatibility flag. The `sqlite-vec` adapter is specific to celld. Cloudflare Durable Object SQLite does not allow the `sqlite-vec` extension or the `vec0` virtual table. The remaining Rig agent code can use another `VectorStoreIndex` on Cloudflare.

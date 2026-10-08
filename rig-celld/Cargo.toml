@@ -14,7 +14,8 @@ worker = { workspace = true, optional = true }
 
 [features]
 default = []
-sqlite-vec = ["dep:worker"]
+storage = ["dep:worker"]
+sqlite-vec = ["storage"]
 
 [lints]
 workspace = true
