@@ -105,7 +105,7 @@ impl DurableObject for AgentCell {
             .chat(input.prompt.clone(), &mut history)
             .await
             .map_err(to_worker_error)?
-            .output;
+            .output();
         // Other requests to this agent can commit turns while this one waits
         // for the provider. Append only the messages of this turn, so a
         // concurrent turn is not overwritten.

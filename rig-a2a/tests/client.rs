@@ -446,7 +446,7 @@ async fn agent_calls_remote_agent(binding: StubBinding) {
         .await
         .expect("client should fetch card");
     let agent_name = remote.agent_name().to_string();
-    let remote_tool = remote.agent().build().into_tool();
+    let remote_tool = remote.agent().build().into_tool().expect("named agent");
 
     let model = MockCompletionModel::from_turns([
         MockTurn::tool_call(
@@ -553,18 +553,7 @@ async fn request_context_threads_to_remote_and_response() {
 // ---------------------------------------------------------------------------
 
 fn text_request(prompt: &str) -> CompletionRequest {
-    CompletionRequest {
-        model: None,
-        chat_history: vec![RigMessage::user(prompt)],
-        documents: vec![],
-        tools: vec![],
-        temperature: None,
-        max_tokens: None,
-        tool_choice: None,
-        additional_params: None,
-        output_schema: None,
-        record_telemetry_content: false,
-    }
+    CompletionRequest::new(prompt)
 }
 
 /// Every text part of a recorded inbound message, in order.
@@ -819,7 +808,7 @@ async fn model_completes_against_the_remote_agent() {
         .await
         .expect("completion should succeed");
 
-    assert_eq!(response.provider, "a2a");
+    assert_eq!(response.provider(), "a2a");
     let text = match response.choice.first() {
         Some(rig_core::completion::AssistantContent::Text(text)) => text.text.clone(),
         other => panic!("expected text, got {other:?}"),
@@ -848,7 +837,7 @@ async fn model_rejects_requests_a2a_cannot_carry() {
 
     let mut with_tools = text_request("hi");
     with_tools.tools.push(ToolDefinition {
-        name: "add".to_string(),
+        name: rig_core::message::ToolName::new("add").expect("non-empty tool name"),
         description: "adds".to_string(),
         parameters: serde_json::json!({}),
     });
@@ -1151,6 +1140,86 @@ async fn artifact_after_a_pause_keeps_the_resumable_task_id() {
     server.abort();
 }
 
+/// Acceptance is caller-owned, while both unary and streamed pauses retain
+/// their distinct reason and the identifiers needed to resume.
+#[tokio::test]
+async fn input_required_uses_the_callers_finish_policy_and_resumes() {
+    use rig_core::completion::FinishReason;
+    use rig_core::message::StopReason;
+
+    let (addr, recorded, server) = serve_script(
+        "pauser",
+        &["ask"],
+        [
+            StubReply::InputRequired {
+                prompt: "which file?".into(),
+            },
+            StubReply::InputRequired {
+                prompt: "which file?".into(),
+            },
+            StubReply::InputRequired {
+                prompt: "which file?".into(),
+            },
+            StubReply::CompletedText("done".into()),
+            StubReply::failed("quota exceeded"),
+        ],
+        StubBinding::JsonRpc,
+    )
+    .await;
+    let remote = A2AClient::from_url(format!("http://{addr}")).await.unwrap();
+    let model = remote.model_for_conversation("policy");
+    let rejected = model.completion(text_request("start")).await.unwrap();
+    assert_eq!(
+        rejected.finish_reason(),
+        Some(FinishReason::Other("input_required".into()))
+    );
+    assert!(matches!(rejected.stop(), StopReason::Error(_)));
+
+    let accepted = model
+        .stream(text_request("continue").accept_unknown_finish_reasons(true))
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!(accepted.finish_reason(), rejected.finish_reason());
+    assert_eq!(accepted.stop(), StopReason::Stop);
+
+    let agent = remote.agent_for_conversation("policy").build();
+    let reply = agent
+        .prompt("continue")
+        .accept_unknown_finish_reasons(true)
+        .await
+        .unwrap();
+    assert_eq!(reply.output(), "which file?");
+    assert_eq!(agent.prompt("README.md").await.unwrap().output(), "done");
+    assert!(
+        agent
+            .prompt("again")
+            .accept_unknown_finish_reasons(true)
+            .await
+            .is_err()
+    );
+    let messages = recorded.lock().unwrap();
+    assert_eq!(messages.len(), 5);
+    assert!(messages[1].message.context_id.is_some());
+    for turn in 1..4 {
+        assert_eq!(
+            messages[turn].message.context_id,
+            messages[1].message.context_id
+        );
+        assert!(
+            messages[turn].message.task_id.is_some(),
+            "paused task resumes"
+        );
+    }
+    assert!(
+        messages[4].message.task_id.is_none(),
+        "completion clears task"
+    );
+    drop(messages);
+    server.abort();
+}
+
 /// The leading system message is standing context. It goes out once, not a
 /// second time as rendered history.
 #[tokio::test]
@@ -1316,7 +1385,7 @@ async fn a2a_backed_agent_becomes_a_sub_agent_tool() {
         MockTurn::text("relayed"),
     ]);
     let orchestrator = AgentBuilder::new(model.clone())
-        .dynamic_tool(sub_agent.into_tool())
+        .dynamic_tool(sub_agent.into_tool().expect("named agent"))
         .build();
 
     let out = orchestrator

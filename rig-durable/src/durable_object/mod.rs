@@ -211,11 +211,7 @@ impl Builder {
         self.tool_with(tool, ToolOptions::default())
     }
     pub fn tool_with<T: Tool + 'static>(mut self, tool: T, options: ToolOptions) -> Self {
-        let definition = rig::completion::ToolDefinition {
-            name: T::NAME.into(),
-            description: tool.description(),
-            parameters: tool.parameters(),
-        };
+        let definition = rig::tool::tool_definition(&tool);
         self.tools.add_tool(tool);
         self.config.tools.insert(ToolEntry {
             definition,
@@ -767,7 +763,9 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                             },
                             policy: Some(entry.policy.clone()),
                         };
-                        let digest = crate::identity::arguments_digest(&call.function.arguments)?;
+                        let digest = crate::identity::arguments_digest(
+                            &serde_json::Value::Object(call.function.arguments.clone()),
+                        )?;
                         self.save_call(
                             &key.canonical(),
                             &Call {

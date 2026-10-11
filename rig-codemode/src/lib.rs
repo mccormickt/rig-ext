@@ -11,12 +11,12 @@
 //!
 //! # Add the crate
 //!
-//! Enable `quickjs` to run scripts. Use Rig 0.43 for compatible tool types.
+//! Enable `quickjs` to run scripts. Use Rig 0.44 for compatible tool types.
 //!
 //! ```toml
 //! [dependencies]
 //! rig-codemode = { version = "0.1", features = ["quickjs"] }
-//! rig-core = { version = "0.43", default-features = false }
+//! rig-core = { version = "0.44", default-features = false }
 //! serde_json = "1"
 //! tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 //! ```
@@ -36,7 +36,7 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let echo = DynamicTool::new(
-//!         "echo",
+//!         rig_core::message::ToolName::new("echo")?,
 //!         "Return the supplied object",
 //!         serde_json::json!({"type": "object"}),
 //!         |args| Box::pin(async move { Ok(ToolOutput::json(args)) }),
@@ -118,7 +118,7 @@
 //! - `quickjs`: the native QuickJS backend. Without a backend feature the
 //!   crate builds catalog and contract code but [`CodeModeBuilder::build`]
 //!   fails with [`BuildError::NoBackend`]. A native C compiler is required.
-//! - `mcp`: catalog entries and output-schema validation for `rig-rmcp` 0.43
+//! - `mcp`: catalog entries and output-schema validation for `rig-rmcp` 0.44
 //!   tools. Enable both `quickjs` and `mcp` to execute MCP-backed scripts.
 
 #![forbid(unsafe_code)]
@@ -142,6 +142,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use rig_core::message::{EmptyToolName, ToolName};
 use rig_core::tool::{DynamicTool, ToolContext, ToolExecutionError, ToolOutput};
 
 pub use analysis::{ScriptAnalysis, analyze};
@@ -208,6 +209,9 @@ pub enum BuildError {
         "catalog entry {0:?} has the code-mode tool's own name; recursive code mode is not allowed"
     )]
     RecursiveTool(String),
+    /// The outer tool name is empty.
+    #[error(transparent)]
+    ToolName(#[from] EmptyToolName),
     /// The host limits are invalid.
     #[error(transparent)]
     Limits(#[from] LimitsError),
@@ -386,6 +390,7 @@ impl CodeModeBuilder {
         if self.catalog.contains(&self.tool_name) {
             return Err(BuildError::RecursiveTool(self.tool_name));
         }
+        let tool_name = ToolName::new(self.tool_name)?;
         let backend = match (self.backend, Backend::COMPILED) {
             (Some(backend), _) => backend,
             (None, []) => return Err(BuildError::NoBackend),
@@ -399,7 +404,7 @@ impl CodeModeBuilder {
                 script_policy: self.script_policy,
                 limits: self.limits,
                 backend,
-                tool_name: self.tool_name,
+                tool_name,
                 declaration_bytes: self.declaration_bytes,
             }),
         })
@@ -412,7 +417,7 @@ struct Inner {
     script_policy: Option<Arc<dyn ScriptPolicy>>,
     limits: Limits,
     backend: Backend,
-    tool_name: String,
+    tool_name: ToolName,
     declaration_bytes: usize,
 }
 
@@ -566,7 +571,7 @@ impl CodeMode {
     ///
     /// # Register with a Rig agent
     ///
-    /// Add `rig = "0.43"` with its default features to use `AgentBuilder` and
+    /// Add `rig = "0.44"` with its default features to use `AgentBuilder` and
     /// the OpenAI client. This example accepts the configured executor from
     /// the [crate-level example](crate). It needs `OPENAI_API_KEY` at runtime.
     ///
@@ -582,7 +587,7 @@ impl CodeMode {
     ///     let response = agent
     ///         .prompt("Use codemode to call echo with a greeting, then show the greeting.")
     ///         .await?;
-    ///     Ok(response.output)
+    ///     Ok(response.output())
     /// }
     /// ```
     pub fn tool(&self) -> DynamicTool {
@@ -661,6 +666,15 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(matches!(error, BuildError::RecursiveTool(name) if name == "codemode"));
+    }
+
+    #[test]
+    fn rejects_empty_outer_tool_name() {
+        let error = CodeMode::builder(Catalog::default(), Arc::new(Never))
+            .tool_name("")
+            .build()
+            .unwrap_err();
+        assert!(matches!(error, BuildError::ToolName(_)));
     }
 
     #[cfg(not(feature = "quickjs"))]

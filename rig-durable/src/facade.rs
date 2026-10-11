@@ -305,7 +305,7 @@ impl DurableAgentBuilder {
 
     /// Add an advanced activity or workflow-backed tool entry.
     pub fn routed_tool(mut self, entry: ToolEntry) -> Result<Self, AgentOrchestratorError> {
-        let name = entry.definition.name.clone();
+        let name = entry.definition.name.to_string();
         if self.tools.contains(&name) || self.routed_tools.get(&name).is_some() {
             return Err(AgentOrchestratorError::DuplicateTool(name));
         }
@@ -352,7 +352,9 @@ impl DurableAgentBuilder {
         let child_metadata = child.metadata.clone();
         self.routed_tools.insert(durable_agent_tool(
             ToolDefinition {
-                name: tool_name,
+                name: rig::message::ToolName::new(tool_name).map_err(|error| {
+                    AgentOrchestratorError::InvalidToolPolicy(error.to_string())
+                })?,
                 description: child_metadata.description,
                 parameters: serde_json::json!({
                     "type": "object",
@@ -373,11 +375,13 @@ impl DurableAgentBuilder {
     pub fn build(mut self) -> Result<AgentDefinition, AgentOrchestratorError> {
         for definition in self.tools.tool_definitions() {
             if self.routed_tools.get(&definition.name).is_some() {
-                return Err(AgentOrchestratorError::DuplicateTool(definition.name));
+                return Err(AgentOrchestratorError::DuplicateTool(
+                    definition.name.to_string(),
+                ));
             }
             let options = self
                 .tool_options
-                .remove(&definition.name)
+                .remove(definition.name.as_str())
                 .unwrap_or_default();
             self.routed_tools.insert(ToolEntry {
                 definition,
@@ -390,17 +394,17 @@ impl DurableAgentBuilder {
         }
         self.config.tools = self.routed_tools;
         for entry in self.config.tools.0.values() {
-            let name = &entry.definition.name;
+            let name = entry.definition.name.as_str();
             if self.config.contract == InvocationContract::Legacy
                 && entry.policy != ToolPolicy::default()
             {
                 return Err(AgentOrchestratorError::InvocationContractRequired(
-                    name.clone(),
+                    name.to_owned(),
                 ));
             }
             check_route_policy(entry, name).map_err(AgentOrchestratorError::InvalidToolPolicy)?;
             if entry.policy.safety().requires_guard() && self.guard.is_none() {
-                return Err(AgentOrchestratorError::GuardStoreRequired(name.clone()));
+                return Err(AgentOrchestratorError::GuardStoreRequired(name.to_owned()));
             }
         }
 
@@ -676,7 +680,7 @@ impl DurableAgent {
         &self,
         prompt: impl Into<Message>,
     ) -> Result<String, AgentOrchestratorError> {
-        Ok(self.start(prompt).await?.wait().await?.output)
+        Ok(self.start(prompt).await?.wait().await?.output())
     }
 
     pub async fn start(

@@ -215,8 +215,8 @@ async fn temporal_session_accepts_multiple_prompts_and_closes() {
     let (worker_result, (first, second, result)) = tokio::join!(worker.run(), run);
 
     worker_result.unwrap();
-    assert_eq!(first.output, "first answer");
-    assert_eq!(second.output, "second answer");
+    assert_eq!(first.output(), "first answer");
+    assert_eq!(second.output(), "second answer");
     assert_eq!(result.history.len(), 4);
 }
 
@@ -266,7 +266,7 @@ async fn temporal_server_executes_model_and_tool_activities() {
     let (worker_result, response) = tokio::join!(worker.run(), run);
 
     worker_result.unwrap();
-    assert_eq!(response.output, "The answer is 42.");
+    assert_eq!(response.output(), "The answer is 42.");
 }
 
 #[tokio::test]
@@ -314,7 +314,7 @@ async fn temporal_retries_tools_with_stable_invocation_identity() {
     let (worker_result, response) = tokio::join!(worker.run(), run);
 
     worker_result.unwrap();
-    assert_eq!(response.output, "available");
+    assert_eq!(response.output(), "available");
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     let invocations = invocations.lock().unwrap();
     assert_eq!(invocations.len(), 2);
@@ -511,8 +511,8 @@ async fn temporal_approval_executes_only_approved_tools() {
     let (worker_result, (approved, denied)) = tokio::join!(worker.run(), run);
 
     worker_result.unwrap();
-    assert_eq!(approved.output, "approved");
-    assert_eq!(denied.output, "denied");
+    assert_eq!(approved.output(), "approved");
+    assert_eq!(denied.output(), "denied");
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
@@ -675,7 +675,7 @@ async fn temporal_session_serializes_updates_and_drains_active_steering_on_close
     let (worker_result, (response, result)) = tokio::join!(worker.run(), run);
 
     worker_result.unwrap();
-    assert_eq!(response.output, "steered answer");
+    assert_eq!(response.output(), "steered answer");
     assert_eq!(result.history.len(), 6);
 }
 
@@ -886,7 +886,7 @@ async fn temporal_guarded_write_is_not_repeated_after_an_uncertain_attempt() {
     let (worker_result, (run_id, response)) = tokio::join!(worker.run(), run);
 
     worker_result.unwrap();
-    assert_eq!(response.output, "finished");
+    assert_eq!(response.output(), "finished");
     assert_eq!(ledger.lock().unwrap().len(), 1, "one external effect");
     let key = LogicalCallKey {
         logical_execution_id: format!("temporal:{}:{namespace}:{run_id}", namespace.len()),
@@ -954,7 +954,7 @@ async fn temporal_idempotent_write_keeps_its_key_across_retries() {
     let (worker_result, response) = tokio::join!(worker.run(), run);
 
     worker_result.unwrap();
-    assert_eq!(response.output, "finished");
+    assert_eq!(response.output(), "finished");
     assert_eq!(ledger.lock().unwrap().len(), 1, "retries reuse one key");
 }
 
@@ -1310,7 +1310,7 @@ async fn queued_prompts_and_steering_compact_before_each_next_prompt() {
             .await
             .unwrap();
         release.notify_one();
-        assert_eq!(active.await.unwrap().output, "answer 2");
+        assert_eq!(active.await.unwrap().output(), "answer 2");
         for result in pending.await {
             assert_eq!(result.unwrap().submission.state, SubmissionState::Answered);
         }
@@ -1370,7 +1370,11 @@ async fn a_reused_workflow_id_has_a_new_guard_identity() {
                 .await
                 .unwrap();
             assert_eq!(
-                handle.get_result(Default::default()).await.unwrap().output,
+                handle
+                    .get_result(Default::default())
+                    .await
+                    .unwrap()
+                    .output(),
                 answer
             );
         }
@@ -1390,7 +1394,7 @@ async fn prompt(handle: &SessionHandle, text: &str) -> String {
         )
         .await
         .unwrap()
-        .output
+        .output()
 }
 
 async fn close(handle: &SessionHandle) -> rig_durable::temporal::TemporalAgentSessionResult {
@@ -1418,12 +1422,15 @@ fn update_failure_message(error: &WorkflowUpdateError) -> String {
 fn user_texts(messages: &[Message]) -> Vec<String> {
     messages
         .iter()
-        .filter_map(|message| match message {
-            Message::User { content } => content.iter().find_map(|item| match item {
-                UserContent::Text(text) => Some(text.text.clone()),
-                _ => None,
-            }),
-            _ => None,
+        .flat_map(|message| match message {
+            Message::User { content } => content
+                .iter()
+                .filter_map(|item| match item {
+                    UserContent::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
         })
         .collect()
 }
@@ -1432,8 +1439,8 @@ fn has_tool_call(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
         matches!(
             message,
-            Message::Assistant { content, .. }
-                if content.iter().any(|item| matches!(item, AssistantContent::ToolCall(_)))
+            Message::Assistant(assistant)
+                if assistant.content.iter().any(|item| matches!(item, AssistantContent::ToolCall(_)))
         )
     })
 }
@@ -1652,11 +1659,16 @@ async fn temporal_compaction_keeps_the_request_canonical_and_the_transcript_comp
         summary_a.chat_history.first(),
         Some(Message::System { .. })
     ));
-    assert_eq!(summary_a.chat_history.len(), 5);
-    assert!(has_tool_call(&summary_a.chat_history));
+    assert_eq!(summary_a.chat_history.len(), 4);
+    // Rig adapts unadvertised tool exchanges into text for summarization.
+    assert!(
+        serde_json::to_string(&summary_a.chat_history)
+            .unwrap()
+            .contains("called tool add")
+    );
     assert_eq!(
         user_texts(&summary_a.chat_history[1..]),
-        ["one", SUMMARY_PROMPT]
+        ["one", "[tool add result] 3", SUMMARY_PROMPT]
     );
 
     let second = &requests[3];
@@ -1680,7 +1692,7 @@ async fn temporal_compaction_keeps_the_request_canonical_and_the_transcript_comp
 
     let third = &requests[5];
     rig::transcript::validate_canonical(&third.chat_history).unwrap();
-    assert_eq!(third.chat_history.len(), 4);
+    assert_eq!(third.chat_history.len(), 3);
     assert_eq!(
         user_texts(&third.chat_history),
         [
@@ -1912,7 +1924,7 @@ async fn temporal_single_run_exposes_ordered_dispositions() {
     };
     let (worker_result, (response, outcomes)) = tokio::join!(worker.run(), run);
     worker_result.unwrap();
-    assert_eq!(response.output, "done");
+    assert_eq!(response.output(), "done");
     assert_dispositions(&outcomes);
     assert!(outcomes.iter().all(|o| o.prompt_index == 0));
 }

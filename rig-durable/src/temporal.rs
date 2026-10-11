@@ -55,7 +55,7 @@
 //!         WorkflowStartOptions::new("rig-assistant", "report-42").build(),
 //!     ).await?;
 //!     let response = handle.get_result(WorkflowGetResultOptions::default()).await?;
-//!     println!("{}", response.output);
+//!     println!("{}", response.output());
 //!     Ok(())
 //! }
 //! ```
@@ -1308,14 +1308,16 @@ impl TemporalAgent {
     /// It fails closed when a tool policy needs a contract or guard store the agent lacks.
     pub fn register(self, options: &mut WorkerOptions) -> Result<(), TemporalAgentError> {
         for tool in &self.config.tools {
-            let name = &tool.definition.name;
+            let name = tool.definition.name.as_str();
             if self.config.contract == InvocationContract::Legacy
                 && tool.policy != ToolPolicy::default()
             {
-                return Err(TemporalAgentError::InvocationContractRequired(name.clone()));
+                return Err(TemporalAgentError::InvocationContractRequired(
+                    name.to_owned(),
+                ));
             }
             if tool.policy.safety().requires_guard() && self.guard.is_none() {
-                return Err(TemporalAgentError::GuardStoreRequired(name.clone()));
+                return Err(TemporalAgentError::GuardStoreRequired(name.to_owned()));
             }
         }
         options.register_workflow::<TemporalAgentWorkflow>()?;
@@ -1324,7 +1326,7 @@ impl TemporalAgent {
             .config
             .tools
             .iter()
-            .map(|tool| (tool.definition.name.clone(), tool.policy.clone()));
+            .map(|tool| (tool.definition.name.to_string(), tool.policy.clone()));
         options.register_activities(TemporalActivities {
             model: self.model,
             tools: ToolExecutor::new(self.tools)

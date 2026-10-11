@@ -8,9 +8,9 @@ The crate owns script execution, tool discovery, and bounded results. The host o
 
 | Cargo features | Contents | Build requirement |
 | --- | --- | --- |
-| none | `Catalog`, `Limits`, `ExecutionReport`, `HostDispatcher`, `DynamicToolDispatcher`, `ScriptPolicy`, `analyze`. `CodeMode::builder().build()` returns `BuildError::NoBackend`. | Rust 1.95+ (the `rig-core` 0.43 MSRV) |
+| none | `Catalog`, `Limits`, `ExecutionReport`, `HostDispatcher`, `DynamicToolDispatcher`, `ScriptPolicy`, `analyze`. `CodeMode::builder().build()` returns `BuildError::NoBackend`. | Rust 1.95+ (the `rig-core` 0.44 MSRV) |
 | `quickjs` | Native QuickJS backend through `rquickjs` 0.14, one worker thread per script | A C compiler for QuickJS; native targets only |
-| `mcp` | `CatalogEntry::from_mcp_definition` and `mcp::OutputSchemaValidator` for `rig-rmcp` tools | `rig-rmcp` 0.43, `jsonschema` 0.58 |
+| `mcp` | `CatalogEntry::from_mcp_definition` and `mcp::OutputSchemaValidator` for `rig-rmcp` tools | `rig-rmcp` 0.44, `jsonschema` 0.58 |
 
 Enabling `mcp` does not change dispatch or permissions for non-MCP tools. The builder never selects a backend by feature precedence: with several backends compiled, call `CodeModeBuilder::backend`.
 
@@ -37,7 +37,7 @@ Two `rquickjs` facts shaped the implementation. `set_memory_limit` is only effec
 
 ## Use
 
-The crate's rustdocs contain checked examples for direct execution, Rig 0.43 agent registration, typed context, policies, limits, reports, discovery, and MCP integration. Build them with:
+The crate's rustdocs contain checked examples for direct execution, Rig 0.44 agent registration, typed context, policies, limits, reports, discovery, and MCP integration. Build them with:
 
 ```sh
 cargo doc -p rig-codemode --no-deps --features quickjs,mcp --open
@@ -157,6 +157,6 @@ cargo test -p rig-codemode --features quickjs,mcp   # plus the fake rmcp server
 
 ## Not in this release
 
-- **Agent-hook adapter (design stage 3).** `rig-agent` 0.43 keeps `dispatch_tool_call` crate-private, so nested calls cannot reuse an agent runner's hooks. `codemode.tool()` works as an ordinary agent tool, but nested calls pass only through the `HostDispatcher` you supply. Keep per-call policy in the dispatcher and script-level policy in a `ScriptPolicy`.
+- **Agent-hook adapter (design stage 3).** `rig-agent` 0.44 keeps `dispatch_tool_call` crate-private, so nested calls cannot reuse an agent runner's hooks. `codemode.tool()` works as an ordinary agent tool, but nested calls pass only through the `HostDispatcher` you supply. Keep per-call policy in the dispatcher and script-level policy in a `ScriptPolicy`.
 - Small-value store, image helpers, and raw provider source grammar.
 - A WASM-hosted guest (option A) or a process sandbox (option E).

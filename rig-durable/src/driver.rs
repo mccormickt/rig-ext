@@ -77,18 +77,14 @@ pub(crate) fn completion_request(
         history.insert(0, Message::system(preamble));
     }
     history.push(prompt);
-    CompletionRequest {
-        model: None,
-        chat_history: history,
-        documents: Vec::new(),
-        tools: options.tools,
-        temperature: options.temperature,
-        max_tokens: options.max_tokens,
-        tool_choice: options.tool_choice,
-        additional_params: options.additional_params,
-        output_schema: None,
-        record_telemetry_content: false,
-    }
+    let mut request = CompletionRequest::new("");
+    request.chat_history = history;
+    request.tools = options.tools;
+    request.temperature = options.temperature;
+    request.max_tokens = options.max_tokens;
+    request.tool_choice = options.tool_choice;
+    request.additional_params = options.additional_params;
+    request
 }
 
 pub(crate) fn apply_model_turn(agent: &mut AgentRun, turn: ModelTurn) -> Result<(), String> {
@@ -112,7 +108,7 @@ pub(crate) fn approval_request(
     turn: usize,
     call_index: usize,
 ) -> Result<ApprovalRequest, String> {
-    let arguments = call.function.arguments.clone();
+    let arguments = serde_json::Value::Object(call.function.arguments.clone());
     let digest = Sha256::digest(serde_json::to_vec(&arguments).map_err(|error| error.to_string())?);
     Ok(ApprovalRequest {
         approval_id: format!(
@@ -122,7 +118,7 @@ pub(crate) fn approval_request(
         tool_name: call.function.name.to_string(),
         arguments,
         tool_call_id: call.id.to_string(),
-        call_id: call.id.provider().map(|id| id.call_id.clone()),
+        call_id: call.id.provider().map(|id| id.as_str().to_owned()),
     })
 }
 
@@ -134,7 +130,7 @@ pub(crate) fn logical_approval_request(
     key: &LogicalCallKey,
     implementation_version: &str,
 ) -> Result<ApprovalRequest, String> {
-    let arguments = call.function.arguments.clone();
+    let arguments = serde_json::Value::Object(call.function.arguments.clone());
     let digest = arguments_digest(&arguments).map_err(|error| error.to_string())?;
     let binding = format!("{}\n{digest}\n{implementation_version}", key.canonical());
     Ok(ApprovalRequest {
@@ -142,7 +138,7 @@ pub(crate) fn logical_approval_request(
         tool_name: call.function.name.to_string(),
         arguments,
         tool_call_id: call.id.to_string(),
-        call_id: call.id.provider().map(|id| id.call_id.clone()),
+        call_id: call.id.provider().map(|id| id.as_str().to_owned()),
     })
 }
 

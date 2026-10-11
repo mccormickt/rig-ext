@@ -254,7 +254,7 @@ handle.signal(
 
 ## Duroxide
 
-Drive Rig 0.43's serializable `AgentRun` state machine inside a Duroxide 0.1
+Drive Rig 0.44's serializable `AgentRun` state machine inside a Duroxide 0.1
 orchestration. The orchestration performs no provider or tool I/O; all such work
 is registered as activities.
 
@@ -314,7 +314,7 @@ and reconnection; for one scoped ID, the first submitted input wins. The provide
 client, raw registry merge methods, `ToolCatalog`, and route constructors remain
 available for advanced integration with existing Duroxide applications.
 
-Rig 0.43 does not expose enough state to convert an already-built `rig::Agent`.
+Rig 0.44 does not expose enough state to convert an already-built `rig::Agent`.
 The durable builder therefore captures the model and tools before Rig makes
 them private. It currently covers preambles, completion settings, history,
 tools, tool choice, maximum turns, streaming, approvals, checkpoints, and child
@@ -423,7 +423,7 @@ The compactor's artifact must implement `Serialize` and `DeserializeOwned`,
 because the workflow retains it between rounds. `ModelCompactor` is the
 crate-owned compactor: one model call summarizes the evicted window and its
 `ModelSummary` artifact records the text and usage. `rig_memory::TemplateCompactor`
-does not qualify in Rig 0.43, because its `TextSummary` artifact has no serde
+does not qualify in Rig 0.44, because its `TextSummary` artifact has no serde
 support and no public constructor.
 
 ```rust,ignore
@@ -475,7 +475,7 @@ distinct.
 `CompletionMode::Streaming` selects a separate stable streaming activity;
 blocking completion remains the compatibility default. The activity consumes
 the model's `stream` to EOF and returns a provider-neutral, serde-tagged
-transcript. The transcript records each Rig 0.43 part event (start, text,
+transcript. The transcript records each Rig 0.44 part event (start, text,
 reasoning, arguments, end, and unknown items) and ends with the
 `CompletionResponse` that Rig folds from the stream. Orchestration applies that
 response deterministically through `AgentRun::streamed_turn`. Calls to tools

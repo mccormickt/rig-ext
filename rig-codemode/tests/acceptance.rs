@@ -50,9 +50,12 @@ where
     F: Fn(Value) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<ToolOutput, ToolExecutionError>> + Send + 'static,
 {
-    DynamicTool::new(name, description, schema(), move |args| {
-        Box::pin(body(args))
-    })
+    DynamicTool::new(
+        rig_core::message::ToolName::new(name).unwrap(),
+        description,
+        schema(),
+        move |args| Box::pin(body(args)),
+    )
 }
 
 fn tools(effects: Arc<Effects>) -> Vec<DynamicTool> {
@@ -1115,7 +1118,7 @@ fn credentialed_fixture<P: rig_codemode::ScriptPolicy>(policy: P) -> (Arc<Effect
     let effects = Arc::new(Effects::default());
     let mut all = tools(effects.clone());
     all.push(DynamicTool::new_with_context(
-        "whoami",
+        rig_core::message::ToolName::new("whoami").unwrap(),
         "Reports the api token from the context",
         schema(),
         |context: &mut ToolContext, _args: Value| {

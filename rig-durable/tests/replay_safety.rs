@@ -387,7 +387,7 @@ async fn interrupt_and_recover(
         .await
         .unwrap();
     second.stop().await;
-    (recovering_model, response.output)
+    (recovering_model, response.output())
 }
 
 #[tokio::test]
@@ -532,7 +532,7 @@ async fn claim_committed_then_worker_dies_before_io() {
         .unwrap();
     second.stop().await;
 
-    assert_eq!(response.output, "done");
+    assert_eq!(response.output(), "done");
     assert_eq!(probe.calls(), 0, "recovery does not execute the tool");
     assert!(ledger.effects().is_empty());
     assert!(tool_result_text(&model, 0).contains("was interrupted"));
@@ -684,7 +684,7 @@ async fn two_submissions_use_distinct_logical_keys_and_retries_keep_theirs() {
     let response = run.wait_timeout(Duration::from_secs(15)).await.unwrap();
     orchestrator.stop().await;
 
-    assert_eq!(response.output, "second done");
+    assert_eq!(response.output(), "second done");
     let invocations = probe.invocations();
     assert_eq!(
         invocations.len(),
@@ -828,7 +828,7 @@ async fn approval_is_not_repeated_after_restart_and_binds_to_arguments() {
         .wait_timeout(Duration::from_secs(15))
         .await
         .expect("the recorded approval releases the call without a new request");
-    assert_eq!(response.output, "done");
+    assert_eq!(response.output(), "done");
     assert_eq!(probe.calls(), 2);
     second.stop().await;
 
@@ -871,7 +871,7 @@ async fn approval_is_not_repeated_after_restart_and_binds_to_arguments() {
     run.approve(&rewritten).await.unwrap();
     let response = run.wait_timeout(Duration::from_secs(15)).await.unwrap();
     orchestrator.stop().await;
-    assert_eq!(response.output, "done");
+    assert_eq!(response.output(), "done");
     assert_eq!(probe.calls(), 1);
 }
 

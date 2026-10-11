@@ -469,18 +469,8 @@ impl Compactor for ModelCompactor {
             }
             chat_history.extend(evicted.iter().cloned());
             chat_history.push(Message::user(SUMMARY_PROMPT));
-            let completion = CompletionRequest {
-                model: None,
-                chat_history,
-                documents: Vec::new(),
-                tools: Vec::new(),
-                temperature: None,
-                max_tokens: None,
-                tool_choice: None,
-                additional_params: None,
-                output_schema: None,
-                record_telemetry_content: false,
-            };
+            let mut completion = CompletionRequest::new("");
+            completion.chat_history = chat_history;
             let response = self
                 .model
                 .call(completion)
@@ -518,10 +508,9 @@ mod tests {
             ),
         );
         vec![
-            Message::Assistant {
-                id: None,
-                content: vec![AssistantContent::ToolCall(call.clone())],
-            },
+            Message::Assistant(rig::message::AssistantMessage::new(vec![
+                AssistantContent::ToolCall(call.clone()),
+            ])),
             Message::User {
                 content: vec![UserContent::tool_result(
                     call.id.clone(),

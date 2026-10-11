@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
         .agent()
         .a2a_conversation("demo-conversation")
         .build()
-        .into_tool();
+        .into_tool()?;
     let openai = OpenAI::from_env()?;
     let orchestrator = AgentBuilder::new(openai.completion(openai::GPT_4O_MINI))
         .preamble("Use the remote agent tool to answer, then relay its reply.")

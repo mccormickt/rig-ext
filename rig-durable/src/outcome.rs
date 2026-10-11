@@ -149,8 +149,8 @@ impl DurableResponse {
         }
     }
 
-    pub fn output(&self) -> &str {
-        &self.response.output
+    pub fn output(&self) -> String {
+        self.response.output()
     }
 
     /// Drop outcomes from the end until the serialized response fits

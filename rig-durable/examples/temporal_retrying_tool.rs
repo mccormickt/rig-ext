@@ -122,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let invocations = invocations.lock().unwrap();
     assert_eq!(invocations.len(), 2);
     assert_eq!(invocations[0], invocations[1]);
-    assert_eq!(response.output, "The service is available.");
-    println!("{}", response.output);
+    assert_eq!(response.output(), "The service is available.");
+    println!("{}", response.output());
     Ok(())
 }

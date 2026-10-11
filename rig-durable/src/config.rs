@@ -167,17 +167,17 @@ impl DurableAgentConfig {
         }
         let mut tools = ToolCatalog::default();
         for tool in &snapshot.tools {
-            let name = &tool.definition.name;
+            let name = tool.definition.name.as_str();
             let registered = self
                 .tools
                 .get(name)
-                .ok_or_else(|| SnapshotError::ToolUnavailable(name.clone()))?;
+                .ok_or_else(|| SnapshotError::ToolUnavailable(name.to_owned()))?;
             if registered.route != tool.route {
-                return Err(SnapshotError::RouteMismatch(name.clone()));
+                return Err(SnapshotError::RouteMismatch(name.to_owned()));
             }
             if registered.policy.version() != tool.policy.version() {
                 return Err(SnapshotError::VersionMismatch {
-                    tool: name.clone(),
+                    tool: name.to_owned(),
                     snapshot: tool.policy.version().into(),
                     registered: registered.policy.version().into(),
                 });
@@ -344,7 +344,7 @@ mod tests {
 
     fn definition(name: &str) -> ToolDefinition {
         ToolDefinition {
-            name: name.into(),
+            name: rig::message::ToolName::new(name).unwrap(),
             description: String::new(),
             parameters: serde_json::json!({"type":"object"}),
         }

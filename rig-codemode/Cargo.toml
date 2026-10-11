@@ -25,7 +25,7 @@ required-features = ["quickjs", "mcp"]
 [dependencies]
 jsonschema = { version = "0.58", default-features = false }
 rig-core.workspace = true
-rig-rmcp = { version = "0.43.0", default-features = false, optional = true }
+rig-rmcp = { version = "0.44.0", default-features = false, optional = true }
 rquickjs = { version = "0.14", default-features = false, features = ["std"], optional = true }
 serde.workspace = true
 serde_json.workspace = true

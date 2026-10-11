@@ -136,7 +136,7 @@ async fn approval_is_managed_through_the_run_handle() {
     let replayed_request = run.next_approval().await.unwrap();
     assert_eq!(replayed_request.approval_id, request.approval_id);
     run.approve(&replayed_request).await.unwrap();
-    assert_eq!(run.wait().await.unwrap().output, "approved");
+    assert_eq!(run.wait().await.unwrap().output(), "approved");
     orchestrator.shutdown(None).await;
 }
 
@@ -168,8 +168,8 @@ async fn steering_runs_as_a_follow_up_turn_before_completion() {
     run.steer("change direction").await.unwrap();
     let response = run.wait().await.unwrap();
 
-    assert_eq!(response.output, "steered answer");
-    assert_eq!(response.messages.unwrap().len(), 2);
+    assert_eq!(response.output(), "steered answer");
+    assert_eq!(response.messages.len(), 2);
     orchestrator.shutdown(None).await;
 }
 
@@ -205,8 +205,8 @@ async fn checkpoint_policy_applies_before_a_steered_turn() {
     run.steer("change direction").await.unwrap();
     let response = run.wait().await.unwrap();
 
-    assert_eq!(response.output, "steered answer");
-    assert_eq!(response.messages.unwrap().len(), 2);
+    assert_eq!(response.output(), "steered answer");
+    assert_eq!(response.messages.len(), 2);
     assert_eq!(
         orchestrator
             .client()
@@ -239,7 +239,7 @@ async fn steering_rejects_a_completed_run() {
         .start("initial prompt")
         .await
         .unwrap();
-    assert_eq!(run.wait().await.unwrap().output, "done");
+    assert_eq!(run.wait().await.unwrap().output(), "done");
 
     assert!(matches!(
         run.steer("too late").await,
@@ -336,7 +336,7 @@ async fn logical_child_uses_versioned_registration_until_its_first_checkpoint() 
         .start("delegate")
         .await
         .unwrap();
-    assert_eq!(run.wait().await.unwrap().output, "done");
+    assert_eq!(run.wait().await.unwrap().output(), "done");
     let history = orchestrator
         .client()
         .read_execution_history(run.instance_id(), 1)
@@ -410,8 +410,8 @@ async fn caller_run_ids_are_scoped_by_agent_and_version() {
         .unwrap();
 
     assert_ne!(first_run.instance_id(), second_run.instance_id());
-    assert_eq!(first_run.wait().await.unwrap().output, "first output");
-    assert_eq!(second_run.wait().await.unwrap().output, "second output");
+    assert_eq!(first_run.wait().await.unwrap().output(), "first output");
+    assert_eq!(second_run.wait().await.unwrap().output(), "second output");
     orchestrator.shutdown(None).await;
 }
 
@@ -512,7 +512,7 @@ async fn checkpoint_can_move_a_run_to_a_registered_agent_version() {
         .wait()
         .await
         .unwrap();
-    assert_eq!(response.output, "migrated answer");
+    assert_eq!(response.output(), "migrated answer");
     orchestrator.shutdown(None).await;
 }
 
@@ -652,7 +652,7 @@ async fn reconnects_to_a_run_after_runtime_restart_without_recalling_the_model_t
         .await
         .unwrap();
 
-    assert_eq!(response.output, "finished after restart");
+    assert_eq!(response.output(), "finished after restart");
     assert_eq!(recovered_calls.load(Ordering::SeqCst), 1);
     second_orchestrator.shutdown(None).await;
 }

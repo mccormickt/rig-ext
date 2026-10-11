@@ -86,7 +86,7 @@ pub struct ToolCatalog(pub BTreeMap<String, ToolEntry>);
 
 impl ToolCatalog {
     pub fn insert(&mut self, entry: ToolEntry) -> Option<ToolEntry> {
-        self.0.insert(entry.definition.name.clone(), entry)
+        self.0.insert(entry.definition.name.to_string(), entry)
     }
     pub fn get(&self, name: &str) -> Option<&ToolEntry> {
         self.0.get(name)
@@ -110,8 +110,8 @@ impl ToolCatalog {
             Some(ToolChoice::None) => BTreeSet::new(),
             Some(ToolChoice::Specific { function_names }) => function_names
                 .iter()
-                .filter(|n| self.0.contains_key(*n))
-                .cloned()
+                .filter(|n| self.0.contains_key(n.as_str()))
+                .map(ToString::to_string)
                 .collect(),
             _ => self.executable_names(),
         }
@@ -125,7 +125,7 @@ pub async fn catalog_from_toolset(toolset: &ToolSet, retry: impl Into<RetryPolic
             .tool_definitions()
             .into_iter()
             .map(|definition| {
-                let name = definition.name.clone();
+                let name = definition.name.to_string();
                 (
                     name,
                     ToolEntry {
@@ -210,7 +210,7 @@ mod tests {
     fn entry(name: &str) -> ToolEntry {
         activity_tool(
             ToolDefinition {
-                name: name.into(),
+                name: rig::message::ToolName::new(name).unwrap(),
                 description: String::new(),
                 parameters: serde_json::json!({}),
             },
@@ -235,7 +235,10 @@ mod tests {
         assert!(catalog.allowed_names(Some(&ToolChoice::None)).is_empty());
         assert_eq!(
             catalog.allowed_names(Some(&ToolChoice::Specific {
-                function_names: vec!["missing".into(), "zeta".into()]
+                function_names: vec![
+                    rig::message::ToolName::new("missing").unwrap(),
+                    rig::message::ToolName::new("zeta").unwrap()
+                ]
             })),
             BTreeSet::from(["zeta".into()])
         );

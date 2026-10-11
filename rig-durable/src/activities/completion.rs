@@ -11,13 +11,17 @@ pub async fn complete(
     model: &DynModel<Completion>,
     request: CompletionRequest,
 ) -> Result<rig::agent::ModelTurn, String> {
-    let executable: BTreeSet<_> = request.tools.iter().map(|tool| tool.name.clone()).collect();
+    let executable: BTreeSet<_> = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect();
     let allowed = match request.tool_choice.as_ref() {
         Some(ToolChoice::None) => BTreeSet::new(),
         Some(ToolChoice::Specific { function_names }) => function_names
             .iter()
-            .filter(|name| executable.contains(*name))
-            .cloned()
+            .filter(|name| executable.contains(name.as_str()))
+            .map(ToString::to_string)
             .collect(),
         Some(ToolChoice::Auto | ToolChoice::Required) | None => executable.clone(),
     };
@@ -25,19 +29,7 @@ pub async fn complete(
         .call(request)
         .await
         .map_err(|error| error.to_string())?;
-    let turn = rig::agent::ModelTurn::new(
-        response.message_id.clone(),
-        response.choice.clone(),
-        response.usage,
-        executable,
-        allowed,
-        response.raw.clone(),
-    )
-    .with_identity(
-        response.response_id.clone(),
-        response.provider_request_id.clone(),
-    )
-    .with_finish_reason(response.finish_reason());
+    let turn = rig::agent::ModelTurn::from_response_parts(&response, executable, allowed);
     Ok(turn)
 }
 
@@ -61,9 +53,10 @@ pub async fn stream(
             }
         };
         let stored = match event {
-            rig::streaming::StreamEvent::Start { part, kind } => StreamItem::Start {
+            rig::streaming::StreamEvent::Start { part, kind, name } => StreamItem::Start {
                 part: part.index() as u32,
                 kind,
+                name,
             },
             rig::streaming::StreamEvent::Text { part, text } => StreamItem::Text {
                 part: part.index() as u32,

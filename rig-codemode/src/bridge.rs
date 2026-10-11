@@ -836,7 +836,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
         let dispatcher = crate::DynamicToolDispatcher::new([rig_core::tool::DynamicTool::new(
-            "late",
+            rig_core::message::ToolName::new("late").unwrap(),
             "",
             json!({}),
             move |_| {

@@ -13,10 +13,13 @@ use serde::{Deserialize, Serialize};
 /// stream event and is always the last item of a transcript.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum StreamItem {
     Start {
         part: u32,
         kind: PartKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<rig::message::ToolName>,
     },
     Text {
         part: u32,
@@ -59,13 +62,17 @@ pub fn apply(
 ) -> Result<(), String> {
     use rig::{agent::run::StreamedTurn, completion::ResponseIdentity};
     use std::collections::BTreeSet;
-    let executable: BTreeSet<_> = request.tools.iter().map(|tool| tool.name.clone()).collect();
+    let executable: BTreeSet<_> = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect();
     let allowed = match request.tool_choice.as_ref() {
         Some(rig::message::ToolChoice::None) => BTreeSet::new(),
         Some(rig::message::ToolChoice::Specific { function_names }) => function_names
             .iter()
-            .filter(|name| executable.contains(*name))
-            .cloned()
+            .filter(|name| executable.contains(name.as_str()))
+            .map(ToString::to_string)
             .collect(),
         Some(rig::message::ToolChoice::Auto | rig::message::ToolChoice::Required) | None => {
             executable.clone()
@@ -91,8 +98,7 @@ pub fn apply(
         .record_streamed_completion_call(
             response.usage,
             ResponseIdentity {
-                message_id: response.message_id.clone(),
-                response_id: response.response_id.clone(),
+                response_id: response.response_id().map(ToString::to_string),
                 provider_request_id: response.provider_request_id.clone(),
             },
             response.finish_reason(),
@@ -101,7 +107,7 @@ pub fn apply(
         .map_err(|e| e.to_string())?;
     agent
         .streamed_turn(StreamedTurn {
-            message_id: response.message_id.clone(),
+            head: response.head(),
             choice: response.choice.clone(),
             executable_tool_names: executable,
             allowed_tool_names: allowed,

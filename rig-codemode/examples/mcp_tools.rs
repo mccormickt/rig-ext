@@ -101,14 +101,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let definitions = client.list_all_tools().await?;
     let mcp_tools = rig_rmcp::tools_from_server(definitions, client.peer());
     // Build the catalog from the MCP definitions: the Rig `ToolDefinition`
-    // produced by `DynamicTool::from` has no output schema.
+    // produced by `DynamicTool::try_from` has no output schema.
     let catalog = Catalog::new(
         mcp_tools
             .iter()
             .map(McpTool::definition)
             .map(CatalogEntry::from_mcp_definition),
     )?;
-    let dispatcher = DynamicToolDispatcher::new(mcp_tools.into_iter().map(Into::into))?;
+    let tools = mcp_tools
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect::<Result<Vec<_>, _>>()?;
+    let dispatcher = DynamicToolDispatcher::new(tools)?;
     let dispatcher = OutputSchemaValidator::new(dispatcher, &catalog)?;
     let codemode = CodeMode::builder(catalog, Arc::new(dispatcher)).build()?;
 

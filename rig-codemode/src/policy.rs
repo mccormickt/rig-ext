@@ -21,10 +21,13 @@
 //! };
 //! use rig_core::tool::{DynamicTool, ToolOutput};
 //!
-//! let tools = ["lookup", "delete"].map(|name| DynamicTool::new(
-//!     name, "Example operation", serde_json::json!({"type": "object"}),
-//!     |args| Box::pin(async move { Ok(ToolOutput::json(args)) }),
-//! ));
+//! let tools = ["lookup", "delete"].into_iter().map(|name| {
+//!     Ok::<_, rig_core::message::EmptyToolName>(DynamicTool::new(
+//!         rig_core::message::ToolName::new(name)?, "Example operation",
+//!         serde_json::json!({"type": "object"}),
+//!         |args| Box::pin(async move { Ok(ToolOutput::json(args)) }),
+//!     ))
+//! }).collect::<Result<Vec<_>, _>>()?;
 //! let dispatcher = DynamicToolDispatcher::new(tools)?;
 //! let catalog = Catalog::new(
 //!     dispatcher.definitions().iter().map(CatalogEntry::from_definition),

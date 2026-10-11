@@ -9,7 +9,7 @@
 //!
 //! # Build an executor from MCP tools
 //!
-//! Enable `rig-codemode` features `quickjs,mcp` and add `rig-rmcp = "0.43"`.
+//! Enable `rig-codemode` features `quickjs,mcp` and add `rig-rmcp = "0.44"`.
 //! Obtain tools with [`rig_rmcp::tools_from_server`] from a connected client's
 //! definitions and peer. Keep that client connection open during execution.
 //! Build the catalog **before** converting the tools to Rig `DynamicTool`s:
@@ -25,7 +25,8 @@
 //!     let catalog = Catalog::new(
 //!         tools.iter().map(McpTool::definition).map(CatalogEntry::from_mcp_definition),
 //!     )?;
-//!     let dispatcher = DynamicToolDispatcher::new(tools.into_iter().map(Into::into))?;
+//!     let tools = tools.into_iter().map(TryInto::try_into).collect::<Result<Vec<_>, _>>()?;
+//!     let dispatcher = DynamicToolDispatcher::new(tools)?;
 //!     let dispatcher = OutputSchemaValidator::new(dispatcher, &catalog)?;
 //!     Ok(CodeMode::builder(catalog, Arc::new(dispatcher)).build()?)
 //! }

@@ -12,13 +12,14 @@ use rig_codemode::{
     Catalog, CatalogEntry, CodeMode, DynamicToolDispatcher, ExecutionRequest, Invocation, Limits,
     ScriptReview,
 };
+use rig_core::message::ToolName;
 use rig_core::tool::{DynamicTool, ToolExecutionError, ToolOutput, ToolResult};
 use serde_json::{Value, json};
 
-fn mock_tools() -> Vec<DynamicTool> {
-    vec![
+fn mock_tools() -> Result<Vec<DynamicTool>, rig_core::message::EmptyToolName> {
+    Ok(vec![
         DynamicTool::new(
-            "list_orders",
+            ToolName::new("list_orders")?,
             "List orders for a customer. Returns an array of { id, total, status }.",
             json!({
                 "type": "object",
@@ -37,7 +38,7 @@ fn mock_tools() -> Vec<DynamicTool> {
             },
         ),
         DynamicTool::new(
-            "order_details",
+            ToolName::new("order_details")?,
             "Details for one order, including the shipping address.",
             json!({
                 "type": "object",
@@ -57,7 +58,7 @@ fn mock_tools() -> Vec<DynamicTool> {
             },
         ),
         DynamicTool::new(
-            "cancel_order",
+            ToolName::new("cancel_order")?,
             "Cancel a pending order.",
             json!({
                 "type": "object",
@@ -73,12 +74,12 @@ fn mock_tools() -> Vec<DynamicTool> {
                 })
             },
         ),
-    ]
+    ])
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dispatcher = DynamicToolDispatcher::new(mock_tools())?
+    let dispatcher = DynamicToolDispatcher::new(mock_tools()?)?
         // Call policy: deny writes on behalf of this parent call.
         .with_call_policy(|invocation: &mut Invocation| {
             if invocation.name == "cancel_order" {

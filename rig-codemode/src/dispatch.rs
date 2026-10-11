@@ -17,7 +17,7 @@
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let lookup = DynamicTool::new(
-//!     "lookup", "Look up a record by ID",
+//!     rig_core::message::ToolName::new("lookup")?, "Look up a record by ID",
 //!     json!({"type": "object", "properties": {"id": {"type": "string"}},
 //!            "required": ["id"], "additionalProperties": false}),
 //!     |args| Box::pin(async move { Ok(ToolOutput::json(args)) }),
@@ -219,7 +219,7 @@ impl DynamicToolDispatcher {
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let tool = DynamicTool::new(
-    ///     "echo", "Return the effective arguments",
+    ///     rig_core::message::ToolName::new("echo")?, "Return the effective arguments",
     ///     json!({"type": "object", "properties": {"tenant": {"type": "string"}},
     ///            "required": ["tenant"]}),
     ///     |args| Box::pin(async move { Ok(ToolOutput::json(args)) }),
@@ -259,7 +259,7 @@ impl DynamicToolDispatcher {
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let tool = DynamicTool::new(
-    ///     "profile", "Read the current profile", json!({"type": "object"}),
+    ///     rig_core::message::ToolName::new("profile")?, "Read the current profile", json!({"type": "object"}),
     ///     |_| Box::pin(async { Ok(ToolOutput::json(json!({
     ///         "name": "Ada", "internal_note": "host-only detail"
     ///     }))) }),
@@ -360,7 +360,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
         let tool = DynamicTool::new(
-            "count",
+            rig_core::message::ToolName::new("count").unwrap(),
             "",
             json!({
                 "type": "object", "properties": {"n": {"type": "integer", "minimum": 0}},
@@ -404,9 +404,12 @@ mod tests {
 
     #[test]
     fn invalid_schema_is_a_construction_error() {
-        let tool = DynamicTool::new("bad", "", json!({"type": "not-a-type"}), |_| {
-            Box::pin(async { Ok(ToolOutput::text("unused")) })
-        });
+        let tool = DynamicTool::new(
+            rig_core::message::ToolName::new("bad").unwrap(),
+            "",
+            json!({"type": "not-a-type"}),
+            |_| Box::pin(async { Ok(ToolOutput::text("unused")) }),
+        );
         assert_eq!(DynamicToolDispatcher::new([tool]).unwrap_err().name, "bad");
     }
 }

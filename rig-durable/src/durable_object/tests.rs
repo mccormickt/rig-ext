@@ -80,8 +80,12 @@ impl Wake for Clock {
 async fn tools_and_deduplication_survive_reopen() -> Result<(), Error> {
     let db = Database::new()?;
     let model = MockCompletionModel::from_turns([
-        MockTurn::tool_call("add-1", "add", serde_json::json!({"x": 7, "y": 12})),
-        MockTurn::text("19"),
+        MockTurn::tool_call("add-1", "add", serde_json::json!({"x": 7, "y": 12}))
+            .with_response_id("tool-response")
+            .with_finish_reason(rig::completion::FinishReason::ToolCalls),
+        MockTurn::text("19")
+            .with_response_id("answer-response")
+            .with_finish_reason(rig::completion::FinishReason::Stop),
     ]);
     let engine = Builder::new(model.clone()).tool(MockAddTool).build(
         db.clone(),
@@ -103,6 +107,20 @@ async fn tools_and_deduplication_survive_reopen() -> Result<(), Error> {
     );
     assert_eq!(model.requests().len(), 2);
     assert_eq!(engine.transcript()?.len(), 4);
+    let transcript = engine.transcript()?;
+    for (index, response_id, stop) in [
+        (1, "tool-response", rig::message::StopReason::ToolUse),
+        (3, "answer-response", rig::message::StopReason::Stop),
+    ] {
+        let Message::Assistant(assistant) = &transcript[index] else {
+            panic!("expected persisted assistant turn");
+        };
+        assert_eq!(
+            assistant.origin.as_ref().unwrap().response_id.as_deref(),
+            Some(response_id)
+        );
+        assert_eq!(assistant.stop.as_ref(), Some(&stop));
+    }
     drop(engine);
     let reopened =
         Builder::new(model.clone())
@@ -113,10 +131,15 @@ async fn tools_and_deduplication_survive_reopen() -> Result<(), Error> {
         SubmissionState::Answered
     );
     assert_eq!(
-        reopened.wait("r1").await?.map(|r| r.response.output),
+        reopened.wait("r1").await?.map(|r| r.response.output()),
         Some("19".into())
     );
     assert_eq!(model.requests().len(), 2);
+    assert_eq!(reopened.transcript()?, transcript);
+    assert_eq!(
+        reopened.result("r1")?.unwrap().response.messages,
+        response.response.messages
+    );
     Ok(())
 }
 
@@ -335,7 +358,7 @@ async fn submissions_and_alarm_interleave_without_another_driver() -> Result<(),
             .all(|r| r.state == SubmissionState::Answered)
     );
     assert_eq!(
-        engine.result("two")?.map(|r| r.response.output),
+        engine.result("two")?.map(|r| r.response.output()),
         Some("second answer".into())
     );
     assert_eq!(model.requests().len(), 3);
@@ -475,7 +498,7 @@ async fn compaction_precedes_queued_prompt() -> Result<(), Error> {
     engine.drive().await?;
     assert_eq!(engine.transcript()?.len(), 6);
     assert_eq!(engine.status()?.compaction.map(|c| c.cutoff), Some(4));
-    assert_eq!(model.requests()[2].chat_history.len(), 4);
+    assert_eq!(model.requests()[2].chat_history.len(), 3);
     assert!(serde_json::to_string(&model.requests()[2])?.contains("summary one"));
     assert_eq!(summary.requests().len(), 2);
     Ok(())
@@ -503,7 +526,7 @@ async fn uncertain_commit_reloads_and_alarm_rearms_on_error() -> Result<(), Erro
     assert!(model.requests().is_empty());
     engine.alarm().await?;
     assert_eq!(
-        engine.result("r")?.map(|r| r.response.output),
+        engine.result("r")?.map(|r| r.response.output()),
         Some("answer".into())
     );
     assert_eq!(engine.transcript()?.len(), 2);
@@ -807,7 +830,7 @@ async fn alarm_consumed_before_admission_ack_is_replaced() -> Result<(), Error> 
     clock.now.set(2000);
     engine.alarm().await?;
     assert_eq!(
-        engine.result("r")?.map(|r| r.response.output),
+        engine.result("r")?.map(|r| r.response.output()),
         Some("answer".into())
     );
     Ok(())

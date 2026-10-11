@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let request = run.next_approval().await?;
     println!("approval requested: {request:?}");
     run.approve(&request).await?;
-    println!("{}", run.wait().await?.output);
+    println!("{}", run.wait().await?.output());
     orchestrator.shutdown(None).await;
     Ok(())
 }

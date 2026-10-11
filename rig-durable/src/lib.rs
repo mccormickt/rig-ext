@@ -17,7 +17,7 @@
 //! | No features | Shared configuration, policy, identity, result, and compaction types | Native and WASM; no runtime |
 //!
 //! Enable `temporal` with the default features to use both native backends. Use Rig
-//! 0.43 models and tools directly; an already-built `rig::Agent` cannot be
+//! 0.44 models and tools directly; an already-built `rig::Agent` cannot be
 //! converted because it does not expose all required configuration.
 //!
 //! # Run a Rig model with SQLite
@@ -311,7 +311,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(response.output, "The answer is 42.");
+        assert_eq!(response.output(), "The answer is 42.");
         runtime.shutdown(None).await;
     }
 
@@ -359,7 +359,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(response.output, "done");
+        assert_eq!(response.output(), "done");
         assert_eq!(count.load(Ordering::SeqCst), 1);
         runtime.shutdown(None).await;
     }
@@ -408,7 +408,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(response.output, "recovered from denial");
+        assert_eq!(response.output(), "recovered from denial");
         assert_eq!(count.load(Ordering::SeqCst), 0);
         runtime.shutdown(None).await;
     }
@@ -470,7 +470,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(response.output, "early approved");
+        assert_eq!(response.output(), "early approved");
         assert_eq!(count.load(Ordering::SeqCst), 1);
         runtime.shutdown(None).await;
     }

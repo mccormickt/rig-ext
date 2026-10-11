@@ -98,6 +98,7 @@ impl SessionInput {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum SessionCommand {
     Submit {
         /// Identifies this delivery so the client can find its rejection.

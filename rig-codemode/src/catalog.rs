@@ -572,6 +572,8 @@ fn render_object(object: &serde_json::Map<String, serde_json::Value>, depth: usi
         return "{}".into();
     }
     let mut fields = Vec::with_capacity(properties.len());
+    let mut properties: Vec<_> = properties.iter().collect();
+    properties.sort_by_key(|(name, _)| *name);
     for (name, schema) in properties {
         let optional = if required.contains(&name.as_str()) {
             ""

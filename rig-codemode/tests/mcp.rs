@@ -135,7 +135,12 @@ async fn fixture() -> Fixture {
     assert!(catalog.get("answer").unwrap().output_schema().is_some());
     assert!(catalog.get("plain").unwrap().output_schema().is_none());
 
-    let dispatcher = DynamicToolDispatcher::new(mcp_tools.into_iter().map(Into::into))
+    let tools = mcp_tools
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let dispatcher = DynamicToolDispatcher::new(tools)
         .unwrap()
         .with_result_policy(|invocation, result| {
             if matches!(invocation.name.as_str(), "wrong_shape" | "secret_key") {

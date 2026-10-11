@@ -5,7 +5,9 @@ use rig_celld::{
 use rig_core::{
     embeddings::Embedding,
     error::ProviderError,
-    vector_store::{InsertDocuments, VectorSearchRequest, VectorStoreIndex, request::Filter},
+    vector_store::{
+        InsertDocuments, VectorSearchRequest, VectorSearchResult, VectorStoreIndex, request::Filter,
+    },
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -145,7 +147,7 @@ impl ConformanceCell {
         ensure(
             ranked
                 .iter()
-                .map(|(_, id, _)| id.as_str())
+                .map(|result| result.id.as_str())
                 .collect::<Vec<_>>()
                 == ["a", "tie-a", "tie-b", "b"],
             "score and stable tie ranking",
@@ -153,7 +155,7 @@ impl ConformanceCell {
         ensure(
             ranked[..3]
                 .iter()
-                .all(|(score, _, _)| (*score - 1.0).abs() < f64::EPSILON),
+                .all(|result| (result.score - 1.0).abs() < f64::EPSILON),
             "cosine score normalization",
         )?;
 
@@ -179,7 +181,7 @@ impl ConformanceCell {
             search(&index, "beta", 10)
                 .await?
                 .iter()
-                .any(|(score, id, _)| id == "multi" && (*score - 1.0).abs() < f64::EPSILON),
+                .any(|result| result.id == "multi" && (result.score - 1.0).abs() < f64::EPSILON),
             "multi-embedding retrieval",
         )?;
         ensure(
@@ -216,7 +218,7 @@ impl ConformanceCell {
             !search(&index, "alpha", 10)
                 .await?
                 .iter()
-                .any(|(_, id, _)| id == "orphan"),
+                .any(|result| result.id == "orphan"),
             "orphan search visibility",
         )?;
         ensure(
@@ -254,7 +256,7 @@ impl ConformanceCell {
         Response::from_json(&json!({
             "status": "ok",
             "generation": replaced.generation,
-            "ranking": ranked.iter().map(|(_, id, _)| id).collect::<Vec<_>>()
+            "ranking": ranked.iter().map(|result| &result.id).collect::<Vec<_>>()
         }))
     }
 
@@ -313,14 +315,14 @@ impl ConformanceCell {
             search(index, "alpha", 10)
                 .await?
                 .iter()
-                .any(|(_, id, _)| id == "atomic"),
+                .any(|result| result.id == "atomic"),
             "old vector rollback",
         )?;
         ensure(
             !search(index, "beta", 10)
                 .await?
                 .iter()
-                .any(|(score, id, _)| id == "atomic" && *score > 0.5),
+                .any(|result| result.id == "atomic" && result.score > 0.5),
             "failed generation isolation",
         )?;
         // Only the row inserted above remains. The failed upsert rolled back
@@ -474,7 +476,7 @@ impl ConformanceCell {
         )?;
         let ranked = search(&index, "alpha", 10).await?;
         ensure(
-            ranked.iter().any(|(_, id, _)| id == "a"),
+            ranked.iter().any(|result| result.id == "a"),
             "reopen vector search",
         )?;
         Response::from_json(&json!({"status": "ok", "generation": memory.generation}))
@@ -511,7 +513,7 @@ impl ConformanceCell {
         ensure(
             matches
                 .iter()
-                .filter(|(_, id, _)| id == CONCURRENT_ID)
+                .filter(|result| result.id == CONCURRENT_ID)
                 .count()
                 == 1,
             "one visible concurrent generation",
@@ -584,7 +586,7 @@ async fn search(
     index: &SqliteVecIndex<FixtureEmbeddingModel>,
     query: &str,
     samples: u64,
-) -> Result<Vec<(f64, String, MemoryRecord)>> {
+) -> Result<Vec<VectorSearchResult<MemoryRecord>>> {
     index
         .top_n(
             VectorSearchRequest::<Filter<Value>>::builder()

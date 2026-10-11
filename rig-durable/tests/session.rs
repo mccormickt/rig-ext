@@ -36,7 +36,7 @@ async fn oversized_answers_preserve_single_run_results_and_do_not_close_sessions
     let orchestrator = orchestrator(DurableAgent::builder("large", model).build().unwrap()).await;
     let agent = orchestrator.agent("large").unwrap();
     let run = agent.start("single").await.unwrap();
-    assert_eq!(run.wait_timeout(WAIT).await.unwrap().output, answer);
+    assert_eq!(run.wait_timeout(WAIT).await.unwrap().output(), answer);
     let detailed = run.wait_detailed_timeout(WAIT).await.unwrap();
     assert_eq!(detailed.output(), answer);
     assert!(detailed.tool_outcomes.is_empty());
@@ -106,12 +106,15 @@ fn scripted_requests(model: &MockCompletionModel, expected: usize) -> Vec<Comple
 fn user_texts(messages: &[Message]) -> Vec<String> {
     messages
         .iter()
-        .filter_map(|message| match message {
-            Message::User { content } => content.iter().find_map(|item| match item {
-                UserContent::Text(text) => Some(text.text.clone()),
-                _ => None,
-            }),
-            _ => None,
+        .flat_map(|message| match message {
+            Message::User { content } => content
+                .iter()
+                .filter_map(|item| match item {
+                    UserContent::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
         })
         .collect()
 }
@@ -329,8 +332,8 @@ fn has_tool_call(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
         matches!(
             message,
-            Message::Assistant { content, .. }
-                if content.iter().any(|item| matches!(item, AssistantContent::ToolCall(_)))
+            Message::Assistant(assistant)
+                if assistant.content.iter().any(|item| matches!(item, AssistantContent::ToolCall(_)))
         )
     })
 }
@@ -399,11 +402,16 @@ async fn compaction_keeps_the_request_canonical_and_the_transcript_complete() {
         summary_a.chat_history.first(),
         Some(Message::System { .. })
     ));
-    assert_eq!(summary_a.chat_history.len(), 5);
-    assert!(has_tool_call(&summary_a.chat_history));
+    assert_eq!(summary_a.chat_history.len(), 4);
+    // Rig adapts calls to tools not offered to the summarizer into text.
+    assert!(
+        serde_json::to_string(&summary_a.chat_history)
+            .unwrap()
+            .contains("called tool add")
+    );
     assert_eq!(
         user_texts(&summary_a.chat_history[1..]),
-        ["one", SUMMARY_PROMPT]
+        ["one", "[tool add result] 3", SUMMARY_PROMPT]
     );
 
     let second = &requests[3];
@@ -432,7 +440,7 @@ async fn compaction_keeps_the_request_canonical_and_the_transcript_complete() {
 
     let third = &requests[5];
     rig::transcript::validate_canonical(&third.chat_history).unwrap();
-    assert_eq!(third.chat_history.len(), 4);
+    assert_eq!(third.chat_history.len(), 3);
     assert_eq!(
         user_texts(&third.chat_history),
         [
@@ -443,7 +451,7 @@ async fn compaction_keeps_the_request_canonical_and_the_transcript_complete() {
     );
 
     let summary_c = &requests[6];
-    assert_eq!(summary_c.chat_history.len(), 5);
+    assert_eq!(summary_c.chat_history.len(), 4);
     assert_eq!(
         user_texts(&summary_c.chat_history[1..]),
         [
@@ -455,7 +463,7 @@ async fn compaction_keeps_the_request_canonical_and_the_transcript_complete() {
 
     let fourth = &requests[7];
     rig::transcript::validate_canonical(&fourth.chat_history).unwrap();
-    assert_eq!(fourth.chat_history.len(), 4);
+    assert_eq!(fourth.chat_history.len(), 3);
     assert_eq!(
         user_texts(&fourth.chat_history),
         [
@@ -672,11 +680,11 @@ async fn single_run_exposes_ordered_dispositions_with_equal_content() {
 
     // The plain Rig response is unchanged.
     let plain = run.wait_timeout(WAIT).await.unwrap();
-    assert_eq!(plain.output, "done");
+    assert_eq!(plain.output(), "done");
 
     let detailed = run.wait_detailed_timeout(WAIT).await.unwrap();
     assert_eq!(detailed.output(), "done");
-    assert_eq!(detailed.response.output, plain.output);
+    assert_eq!(detailed.response.output(), plain.output());
     assert_dispositions(&detailed.tool_outcomes);
     assert_dispositions(&run.result_detailed().await.unwrap().tool_outcomes);
 

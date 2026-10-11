@@ -53,7 +53,7 @@ async fn run(checkpoint: CheckpointPolicy, instance: &str) -> (PromptResponse, V
 #[tokio::test]
 async fn disabled_keeps_one_execution() {
     let (response, executions, requests) = run(CheckpointPolicy::Disabled, "disabled").await;
-    assert_eq!(response.output, "42");
+    assert_eq!(response.output(), "42");
     assert_eq!(executions, [1]);
     assert_eq!(requests, 2);
 }
@@ -71,7 +71,7 @@ async fn threshold_one_continues_at_each_nonterminal_boundary() {
     // response is not followed by a redundant continuation.
     assert_eq!(executions, [1, 2, 3]);
     assert_eq!(requests, 2);
-    assert_eq!(checkpointed.output, plain.output);
+    assert_eq!(checkpointed.output(), plain.output());
     assert_eq!(checkpointed.usage, plain.usage);
     assert_eq!(checkpointed.messages, plain.messages);
 }

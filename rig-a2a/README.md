@@ -13,8 +13,8 @@ host-side.
 ```toml
 [dependencies]
 rig-a2a = "0.1"
-rig-agent = "0.43"
-rig-core = "0.43"
+rig-agent = "0.44.0"
+rig-core = "0.44.0"
 ```
 
 The default feature uses Rustls. To use native TLS instead:
@@ -66,7 +66,7 @@ let remote_tool = remote
     .agent()
     .a2a_conversation("project-42")
     .build()
-    .into_tool();
+    .into_tool()?;
 let agent = AgentBuilder::new(openai.completion(openai::GPT_4O_MINI))
     .dynamic_tool(remote_tool)
     .build();
@@ -80,7 +80,7 @@ agent, and Rig's `Agent::into_tool` performs the standard sub-agent conversion.
 Use `a2a_conversation` on the agent builder before conversion when repeated
 calls must continue one remote A2A thread.
 
-Rig 0.43 does not expose a run's conversation ID to completion hooks and does
+Rig 0.44 does not expose a run's conversation ID to completion hooks and does
 not copy it from an outer agent into a sub-agent run. Therefore, a converted
 sub-agent cannot infer the outer conversation automatically. Bind the
 conversation when constructing the sub-agent, or create one orchestrator tool
@@ -91,8 +91,23 @@ set per application conversation.
 An A2A agent owns its instructions and tools. Requests that require local tool
 calls or a Rig output schema therefore fail instead of silently dropping those
 requirements. Sampling parameters are ignored because decoding belongs to the
-remote agent. A2A does not report token usage, so responses use zero-valued Rig
-usage metrics.
+remote agent. A2A does not report token usage, so response usage counters are
+absent (`None`). Typed generation options are unsupported and follow Rig's
+unsupported-option policy.
+
+### Paused tasks and finish-reason policy
+
+An `input-required` task retains its context and task IDs for the next turn
+and reports `FinishReason::Other("input_required")`, distinct from completion.
+Rig 0.44 defaults to treating unknown finish reasons as errors. No acceptance
+policy is forced by this adapter. For a remote that intentionally asks for
+more input, opt in on that A2A run with
+`.accept_unknown_finish_reasons(true)` (or on its agent builder or direct
+`CompletionRequest`). This allows the clarification to be returned normally;
+the next run with the same `a2a_conversation` resumes the paused task. Keep this
+policy scoped to that remote, not an orchestrator's unrelated models. Remote
+failed, rejected, canceled and auth-required tasks still produce provider
+errors even when acceptance is enabled.
 
 See the examples for direct requests, model-backed agents, streaming, and
 sub-agent composition.

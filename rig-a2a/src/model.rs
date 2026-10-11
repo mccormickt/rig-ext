@@ -27,6 +27,13 @@
 //! `usage` reports every counter as absent (`None`): A2A has no token
 //! accounting.
 //!
+//! A paused task reports `FinishReason::Other("input_required")` and retains
+//! the IDs needed to resume it. Rig 0.44 fails closed on unknown finish reasons;
+//! callers expecting clarification turns must explicitly set
+//! `accept_unknown_finish_reasons(true)` on their A2A request, run or builder.
+//! This adapter does not override that policy, and failed remote tasks still
+//! produce provider errors even when it is enabled.
+//!
 //! # Conversation threading
 //!
 //! Three ways to thread, in increasing precedence:
@@ -75,7 +82,7 @@ use rig_core::completion::{
 use rig_core::driver::{Exchange, Model, Opened, Opening};
 use rig_core::error::{EncodeError, ProviderError};
 use rig_core::message::{Message as RigMessage, ToolChoice, UserContent};
-use rig_core::operation::{Completion, Finish, TextPart};
+use rig_core::operation::{Block, Completion, Finish};
 use rig_core::streaming::Streamed;
 use rig_core::wire::{Decoder, Descriptor, Flow, Mode, Out, Wire, WireEvent};
 
@@ -408,6 +415,35 @@ pub enum A2AFrame {
     Stream(a2a::StreamResponse, Option<ConversationId>),
 }
 
+/// The remote reply as received: a unary response or an ordered array of events.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct A2ADocument {
+    unary: Option<serde_json::Value>,
+    events: Vec<serde_json::Value>,
+}
+
+impl rig_core::wire::document::Serves<Completion> for A2ADocument {}
+
+impl rig_core::wire::document::Reassemble<A2AFrame> for A2ADocument {
+    fn absorb(&mut self, frame: &A2AFrame) {
+        match frame {
+            A2AFrame::Unary(response, ..) => {
+                self.unary = serde_json::to_value(response).ok();
+            }
+            A2AFrame::Stream(event, ..) => {
+                if let Ok(event) = serde_json::to_value(event) {
+                    self.events.push(event);
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> serde_json::Value {
+        self.unary.unwrap_or(serde_json::Value::Array(self.events))
+    }
+}
+
 #[derive(Clone, Copy)]
 struct A2ATransport;
 
@@ -459,9 +495,12 @@ impl Wire for A2AModel {
     type Payload = A2APayload;
     type Frame = A2AFrame;
     type Decoder<'id> = A2ADecoder<'id>;
+    type Reassembler = A2ADocument;
 
     fn describe(&self) -> Descriptor<'_> {
-        Descriptor::new(PROVIDER).model(self.agent_name.as_str())
+        Descriptor::new(PROVIDER)
+            .model(self.agent_name.as_str())
+            .replay(self)
     }
     fn encode(&self, request: CompletionRequest, mode: Mode) -> Result<A2APayload, EncodeError> {
         let outbound = self.build_request(request).map_err(EncodeError::request)?;
@@ -475,9 +514,67 @@ impl Wire for A2AModel {
     fn decoder<'id>(&self) -> A2ADecoder<'id> {
         A2ADecoder {
             model: self.clone(),
-            text: None,
             last: None,
             unary: false,
+            brand: std::marker::PhantomData,
+        }
+    }
+}
+
+impl rig_core::completion::ReplayTarget for A2AModel {
+    fn api(&self) -> rig_core::message::Api {
+        rig_core::message::Api::from(PROVIDER.to_owned())
+    }
+    fn provider(&self) -> &str {
+        PROVIDER
+    }
+    fn model(&self) -> &str {
+        &self.agent_name
+    }
+    fn accepts(&self, _model: &str) -> rig_core::completion::Accepts {
+        rig_core::completion::Accepts::TEXT
+    }
+    fn takes_documents(&self) -> bool {
+        true
+    }
+    fn map_options(
+        &self,
+        _request: &CompletionRequest,
+        fields: rig_core::completion::options::OptionFields<'_>,
+    ) -> rig_core::completion::options::OptionMap {
+        use rig_core::completion::options::{Mapping, OptionFields, OptionMap};
+        let OptionFields {
+            reasoning,
+            cache,
+            service_tier,
+            verbosity,
+            parallel_tool_calls,
+            top_p,
+            seed,
+            stop,
+        } = fields;
+        let unsupported = |_| Mapping::unsupported("an A2A agent owns its generation settings");
+        OptionMap {
+            reasoning: Mapping::of(reasoning, unsupported),
+            cache: Mapping::of(cache, |_| Mapping::unsupported("A2A has no cache setting")),
+            service_tier: Mapping::of(service_tier, |_| {
+                Mapping::unsupported("A2A has no service tier")
+            }),
+            verbosity: Mapping::of(verbosity, |_| {
+                Mapping::unsupported("an A2A agent owns its generation settings")
+            }),
+            parallel_tool_calls: Mapping::of(parallel_tool_calls, |_| {
+                Mapping::unsupported("an A2A agent owns its tools")
+            }),
+            top_p: Mapping::of(top_p, |_| {
+                Mapping::unsupported("an A2A agent owns its generation settings")
+            }),
+            seed: Mapping::of(seed, |_| {
+                Mapping::unsupported("an A2A agent owns its generation settings")
+            }),
+            stop: Mapping::of_stop(stop, |_| {
+                Mapping::unsupported("an A2A agent owns its generation settings")
+            }),
         }
     }
 }
@@ -491,23 +588,27 @@ impl From<A2AModel> for rig_core::driver::DynModel<Completion> {
 #[doc(hidden)]
 pub struct A2ADecoder<'id> {
     model: A2AModel,
-    text: Option<TextPart<'id>>,
     last: Option<A2AThreadInfo>,
     unary: bool,
+    brand: std::marker::PhantomData<&'id ()>,
 }
 
 impl<'id> A2ADecoder<'id> {
-    fn emit(&mut self, text: String, out: &mut Out<'id, Completion>) {
-        let part = self.text.get_or_insert_with(|| out.text());
-        out.push_text(part, &text);
+    fn emit(&mut self, text: String, out: &mut Out<'id, Completion>) -> Result<(), ProviderError> {
+        out.run(Block::Text, &text)?;
+        Ok(())
     }
     fn finish(&mut self, out: Out<'id, Completion>, message_id: Option<String>) -> Flow {
         out.end(Finish {
             usage: Usage::default(),
             reason: Some(self.last.as_ref().map_or(FinishReason::Stop, finish_reason)),
-            message_id,
-            response_id: self.last.as_ref().and_then(|i| i.task_id.clone()),
+            response_id: self
+                .last
+                .as_ref()
+                .and_then(|i| i.task_id.clone())
+                .or(message_id),
             model: Some(self.model.agent_name.clone()),
+            error: None,
         })
     }
 }
@@ -553,7 +654,7 @@ impl<'id> Decoder<'id, Completion, A2AFrame> for A2ADecoder<'id> {
                         (body, Some(message.message_id.clone()))
                     }
                 };
-                self.emit(text, &mut out);
+                self.emit(text, &mut out)?;
                 Ok(self.finish(out, id))
             }
             A2AFrame::Stream(event, conversation) => {
@@ -565,7 +666,7 @@ impl<'id> Decoder<'id, Completion, A2AFrame> for A2ADecoder<'id> {
                 self.last = Some(info);
                 let text = stream_text(event)?;
                 if !text.is_empty() {
-                    self.emit(text, &mut out);
+                    self.emit(text, &mut out)?;
                 }
                 Ok(Flow::More)
             }
@@ -708,7 +809,7 @@ fn log_ignored(request: &CompletionRequest) {
 fn push_message_text(parts: &mut Vec<Part>, message: &RigMessage) {
     let (prefix, text) = match message {
         RigMessage::User { content } => ("", user_text(content)),
-        RigMessage::Assistant { content, .. } => ("assistant: ", assistant_text(content)),
+        RigMessage::Assistant(message) => ("assistant: ", assistant_text(&message.content)),
         RigMessage::System { content, .. } => ("", content.clone()),
     };
     if text.trim().is_empty() {
@@ -853,25 +954,14 @@ mod tests {
     use super::*;
 
     fn request() -> CompletionRequest {
-        CompletionRequest {
-            model: None,
-            chat_history: vec![RigMessage::user("hello")],
-            documents: vec![],
-            tools: vec![],
-            temperature: None,
-            max_tokens: None,
-            tool_choice: None,
-            additional_params: None,
-            output_schema: None,
-            record_telemetry_content: false,
-        }
+        CompletionRequest::new("hello")
     }
 
     #[test]
     fn tools_are_rejected_rather_than_ignored() {
         let mut req = request();
         req.tools.push(rig_core::completion::ToolDefinition {
-            name: "add".to_string(),
+            name: rig_core::message::ToolName::new("add").expect("non-empty tool name"),
             description: "adds".to_string(),
             parameters: serde_json::json!({}),
         });

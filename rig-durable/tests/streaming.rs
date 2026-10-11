@@ -63,18 +63,17 @@ async fn text_deltas_produce_output_and_usage() {
     )
     .await;
     let response = result.unwrap();
-    assert_eq!(response.output, "hello");
+    assert_eq!(response.output(), "hello");
     assert_eq!(response.usage.total_tokens, Some(7));
     assert_eq!(count, 1);
 }
 
 #[tokio::test]
-async fn explicit_message_id_takes_precedence_over_the_terminal_id() {
+async fn streamed_response_id_is_preserved() {
     let model = MockCompletionModel::from_stream_turns([[
-        MockStreamEvent::message_id("message-event"),
         MockStreamEvent::text("done"),
         MockStreamEvent::FinalResponse(Finish {
-            message_id: Some("terminal-message".into()),
+            response_id: Some("terminal-message".into()),
             ..mock_final(Usage::default())
         }),
     ]]);
@@ -88,19 +87,27 @@ async fn explicit_message_id_takes_precedence_over_the_terminal_id() {
     .0
     .unwrap();
     assert_eq!(
-        response.completion_calls[0].message_id.as_deref(),
-        Some("message-event")
+        response.completion_calls[0].response_id.as_deref(),
+        Some("terminal-message")
     );
     let messages = serde_json::to_string(&response.messages).unwrap();
-    assert!(messages.contains("message-event"));
-    assert!(!messages.contains("terminal-message"));
+    assert!(messages.contains("terminal-message"));
+    let restored: Vec<rig::completion::Message> = serde_json::from_str(&messages).unwrap();
+    assert_eq!(restored, response.messages);
+    let rig::completion::Message::Assistant(assistant) = restored.last().unwrap() else {
+        panic!("expected assistant answer");
+    };
+    assert_eq!(
+        assistant.origin.as_ref().unwrap().response_id.as_deref(),
+        Some("terminal-message")
+    );
+    assert_eq!(assistant.stop, Some(rig::message::StopReason::Stop));
 }
 
 #[tokio::test]
 async fn complete_tool_call_executes_and_stream_continues() {
     let model = MockCompletionModel::from_stream_turns([
         vec![
-            MockStreamEvent::message_id("assistant-message"),
             MockStreamEvent::tool_call("provider-id", "add", serde_json::json!({"x": 2, "y": 3}))
                 .with_call_id("provider-call"),
             MockStreamEvent::final_response_with_default_usage(),
@@ -118,12 +125,10 @@ async fn complete_tool_call_executes_and_stream_continues() {
     )
     .await;
     let response = result.unwrap();
-    assert_eq!(response.output, "5");
+    assert_eq!(response.output(), "5");
     assert_eq!(count, 2);
     let history = serde_json::to_string(&response.messages).unwrap();
-    assert!(history.contains("provider-id"));
     assert!(history.contains("provider-call"));
-    assert!(history.contains("assistant-message"));
 }
 
 #[tokio::test]
@@ -150,7 +155,7 @@ async fn tool_call_deltas_assemble_and_nameless_call_is_dropped() {
         .await
         .0
         .unwrap()
-        .output,
+        .output(),
         "9"
     );
 
@@ -168,7 +173,7 @@ async fn tool_call_deltas_assemble_and_nameless_call_is_dropped() {
     )
     .await;
     let response = result.unwrap();
-    assert_eq!(response.output, "");
+    assert_eq!(response.output(), "");
     assert_eq!(count, 1);
 }
 
@@ -191,7 +196,7 @@ async fn unknown_and_reasoning_are_durable_but_unknown_is_not_history() {
     .unwrap();
     let history = serde_json::to_string(&response.messages).unwrap();
     assert!(history.contains("think"));
-    assert!(!history.contains("native"));
+    assert!(!history.contains("\"native\":true"));
     assert_eq!(response.usage.total_tokens, None);
 }
 
@@ -216,7 +221,7 @@ async fn truncated_streams_retry_without_committing_content_or_tools() {
     )
     .await;
 
-    assert_eq!(response.unwrap().output, "recovered");
+    assert_eq!(response.unwrap().output(), "recovered");
     assert_eq!(requests, 2);
 }
 
@@ -236,7 +241,7 @@ async fn provider_errors_retry_and_unknown_tools_fail_closed() {
         "stream-retry",
     )
     .await;
-    assert_eq!(response.unwrap().output, "recovered");
+    assert_eq!(response.unwrap().output(), "recovered");
     assert_eq!(requests, 2);
 
     let unknown = MockCompletionModel::from_stream_turns([[
@@ -306,7 +311,7 @@ async fn checkpointing_streamed_turns_does_not_repeat_provider_calls() {
         .unwrap()
         .unwrap();
 
-    assert_eq!(response.output, "42");
+    assert_eq!(response.output(), "42");
     assert_eq!(response.usage.total_tokens, Some(3));
     assert_eq!(model.request_count(), 2);
     assert_eq!(

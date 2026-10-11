@@ -24,7 +24,7 @@ npm install --global esbuild
 
 Use celld 0.6.0 or later. The turn transaction contains the nested transaction of the index upsert, and earlier releases reject that nesting.
 
-The workspace pins workers-rs 0.8.3 because it shares the `wasm-streams` 0.5 ABI used by Rig 0.43 and reqwest 0.13. See the [workspace constraints](../../../README.md#constraints).
+The workspace pins workers-rs 0.8.3 because it shares the `wasm-streams` 0.5 ABI used by Rig 0.44 and reqwest 0.13. See the [workspace constraints](../../../README.md#constraints).
 
 ## Build
 

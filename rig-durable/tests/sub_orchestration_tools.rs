@@ -20,7 +20,7 @@ use rig_durable::{
 
 fn definition() -> ToolDefinition {
     ToolDefinition {
-        name: "child".into(),
+        name: rig::message::ToolName::new("child").unwrap(),
         description: "Run child".into(),
         parameters: serde_json::json!({"type":"object"}),
     }
@@ -81,7 +81,7 @@ async fn json_output_and_correlations_reach_the_model() {
         sub_orchestration_tool(definition(), "Child", None),
     )
     .await;
-    assert_eq!(result.unwrap().output, "done");
+    assert_eq!(result.unwrap().output(), "done");
     let request = serde_json::to_value(&model.requests()[1])
         .unwrap()
         .to_string();
@@ -102,7 +102,7 @@ async fn raw_text_output_and_continue_as_new_complete() {
         sub_orchestration_tool(definition(), "Child", None),
     )
     .await;
-    assert_eq!(result.unwrap().output, "done");
+    assert_eq!(result.unwrap().output(), "done");
     let request = serde_json::to_value(&model.requests()[1])
         .unwrap()
         .to_string();

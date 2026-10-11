@@ -11,7 +11,8 @@ use rig_core::{
     error::ProviderError,
     operation,
     vector_store::{
-        InsertDocuments, VectorSearchRequest, VectorStoreError, VectorStoreIndex, request::Filter,
+        InsertDocuments, VectorSearchIdResult, VectorSearchRequest, VectorSearchResult,
+        VectorStoreError, VectorStoreIndex, request::Filter,
     },
     wasm_compat::{WasmCompatSend, WasmCompatSync},
     wire::Wire,
@@ -709,13 +710,17 @@ where
     async fn top_n<T: DeserializeOwned + WasmCompatSend>(
         &self,
         request: VectorSearchRequest<Self::Filter>,
-    ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
+    ) -> Result<Vec<VectorSearchResult<T>>, VectorStoreError> {
         self.search(request)
             .await?
             .into_iter()
             .map(|result| {
                 serde_json::from_str(&result.document)
-                    .map(|document| (result.score, result.id, document))
+                    .map(|document| VectorSearchResult {
+                        score: result.score,
+                        id: result.id,
+                        document,
+                    })
                     .map_err(VectorStoreError::from)
             })
             .collect()
@@ -724,12 +729,15 @@ where
     async fn top_n_ids(
         &self,
         request: VectorSearchRequest<Self::Filter>,
-    ) -> Result<Vec<(f64, String)>, VectorStoreError> {
+    ) -> Result<Vec<VectorSearchIdResult>, VectorStoreError> {
         Ok(self
             .search(request)
             .await?
             .into_iter()
-            .map(|result| (result.score, result.id))
+            .map(|result| VectorSearchIdResult {
+                score: result.score,
+                id: result.id,
+            })
             .collect())
     }
 }

@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     ]);
     let orchestrator = AgentBuilder::new(model)
         .preamble("Delegate research to the librarian sub-agent.")
-        .dynamic_tool(researcher.into_tool())
+        .dynamic_tool(researcher.into_tool()?)
         .build();
     println!(
         "orchestrator: {}\n",
@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
     // be invoked, so the request is refused instead.
     let mut with_tools = rig_core::completion::CompletionRequest::new("hi");
     with_tools.tools.push(rig_core::completion::ToolDefinition {
-        name: "add".to_string(),
+        name: rig_core::message::ToolName::new("add")?,
         description: "adds two numbers".to_string(),
         parameters: serde_json::json!({}),
     });

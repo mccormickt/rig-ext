@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .client()
         .list_executions(run.instance_id())
         .await?;
-    println!("{}", response.output);
+    println!("{}", response.output());
     println!("Duroxide executions: {executions:?}");
     orchestrator.shutdown(None).await;
     Ok(())

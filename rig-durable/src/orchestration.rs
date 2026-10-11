@@ -503,7 +503,7 @@ impl Engine<'_> {
                 let response: PromptResponse =
                     serde_json::from_str(&raw).map_err(|error| error.to_string())?;
                 (
-                    vec![ToolResultContent::text(response.output)],
+                    vec![ToolResultContent::text(response.output())],
                     ToolOutcome::routed(position, &call),
                 )
             }
