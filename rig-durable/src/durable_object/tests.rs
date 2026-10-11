@@ -77,6 +77,26 @@ impl Wake for Clock {
 }
 
 #[tokio::test]
+async fn old_schema_is_rejected_before_loading_typed_state() -> Result<(), Error> {
+    let db = Database::new()?;
+    db.exec(
+        "CREATE TABLE rig_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        &[],
+    )?;
+    db.exec("INSERT INTO rig_meta VALUES ('schema', '1')", &[])?;
+    // Deliberately no typed-state tables: opening must stop at the schema gate.
+    let result = Builder::new(MockCompletionModel::from_turns([MockTurn::text("unused")])).build(
+        db,
+        Clock::default(),
+        "old-session",
+    );
+    assert!(
+        matches!(result, Err(Error::Invalid(message)) if message == "unsupported Durable Object schema version")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn tools_and_deduplication_survive_reopen() -> Result<(), Error> {
     let db = Database::new()?;
     let model = MockCompletionModel::from_turns([

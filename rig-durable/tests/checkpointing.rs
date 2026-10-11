@@ -45,6 +45,21 @@ async fn run(checkpoint: CheckpointPolicy, instance: &str) -> (PromptResponse, V
         .unwrap()
         .unwrap();
     let executions = client.list_executions(instance).await.unwrap();
+    if instance == "checkpointed" {
+        if let Ok(directory) = std::env::var("RIG_DURABLE_RECORD_DIR") {
+            for execution in &executions {
+                let history = client
+                    .read_execution_history(instance, *execution)
+                    .await
+                    .unwrap();
+                std::fs::write(
+                    format!("{directory}/duroxide-continuation-{execution}.json"),
+                    serde_json::to_vec(&history).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+    }
     let requests = model.requests().len();
     runtime.shutdown(None).await;
     (response, executions, requests)

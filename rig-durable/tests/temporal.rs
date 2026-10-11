@@ -308,6 +308,17 @@ async fn temporal_retries_tools_with_stable_invocation_identity() {
             .get_result(WorkflowGetResultOptions::default())
             .await
             .unwrap();
+        if let Ok(directory) = std::env::var("RIG_DURABLE_RECORD_DIR") {
+            std::fs::write(
+                format!("{directory}/temporal-retry.json"),
+                handle
+                    .fetch_history(Default::default())
+                    .to_json()
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+        }
         shutdown();
         result
     };
@@ -464,6 +475,17 @@ async fn temporal_approval_executes_only_approved_tools() {
             .await
             .unwrap();
 
+        if let Ok(directory) = std::env::var("RIG_DURABLE_RECORD_DIR") {
+            std::fs::write(
+                format!("{directory}/temporal-approval.json"),
+                approved
+                    .fetch_history(Default::default())
+                    .to_json()
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+        }
         let denied = client
             .start_workflow(
                 TemporalAgentWorkflow::run,
@@ -669,6 +691,17 @@ async fn temporal_session_serializes_updates_and_drains_active_steering_on_close
             .get_result(WorkflowGetResultOptions::default())
             .await
             .unwrap();
+        if let Ok(directory) = std::env::var("RIG_DURABLE_RECORD_DIR") {
+            std::fs::write(
+                format!("{directory}/temporal-steering.json"),
+                handle
+                    .fetch_history(Default::default())
+                    .to_json()
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+        }
         shutdown();
         (response, result)
     };

@@ -40,11 +40,11 @@ pub(super) fn initialize(db: &impl SqlDatabase) -> Result<(), Error> {
         db.exec("CREATE TABLE IF NOT EXISTS rig_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)", &[])?;
         let version = db.exec("SELECT value FROM rig_meta WHERE key = 'schema'", &[])?;
         if let Some(row) = version.first() {
-            if row.get("value").and_then(Value::as_str) != Some("1") {
+            if row.get("value").and_then(Value::as_str) != Some("2") {
                 return Err(Error::Invalid("unsupported Durable Object schema version".into()));
             }
         } else {
-            db.exec("INSERT INTO rig_meta VALUES ('schema', '1')", &[])?;
+            db.exec("INSERT INTO rig_meta VALUES ('schema', '2')", &[])?;
         }
         for statement in [
             "CREATE TABLE IF NOT EXISTS rig_entries (id INTEGER PRIMARY KEY, data TEXT NOT NULL)",

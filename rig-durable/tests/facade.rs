@@ -410,6 +410,24 @@ async fn caller_run_ids_are_scoped_by_agent_and_version() {
         .unwrap();
 
     assert_ne!(first_run.instance_id(), second_run.instance_id());
+    // Reconnecting to the same application identity cannot attach to an old
+    // Rig generation's run or session, even at the same application semver.
+    use sha2::{Digest, Sha256};
+    let mut old_digest = Sha256::new();
+    for part in ["first", "1.0.0", "shared-caller-id"] {
+        old_digest.update((part.len() as u64).to_be_bytes());
+        old_digest.update(part.as_bytes());
+    }
+    let old_hash = format!("{:x}", old_digest.finalize());
+    assert_ne!(first_run.instance_id(), format!("rig-agent-{old_hash}"));
+    assert_ne!(
+        orchestrator
+            .agent("first")
+            .unwrap()
+            .session("shared-caller-id")
+            .instance_id(),
+        format!("rig-session-{old_hash}")
+    );
     assert_eq!(first_run.wait().await.unwrap().output(), "first output");
     assert_eq!(second_run.wait().await.unwrap().output(), "second output");
     orchestrator.shutdown(None).await;

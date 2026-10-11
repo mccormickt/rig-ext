@@ -27,7 +27,7 @@ use crate::{
     },
 };
 
-pub const SESSION_FORMAT_VERSION: u32 = 1;
+pub const SESSION_FORMAT_VERSION: u32 = 2;
 /// Duroxide queue that carries [`SessionCommand`]s.
 pub const SESSION_INBOX_QUEUE: &str = "RigSessionInboxV1";
 /// KV key of the [`SubmissionLedger`].
@@ -46,7 +46,7 @@ pub fn session_result_key(submission_id: &str) -> String {
 }
 
 /// Orchestration input of a session. It is also the continuation payload.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct SessionInput {
     pub format_version: u32,
     pub context: ContextState,
@@ -68,6 +68,51 @@ pub struct SessionInput {
     pub closed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<ConfigSnapshot>,
+}
+
+impl<'de> Deserialize<'de> for SessionInput {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value
+            .get("format_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(SESSION_FORMAT_VERSION))
+        {
+            return Err(serde::de::Error::custom(
+                "unsupported session persistence generation",
+            ));
+        }
+        #[derive(Deserialize)]
+        struct Wire {
+            format_version: u32,
+            context: ContextState,
+            ledger: SubmissionLedger,
+            #[serde(default)]
+            queued: Vec<SubmitInput>,
+            #[serde(default)]
+            retained_results: Vec<String>,
+            #[serde(default)]
+            rejections: Vec<SessionRejection>,
+            #[serde(default)]
+            generation: u32,
+            #[serde(default)]
+            closed: bool,
+            #[serde(default)]
+            snapshot: Option<ConfigSnapshot>,
+        }
+        let wire: Wire = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            format_version: wire.format_version,
+            context: wire.context,
+            ledger: wire.ledger,
+            queued: wire.queued,
+            retained_results: wire.retained_results,
+            rejections: wire.rejections,
+            generation: wire.generation,
+            closed: wire.closed,
+            snapshot: wire.snapshot,
+        })
+    }
 }
 
 impl SessionInput {

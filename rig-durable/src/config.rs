@@ -53,7 +53,8 @@ pub enum CheckpointPolicy {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointConfig {
     pub policy: CheckpointPolicy,
-    /// Optional orchestration version to select for the new execution.
+    /// Optional application orchestration version to select for the new execution.
+    /// This cannot migrate between crate-owned Rig persistence generations.
     pub target_version: Option<String>,
 }
 

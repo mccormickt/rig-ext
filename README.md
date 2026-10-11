@@ -26,4 +26,5 @@ Each crate README lists its examples and any extra build requirements.
 - The workspace pins `worker` to 0.8.3. Rig 0.44 uses `wasm-streams` 0.5. workers-rs 0.8.4 and later use `wasm-streams` 0.6. Both versions in one Worker make duplicate WASM symbols.
 - `rig-a2a` supports native targets only.
 - `rig-durable` supports WASM with default features disabled. Its `duroxide` and `temporal` backends are native-only; use `durable-object` on Workers.
+- Rig 0.44 changes durable persistence formats. Existing runs and schema-1 Durable Objects need the old deployment. Read the [`rig-durable` upgrade notes](rig-durable/README.md#rig-044) before deployment.
 - `rig-celld/storage` supports Cloudflare and celld SQLite Durable Objects. `sqlite-vec` requires celld 0.6.0 or later. See the [`rig-celld` README](rig-celld/README.md#configure-celld).

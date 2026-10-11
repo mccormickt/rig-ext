@@ -2,17 +2,19 @@
 
 use crate::activity_types::InvocationContract;
 
-pub const ORCHESTRATION: &str = "RigDurableAgentV1";
-pub const COMPLETION_ACTIVITY: &str = "RigModelCompletionV1";
-pub const STREAMING_COMPLETION_ACTIVITY: &str = "RigModelStreamingCompletionV1";
+/// Crate-owned persistence generation, independent of application semver.
+pub const PERSISTENCE_GENERATION: u32 = 2;
+pub const ORCHESTRATION: &str = "RigDurableAgentG2V1";
+pub const COMPLETION_ACTIVITY: &str = "RigModelCompletionG2V1";
+pub const STREAMING_COMPLETION_ACTIVITY: &str = "RigModelStreamingCompletionG2V1";
 /// Tool activity under [`InvocationContract::Legacy`].
-pub const TOOL_ACTIVITY: &str = "RigToolExecutionV1";
+pub const TOOL_ACTIVITY: &str = "RigToolExecutionG2V1";
 /// Tool activity under [`InvocationContract::Logical`].
-pub const LOGICAL_TOOL_ACTIVITY: &str = "RigToolExecutionV2";
+pub const LOGICAL_TOOL_ACTIVITY: &str = "RigToolExecutionG2V2";
 /// Long-lived session orchestration.
-pub const SESSION_ORCHESTRATION: &str = "RigDurableAgentSessionV1";
+pub const SESSION_ORCHESTRATION: &str = "RigDurableAgentSessionG2V1";
 /// Summarization activity used by completed-prompt compaction.
-pub const COMPACTION_ACTIVITY: &str = "RigContextCompactionV1";
+pub const COMPACTION_ACTIVITY: &str = "RigContextCompactionG2V1";
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeNames {
@@ -41,15 +43,18 @@ impl RuntimeNames {
     }
 
     pub(crate) fn for_agent(name: &str, version: &str) -> Self {
-        let orchestration = format!("rig-duroxide::agent::{name}");
-        let activity_prefix = format!("rig-duroxide::activity::{name}::{version}");
+        let orchestration = format!("rig-duroxide::g{PERSISTENCE_GENERATION}::agent::{name}");
+        let activity_prefix =
+            format!("rig-duroxide::g{PERSISTENCE_GENERATION}::activity::{name}::{version}");
         Self {
             orchestration,
             completion_activity: format!("{activity_prefix}::completion::v1"),
             streaming_completion_activity: format!("{activity_prefix}::streaming::v1"),
             tool_activity: format!("{activity_prefix}::tool::v1"),
             logical_tool_activity: format!("{activity_prefix}::tool::v2"),
-            session_orchestration: format!("rig-duroxide::session::{name}"),
+            session_orchestration: format!(
+                "rig-duroxide::g{PERSISTENCE_GENERATION}::session::{name}"
+            ),
             compaction_activity: format!("{activity_prefix}::compaction::v1"),
         }
     }

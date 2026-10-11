@@ -790,6 +790,7 @@ impl DurableAgent {
 
 fn instance_id(metadata: &AgentMetadata, prefix: &str, id: &str) -> String {
     let mut digest = Sha256::new();
+    digest.update(crate::names::PERSISTENCE_GENERATION.to_be_bytes());
     let version = metadata.version.to_string();
     for part in [metadata.name.as_str(), version.as_str(), id] {
         digest.update((part.len() as u64).to_be_bytes());

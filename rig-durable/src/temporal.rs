@@ -257,7 +257,7 @@ impl TemporalWorkflowState for TemporalAgentWorkflow {
 
 #[workflow_methods]
 impl TemporalAgentWorkflow {
-    #[run(name = "RigTemporalAgentV1")]
+    #[run(name = "RigTemporalAgentG2V1")]
     pub async fn run(
         ctx: &mut WorkflowContext<Self>,
         input: TemporalAgentInput,
@@ -595,7 +595,7 @@ impl TemporalAgentSessionWorkflow {
         }
     }
 
-    #[run(name = "RigTemporalAgentSessionV1")]
+    #[run(name = "RigTemporalAgentSessionG2V1")]
     pub async fn run(
         ctx: &mut WorkflowContext<Self>,
     ) -> WorkflowResult<TemporalAgentSessionResult> {
@@ -1056,7 +1056,7 @@ struct TemporalActivities {
 
 #[activities]
 impl TemporalActivities {
-    #[activity(name = "RigTemporalModelCompletionV1")]
+    #[activity(name = "RigTemporalModelCompletionG2V1")]
     async fn complete(
         self: Arc<Self>,
         _ctx: ActivityContext,
@@ -1067,9 +1067,9 @@ impl TemporalActivities {
             .map_err(activity_error)
     }
 
-    /// Legacy contract: payloads are byte-identical to registrations made
-    /// before tool policies existed.
-    #[activity(name = "RigTemporalToolExecutionV1")]
+    /// Legacy invocation shape within persistence generation 2. This does not
+    /// register or adapt pre-0.44 activity identities.
+    #[activity(name = "RigTemporalToolExecutionG2V1")]
     async fn execute_tool(
         self: Arc<Self>,
         _ctx: ActivityContext,
@@ -1080,7 +1080,7 @@ impl TemporalActivities {
 
     /// Logical contract: the input carries the logical call key and policy;
     /// the activity adds the physical attempt Temporal reports.
-    #[activity(name = "RigTemporalToolExecutionV2")]
+    #[activity(name = "RigTemporalToolExecutionG2V2")]
     async fn execute_logical_tool(
         self: Arc<Self>,
         ctx: ActivityContext,
@@ -1095,7 +1095,7 @@ impl TemporalActivities {
     }
 
     /// Run the registered policy and compactor over a session transcript.
-    #[activity(name = "RigTemporalContextCompactionV1")]
+    #[activity(name = "RigTemporalContextCompactionG2V1")]
     async fn compact(
         self: Arc<Self>,
         _ctx: ActivityContext,

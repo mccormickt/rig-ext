@@ -14,6 +14,30 @@ Use both native backends with `features = ["temporal"]`.
 Use Workers with `default-features = false, features = ["durable-object"]`.
 The backend-neutral core also builds without any features on WASM.
 
+## Rig 0.44
+
+Use the published Rig 0.44 APIs: `PromptResponse::output()` and
+`DurableResponse::output()` return an owned `String`, and tool definitions use
+validated `rig::message::ToolName` values. Assistant turns retain Rig's `origin`
+and `stop` metadata through model activities, streaming, and durable storage.
+Stream start records also retain the optional tool name.
+
+Persisted pre-0.44 histories are not interchangeable with new histories: Rig
+changed provider call IDs and the serialized agent-run envelope from format 1
+to format 2. Crate-owned persistence generation **2** scopes run/session and
+Rig-bearing activity identities and facade IDs, independently of application
+semver and Legacy/Logical invocation policy. Old continuations, session envelopes,
+and Durable Object SQL schema 1 are deliberately rejected, not adapted.
+
+For Temporal, use separate old/new task queues or pinned deployment routing so
+old executions stay on old workers. For Duroxide, drain the old deployment before
+switching, or use separate stores: old/new registries sharing a store are unsafe
+because either dispatcher can claim incompatible work. Durable Objects require
+new object storage identities; existing schema 1 objects must stay on old code.
+`checkpoint.target_version` selects only an application version, not a Rig
+migration. The recorded legacy fixtures are unchanged identity-exclusion evidence;
+generation 2 replay fixtures are recorded separately with Rig 0.44 runtimes.
+
 This crate is unreleased and remains at version `0.1.0`. The Rust API docs include
 checked examples for Rig models and tools, sessions, approvals, compaction, and
 the native backends. Build and open them with:

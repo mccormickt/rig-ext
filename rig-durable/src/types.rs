@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{config::ConfigSnapshot, outcome::ToolOutcome};
 
-const CONTINUATION_FORMAT_VERSION: u32 = 1;
+const CONTINUATION_FORMAT_VERSION: u32 = 2;
 
 /// Persisted orchestration input.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -17,15 +17,40 @@ pub struct AgentInput {
     /// the client supplied none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<ConfigSnapshot>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_continuation"
+    )]
     continuation: Option<ContinuationEnvelope>,
+}
+
+// Inspect the crate envelope as untyped JSON before asking Rig to decode state.
+fn deserialize_continuation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ContinuationEnvelope>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else { return Ok(None) };
+    if value.get("kind").and_then(serde_json::Value::as_str) != Some("v2")
+        || value
+            .get("format_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(CONTINUATION_FORMAT_VERSION))
+    {
+        return Err(serde::de::Error::custom(
+            "unsupported agent continuation persistence generation",
+        ));
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
 }
 
 /// Crate-owned, versioned wire state used only by `continue_as_new`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ContinuationEnvelope {
-    V1 {
+    V2 {
         format_version: u32,
         generation: u32,
         operations: u32,
@@ -78,7 +103,7 @@ impl AgentInput {
                 prompt_index: 0,
                 tool_outcomes: Vec::new(),
             }),
-            Some(ContinuationEnvelope::V1 {
+            Some(ContinuationEnvelope::V2 {
                 format_version,
                 generation,
                 operations: _,
@@ -111,7 +136,7 @@ impl AgentInput {
             prompt: Message::user(""),
             history: Vec::new(),
             snapshot,
-            continuation: Some(ContinuationEnvelope::V1 {
+            continuation: Some(ContinuationEnvelope::V2 {
                 format_version: CONTINUATION_FORMAT_VERSION,
                 generation,
                 operations,

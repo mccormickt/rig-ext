@@ -1,12 +1,13 @@
-//! Replay real histories recorded with the pre-policy baseline.
+//! Old histories must never resolve to incompatible generation 2 code.
 
 #[cfg(feature = "temporal")]
 #[tokio::test]
-async fn temporal_replays_recorded_retries_approval_and_steering() {
+async fn temporal_excludes_every_legacy_workflow_identity() {
     use rig_durable::temporal::{TemporalAgentSessionWorkflow, TemporalAgentWorkflow};
     use temporalio_client::WorkflowHistory;
-    use temporalio_sdk::workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions};
-
+    use temporalio_sdk::workflow_replayer::{
+        WorkflowReplayError, WorkflowReplayFailure, WorkflowReplayer, WorkflowReplayerOptions,
+    };
     let mut options = WorkflowReplayerOptions::new().build();
     options
         .register_workflow::<TemporalAgentWorkflow>()
@@ -15,96 +16,95 @@ async fn temporal_replays_recorded_retries_approval_and_steering() {
         .register_workflow::<TemporalAgentSessionWorkflow>()
         .unwrap();
     let replayer = WorkflowReplayer::new(options).unwrap();
-    for bytes in [
-        include_bytes!("fixtures/legacy/temporal-retry.json").as_slice(),
-        include_bytes!("fixtures/legacy/temporal-approval.json").as_slice(),
-        include_bytes!("fixtures/legacy/temporal-steering.json").as_slice(),
+    for (bytes, old_type) in [
+        (
+            include_bytes!("fixtures/legacy/temporal-retry.json").as_slice(),
+            "RigTemporalAgentV1",
+        ),
+        (
+            include_bytes!("fixtures/legacy/temporal-approval.json").as_slice(),
+            "RigTemporalAgentV1",
+        ),
+        (
+            include_bytes!("fixtures/legacy/temporal-steering.json").as_slice(),
+            "RigTemporalAgentSessionV1",
+        ),
     ] {
-        replayer
+        let error = replayer
             .replay_workflow(WorkflowHistory::from_json(bytes).unwrap())
             .await
-            .unwrap();
+            .unwrap_err();
+        let WorkflowReplayError::Replay(WorkflowReplayFailure::WorkflowTaskFailure { message }) =
+            error
+        else {
+            panic!("expected missing workflow type, got {error:?}");
+        };
+        assert!(
+            message.contains(&format!("Workflow type {old_type} not found")),
+            "{message}"
+        );
     }
 }
 
 #[cfg(feature = "duroxide")]
-#[tokio::test]
-async fn duroxide_replays_each_recorded_continuation_window() {
-    use duroxide::{
-        Event, EventKind, RetryPolicy,
-        runtime::replay_engine::{ReplayEngine, TurnResult},
-    };
-    use rig::{test_utils::MockAddTool, tool::ToolSet};
-    use rig_durable::{
-        CheckpointConfig, CheckpointPolicy, DurableAgentConfig, catalog_from_toolset,
-        orchestration_registry,
-    };
-    use std::num::NonZeroU32;
-
-    let config = DurableAgentConfig {
-        tools: catalog_from_toolset(&ToolSet::from_tools(vec![MockAddTool]), RetryPolicy::new(1))
-            .await,
-        checkpoint: CheckpointConfig {
-            policy: CheckpointPolicy::Every(NonZeroU32::new(1).unwrap()),
-            target_version: None,
-        },
-        ..Default::default()
-    };
-    let registry = orchestration_registry(config);
+#[test]
+fn duroxide_excludes_every_legacy_orchestration_identity() {
+    use duroxide::{Event, EventKind};
+    let registry = rig_durable::orchestration_registry(Default::default());
     for bytes in [
         include_bytes!("fixtures/legacy/duroxide-continuation-1.json").as_slice(),
         include_bytes!("fixtures/legacy/duroxide-continuation-2.json").as_slice(),
         include_bytes!("fixtures/legacy/duroxide-continuation-3.json").as_slice(),
     ] {
-        let mut history: Vec<Event> = serde_json::from_slice(bytes).unwrap();
-        let terminal = history.pop().unwrap();
+        let history: Vec<Event> = serde_json::from_slice(bytes).unwrap();
         let EventKind::OrchestrationStarted {
             name,
             version,
             input,
             ..
-        } = history[0].kind.clone()
+        } = &history[0].kind
         else {
-            panic!("fixture must start with orchestration input")
+            panic!("missing orchestration start");
         };
-        let (_, handler) = registry.resolve_handler(&name).unwrap();
-        let mut replay = ReplayEngine::new("checkpointed".into(), terminal.execution_id, history);
-        let result = replay.execute_orchestration(handler, input, name, version, "fixture-replay");
-        match (terminal.kind, result) {
-            (
-                EventKind::OrchestrationContinuedAsNew {
-                    input: expected, ..
-                },
-                TurnResult::ContinueAsNew { input, .. },
-            ) => {
-                // Check all recorded fields, including the complete Rig state.
-                let expected: serde_json::Value = serde_json::from_str(&expected).unwrap();
-                let actual: serde_json::Value = serde_json::from_str(&input).unwrap();
-                for (key, value) in expected["continuation"].as_object().unwrap() {
-                    assert_eq!(
-                        &actual["continuation"][key], value,
-                        "continuation field {key}"
-                    );
-                }
-                assert_eq!(actual["prompt"], expected["prompt"]);
-                assert_eq!(actual["history"], expected["history"]);
-            }
-            (
-                EventKind::OrchestrationCompleted { output: expected },
-                TurnResult::Completed(output),
-            ) => {
-                assert_eq!(
-                    serde_json::from_str::<serde_json::Value>(&output).unwrap(),
-                    serde_json::from_str::<serde_json::Value>(&expected).unwrap()
-                );
-            }
-            (expected, actual) => panic!("replay mismatch: {expected:?} / {actual:?}"),
-        }
         assert!(
-            !replay
-                .pending_actions()
-                .iter()
-                .any(|action| matches!(action, duroxide::Action::CallActivity { .. }))
+            registry
+                .resolve_handler_exact(name, &semver::Version::parse(version).unwrap())
+                .is_none()
         );
+        let value: serde_json::Value = serde_json::from_str(input).unwrap();
+        if value.get("continuation").is_some() {
+            assert!(
+                serde_json::from_str::<rig_durable::AgentInput>(input)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsupported agent continuation persistence generation")
+            );
+        }
     }
+}
+
+#[cfg(feature = "duroxide")]
+#[test]
+fn old_continuation_is_rejected_before_rig_deserialization() {
+    let mut input = serde_json::to_value(rig_durable::AgentInput::new("start")).unwrap();
+    input["continuation"] =
+        serde_json::json!({"kind": "v1", "agent_run": "invalid nested Rig state"});
+    let error = serde_json::from_value::<rig_durable::AgentInput>(input)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "unsupported agent continuation persistence generation"
+    );
+}
+
+#[cfg(feature = "duroxide")]
+#[test]
+fn old_session_is_rejected_before_rig_deserialization() {
+    let error = serde_json::from_value::<rig_durable::session::SessionInput>(serde_json::json!({
+        "format_version": 1, "context": "invalid nested Rig state"
+    }))
+    .unwrap_err()
+    .to_string();
+    assert_eq!(error, "unsupported session persistence generation");
 }
