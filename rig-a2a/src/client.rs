@@ -310,7 +310,8 @@ impl A2AClient {
     }
 
     fn agent_with(&self, model: A2AModel) -> AgentBuilder<NoToolConfig> {
-        AgentBuilder::new(model)
+        model
+            .agent()
             .name(&self.agent_name)
             .description(describe_card(&self.card))
     }

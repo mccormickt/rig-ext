@@ -600,6 +600,7 @@ async fn threaded_turns_send_standing_context_once() {
     // Turn 2 repeats the same preamble and document, as Rig rebuilds them for
     // every request, and additionally retrieves one new document.
     let mut turn = text_request("turn 2");
+    turn.chat_history.insert(0, RigMessage::user("turn 1"));
     turn.chat_history
         .insert(0, rig_core::message::Message::system("You are terse."));
     turn.documents = vec![
@@ -634,7 +635,80 @@ async fn threaded_turns_send_standing_context_once() {
         second.iter().any(|text| text.contains("turn 2")),
         "the newest prompt always goes out: {second:?}"
     );
+    assert!(!second.iter().any(|text| text.contains("turn 1")));
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn threaded_requests_keep_only_the_original_newest_multipart_message() {
+    use rig_core::message::{AssistantMessage, Message as RigMessage, StopReason, UserContent};
+
+    let (addr, recorded, server) = serve_stub(
+        "boundaries",
+        &["chat"],
+        StubReply::CompletedText("ok".into()),
+    )
+    .await;
+    let remote = A2AClient::from_url(format!("http://{addr}")).await.unwrap();
+    let params = serde_json::json!({"a2a": {"context_id": "ctx-restored"}});
+    let newest = RigMessage::User {
+        content: vec![
+            UserContent::text("new part one"),
+            UserContent::text("new part two"),
+        ],
+    };
+    for gap in [
+        None,
+        Some(RigMessage::assistant("")),
+        Some(RigMessage::Assistant(
+            AssistantMessage::new(vec![rig_core::message::AssistantContent::text(
+                "failed answer",
+            )])
+            .with_stop(StopReason::Error("failed".into())),
+        )),
+    ] {
+        let mut history = vec![RigMessage::user("old prompt")];
+        history.extend(gap);
+        for agent_backed in [false, true] {
+            for streaming in [false, true] {
+                if agent_backed {
+                    let agent = remote.agent().additional_params(params.clone()).build();
+                    let run = agent.prompt(newest.clone()).history(history.clone());
+                    if streaming {
+                        let mut stream = run.stream();
+                        while let Some(item) = stream.next().await {
+                            item.unwrap();
+                        }
+                    } else {
+                        assert_eq!(run.await.unwrap().to_string(), "ok");
+                    }
+                } else {
+                    let mut request = CompletionRequest::new(newest.clone());
+                    request.chat_history = history.clone();
+                    request.chat_history.push(newest.clone());
+                    request.additional_params = Some(params.clone());
+                    if streaming {
+                        let mut stream = remote.model().stream(request).unwrap();
+                        while let Some(item) = stream.next().await {
+                            item.unwrap();
+                        }
+                    } else {
+                        assert_eq!(
+                            remote.model().completion(request).await.unwrap().text(),
+                            "ok"
+                        );
+                    }
+                }
+                let turn = recorded.lock().unwrap().len() - 1;
+                assert_eq!(
+                    recorded_texts(&recorded, turn),
+                    ["new part one\nnew part two"]
+                );
+            }
+        }
+    }
+    assert_eq!(recorded.lock().unwrap().len(), 12);
     server.abort();
 }
 
@@ -882,10 +956,16 @@ async fn agent_backed_by_a2a_threads_a_conversation() {
         "first"
     );
     assert_eq!(
-        agent.prompt("turn 2").await.expect("turn 2").to_string(),
+        agent
+            .prompt("turn 2")
+            .history([RigMessage::user("turn 1")])
+            .await
+            .expect("turn 2")
+            .to_string(),
         "second"
     );
 
+    assert_eq!(recorded_texts(&recorded, 1), ["turn 2"]);
     let messages = recorded.lock().unwrap();
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].message.context_id, None);
@@ -923,10 +1003,12 @@ async fn one_agent_threads_each_conversation_it_is_asked_for() {
         .expect("bob turn 1");
     agent
         .prompt("alice turn 2")
+        .history([RigMessage::user("alice turn 1")])
         .a2a_conversation("alice")
         .await
         .expect("alice turn 2");
 
+    assert_eq!(recorded_texts(&recorded, 2), ["alice turn 2"]);
     let messages = recorded.lock().unwrap();
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[0].message.context_id, None, "alice opens a thread");

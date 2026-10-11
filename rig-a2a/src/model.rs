@@ -1,6 +1,6 @@
 //! A remote A2A agent as a Rig completion model.
 //!
-//! [`A2AModel`] lets a remote agent back a Rig [`Agent`], so `prompt`, `chat`,
+//! [`A2AModel::agent`] lets a remote agent back a Rig [`Agent`], so `prompt`, `chat`,
 //! streaming, hooks, and conversation memory all work against it, and
 //! [`Agent::into_tool`] projects it as a sub-agent.
 //!
@@ -76,6 +76,9 @@ use std::sync::Arc;
 use a2a::{Message as A2AMessage, Part, Role, SendMessageRequest, SendMessageResponse};
 use a2a_client::{A2AClient as InnerClient, Transport};
 use futures::StreamExt;
+use rig_agent::agent::{
+    AgentBuilder, AgentHook, DispatchAction, DispatchEvent, HookContext, NoToolConfig,
+};
 use rig_core::completion::{
     AssistantContent, CompletionRequest, CompletionResponse, FinishReason, Usage,
 };
@@ -90,12 +93,12 @@ use crate::error::A2AError;
 use crate::parts::{
     DEFAULT_TEXT_LIMIT, message_body_limited, state_label, status_text_limited, task_body_limited,
 };
-use crate::thread::{A2AThreadInfo, ConversationId, ThreadStore};
+use crate::thread::{A2AThreadInfo, ConversationId, Thread, ThreadStore};
 
 /// Provider name reported on responses and streams from this model.
 pub const PROVIDER: &str = "a2a";
 
-/// A remote A2A agent, usable wherever Rig expects a completion model.
+/// A remote A2A agent with direct completion calls and a Rig agent builder.
 ///
 /// Build one with [`A2AClient::model`](crate::A2AClient::model) or
 /// [`A2AClient::model_for_conversation`](crate::A2AClient::model_for_conversation).
@@ -158,12 +161,22 @@ impl A2AModel {
         Model::new(self.clone(), A2ATransport)
     }
 
+    /// Build a Rig agent with A2A request preparation before history adaptation.
+    ///
+    /// Use this builder or [`A2AClient::agent`](crate::A2AClient::agent), not a
+    /// raw erased driver, to preserve the newest prompt's message boundary.
+    pub fn agent(&self) -> AgentBuilder<NoToolConfig> {
+        AgentBuilder::new(self.driver())
+            .name(crate::parts::agent_name(&self.agent_name))
+            .add_hook(self.clone())
+    }
+
     /// Complete one request against the remote agent.
     pub async fn completion(
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
-        self.driver().call(request).await
+        self.driver().call(self.prepare_request(request)?).await
     }
 
     /// Open a streaming completion against the remote agent.
@@ -171,14 +184,13 @@ impl A2AModel {
         &self,
         request: CompletionRequest,
     ) -> Result<Streamed<Completion>, ProviderError> {
-        self.driver().stream(request)
+        self.driver().stream(self.prepare_request(request)?)
     }
 
-    /// Build the outbound A2A request for a Rig completion request.
-    fn build_request(&self, request: CompletionRequest) -> Result<Outbound, A2AError> {
-        reject_unsupported(&request)?;
-        log_ignored(&request);
-
+    fn thread(
+        &self,
+        request: &CompletionRequest,
+    ) -> Result<(Option<ConversationId>, Thread), A2AError> {
         let params = thread_params(request.additional_params.as_ref())?;
         // A conversation named on the run outranks the model's own binding, so
         // one agent serves many conversations instead of one agent per
@@ -199,6 +211,34 @@ impl A2AModel {
             thread.context_id = Some(context_id);
             thread.task_id = params.task_id;
         }
+        Ok((conversation, thread))
+    }
+
+    fn prepare_request(
+        &self,
+        mut request: CompletionRequest,
+    ) -> Result<CompletionRequest, ProviderError> {
+        request.validate_message_content()?;
+        let (_, thread) = self.thread(&request)?;
+        if thread.context_id.is_some() && request.chat_history.len() > 1 {
+            // The remote holds the older turns. Select the original newest
+            // message before Rig merges user messages across failed turns.
+            let newest = request.chat_history.remove(request.chat_history.len() - 1);
+            let standing = usize::from(matches!(
+                request.chat_history.first(),
+                Some(RigMessage::System { .. })
+            ));
+            request.chat_history.truncate(standing);
+            request.chat_history.push(newest);
+        }
+        Ok(request)
+    }
+
+    /// Build the outbound A2A request for a Rig completion request.
+    fn build_request(&self, request: CompletionRequest) -> Result<Outbound, A2AError> {
+        reject_unsupported(&request)?;
+        log_ignored(&request);
+        let (conversation, thread) = self.thread(&request)?;
         // A threaded remote already holds everything sent under this
         // `contextId`; replaying it would duplicate it on the remote side. An
         // unthreaded call has no server-side memory, so the whole request is
@@ -579,9 +619,25 @@ impl rig_core::completion::ReplayTarget for A2AModel {
     }
 }
 
-impl From<A2AModel> for rig_core::driver::DynModel<Completion> {
-    fn from(model: A2AModel) -> Self {
-        model.driver().erase()
+impl AgentHook for A2AModel {
+    async fn on_dispatch(&self, _ctx: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
+        use rig_core::{
+            effect::EffectKind,
+            error::{ErrorKind, ErrorReport},
+        };
+
+        let EffectKind::Completion { request, stream } = event.kind else {
+            return DispatchAction::Proceed;
+        };
+        match self.prepare_request(request.clone()) {
+            Ok(request) => DispatchAction::Patch(EffectKind::Completion {
+                request,
+                stream: *stream,
+            }),
+            Err(error) => {
+                DispatchAction::Deny(ErrorReport::new(ErrorKind::Other, error.to_string()))
+            }
+        }
     }
 }
 

@@ -51,6 +51,12 @@ thread key. It works on an agent builder or on an individual run.
 `model_for_conversation` and `agent_for_conversation` are also available when a
 model or agent should bind its remote thread for its whole lifetime.
 
+Build agents with `client.agent()`, `client.agent_for_conversation(...)`, or
+`model.agent()`. These builders install A2A request preparation before Rig
+adapts history. `A2AModel` does not convert to `DynModel`: a raw erased driver
+cannot retain the original newest-message boundary. Direct `model.completion`
+and `model.stream` calls prepare requests at the same boundary.
+
 ## Compose it as a sub-agent tool
 
 ```rust,no_run
