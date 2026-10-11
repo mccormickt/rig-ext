@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 
 use rig::completion::Message;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+
+use crate::identity::arguments_digest;
 
 pub const LEDGER_FORMAT_VERSION: u32 = 1;
 pub const DEFAULT_LEDGER_MAX_BYTES: usize = 48 * 1024;
@@ -78,8 +79,7 @@ impl SubmitInput {
 
     /// Hex SHA-256 over the canonical JSON of the message and the mode.
     pub fn payload_digest(&self) -> Result<String, serde_json::Error> {
-        let payload = serde_json::to_vec(&(&self.message, self.mode))?;
-        Ok(format!("{:x}", Sha256::digest(payload)))
+        arguments_digest(&serde_json::to_value((&self.message, self.mode))?)
     }
 }
 
@@ -382,6 +382,37 @@ mod tests {
         );
         assert_eq!(ledger.receipts.len(), 1);
         assert_eq!(ledger.next_prompt_index, 1);
+    }
+
+    #[test]
+    fn nested_json_key_order_does_not_change_submission_identity() {
+        let mut ledger = ledger();
+        let request = |arguments: &str| {
+            SubmitInput::new(
+                "req-json",
+                Message::Assistant(rig::message::AssistantMessage::new(vec![
+                    rig::message::AssistantContent::ToolCall(rig::message::ToolCall::from_wire(
+                        "call-1",
+                        rig::message::ToolFunction::new(
+                            rig::message::ToolName::new("lookup").unwrap(),
+                            serde_json::from_str(arguments).unwrap(),
+                        ),
+                    )),
+                ])),
+            )
+        };
+        let first = request(r#"{"a":1,"b":{"x":2,"y":[{"c":3,"d":4}]}}"#);
+        let reordered = request(r#"{"b":{"y":[{"d":4,"c":3}],"x":2},"a":1}"#);
+        let admitted = ledger.admit(&first, IDLE).unwrap();
+        assert_eq!(
+            ledger.admit(&reordered, BUSY).unwrap(),
+            Admission::Existing(admitted.submission().clone())
+        );
+        let changed = request(r#"{"a":1,"b":{"x":2,"y":[{"c":3,"d":5}]}}"#);
+        assert!(matches!(
+            ledger.admit(&changed, IDLE),
+            Err(SubmissionError::Conflict { .. })
+        ));
     }
 
     #[test]

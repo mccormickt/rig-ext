@@ -555,11 +555,19 @@ mod tests {
                 .with_guard(Some(store.clone()));
         let policy = Some(ToolPolicy::interrupt_on_uncertain());
         let first = executor
-            .execute(input("counting", "{}", policy.clone()))
+            .execute(input(
+                "counting",
+                r#"{"a":1,"b":{"x":2,"y":[{"c":3,"d":4}]}}"#,
+                policy.clone(),
+            ))
             .await
             .unwrap();
         let second = executor
-            .execute(input("counting", "{}", policy.clone()))
+            .execute(input(
+                "counting",
+                r#"{"b":{"y":[{"d":4,"c":3}],"x":2},"a":1}"#,
+                policy.clone(),
+            ))
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -569,7 +577,11 @@ mod tests {
 
         // Different arguments under the same logical key cannot reuse the claim.
         let mismatch = executor
-            .execute(input("counting", r#"{"extra":true}"#, policy.clone()))
+            .execute(input(
+                "counting",
+                r#"{"a":1,"b":{"x":2,"y":[{"c":3,"d":5}]}}"#,
+                policy.clone(),
+            ))
             .await
             .unwrap();
         let result = mismatch.result.unwrap();

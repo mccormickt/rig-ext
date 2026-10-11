@@ -63,9 +63,11 @@ pub struct AttemptMetadata {
 
 /// Hex SHA-256 of the canonical JSON form of `arguments`.
 pub fn arguments_digest(arguments: &serde_json::Value) -> Result<String, serde_json::Error> {
+    let mut canonical = arguments.clone();
+    canonical.sort_all_objects();
     Ok(format!(
         "{:x}",
-        Sha256::digest(serde_json::to_vec(arguments)?)
+        Sha256::digest(serde_json::to_vec(&canonical)?)
     ))
 }
 

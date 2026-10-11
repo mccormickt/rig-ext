@@ -109,10 +109,10 @@ pub(crate) fn approval_request(
     call_index: usize,
 ) -> Result<ApprovalRequest, String> {
     let arguments = serde_json::Value::Object(call.function.arguments.clone());
-    let digest = Sha256::digest(serde_json::to_vec(&arguments).map_err(|error| error.to_string())?);
+    let digest = arguments_digest(&arguments).map_err(|error| error.to_string())?;
     Ok(ApprovalRequest {
         approval_id: format!(
-            "prompt-{prompt_index}-turn-{turn}-call-{call_index}-{}-{digest:x}",
+            "prompt-{prompt_index}-turn-{turn}-call-{call_index}-{}-{digest}",
             call.id
         ),
         tool_name: call.function.name.to_string(),
