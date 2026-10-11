@@ -476,6 +476,13 @@ impl Compactor for ModelCompactor {
                 .call(completion)
                 .await
                 .map_err(|error| MemoryError::Backend(Box::new(error)))?;
+            if let Some(error) = rig::message::turn_failure(
+                &response.choice,
+                Some(&response.stop()),
+                response.finish_reason().as_ref(),
+            ) {
+                return Err(MemoryError::Policy(error));
+            }
             let text = response.text();
             if text.trim().is_empty() {
                 return Err(MemoryError::Policy(
@@ -693,6 +700,44 @@ mod tests {
             ContextState::new(transcript()).with_compaction(Some(record)),
             Err(CompactionError::NotCanonical { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_summary_keeps_the_prior_context() {
+        use rig::{
+            completion::FinishReason,
+            test_utils::{MockCompletionModel, MockTurn},
+        };
+
+        let model = MockCompletionModel::from_turns([
+            MockTurn::text("prior summary"),
+            MockTurn::text("failed partial summary")
+                .with_finish_reason(FinishReason::Other("unexpected".into())),
+            MockTurn::text("updated summary"),
+        ]);
+        let compaction = Compaction::new(
+            SlidingWindowMemory::last_messages(2),
+            ModelCompactor::new(model),
+        );
+        let mut state = ContextState::new(transcript());
+        state
+            .apply(compaction.run(state.request("s", "1")).await.unwrap(), "1")
+            .unwrap();
+        state.append([Message::user("fourth"), Message::assistant("done")]);
+        let before = state.clone();
+        let error = compaction.run(state.request("s", "1")).await.unwrap_err();
+        assert!(error.contains("unexpected"), "{error}");
+        assert_eq!(state, before);
+        assert_eq!(state.applied_cutoff(), 9);
+        assert_eq!(state.active_context(), before.active_context());
+        state
+            .apply(compaction.run(state.request("s", "1")).await.unwrap(), "1")
+            .unwrap();
+        assert!(state.applied_cutoff() > before.applied_cutoff());
+        assert_eq!(
+            state.compaction.unwrap().artifact.value["text"],
+            "updated summary"
+        );
     }
 
     #[tokio::test]
