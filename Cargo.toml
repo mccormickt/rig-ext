@@ -8,6 +8,7 @@ members = [
   "rig-codemode",
   "rig-durable",
   "rig-durable/examples/durable-object",
+  "rig-typesafeai-tools",
 ]
 
 [workspace.package]
