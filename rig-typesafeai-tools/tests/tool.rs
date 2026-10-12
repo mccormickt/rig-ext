@@ -49,13 +49,17 @@ async fn preserves_native_answers_and_projects_only_model_and_usage() {
             .evaluation(),
     );
     assert_eq!(tool.name().as_str(), "jev_evaluate");
-    for state in [
-        json!("outage"),
-        json!({"event": "outage"}),
-        json!(["outage"]),
+    for (state, explicit_null) in [
+        (json!("outage"), false),
+        (json!({"event": "outage"}), true),
+        (json!(["outage"]), false),
     ] {
+        let mut input_questions = questions();
+        if explicit_null {
+            input_questions["urgent"]["criteria"] = Value::Null;
+        }
         let output = tool
-            .execute(json!({"state": state, "questions": questions()}))
+            .execute(json!({"state": state, "questions": input_questions}))
             .await
             .unwrap();
         assert_eq!(
@@ -97,6 +101,7 @@ async fn direct_calls_reject_invalid_arguments_without_provider_io() {
         json!({"q": {"type": "noul", "instructions": true}}),
         json!({"q": {"type": "noul", "instructions": "Unknown field", "endpoint": "https://guest.invalid"}}),
         json!({"q": {"type": "noul", "instructions": "Bad criteria", "criteria": {"true": "yes"}}}),
+        json!({"q": {"type": "noul", "instructions": "Bad criteria", "criteria": {"true": "yes", "false": "no", "extra": "unknown"}}}),
         json!({"q": {"type": "choice", "instructions": "Bad choices", "criteria": {"one": "alone"}}}),
         json!({"q": {"type": "choice", "instructions": "Bad content", "criteria": {"one": 123, "two": "valid"}}}),
         json!({"q": {"type": "score", "instructions": "Bad rubric", "criteria": ["alone"]}}),

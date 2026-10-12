@@ -61,7 +61,7 @@ fn parameters() -> Value {
                         "properties": {
                             "type": {"const": "noul"}, "instructions": {},
                             "criteria": {
-                                "type": "object", "required": ["true", "false"],
+                                "type": ["object", "null"], "required": ["true", "false"],
                                 "additionalProperties": false,
                                 "properties": {"true": {}, "false": {}}
                             }

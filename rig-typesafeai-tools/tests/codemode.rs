@@ -3,16 +3,64 @@
 
 use rig_codemode::{
     CallStatus, Catalog, CatalogEntry, CodeMode, DynamicToolDispatcher, ExecutionRequest,
-    ExecutionStatus,
+    ExecutionStatus, HostDispatcher, Invocation,
 };
 use rig_core::{
-    test_utils::{MockHttpResponse, SequencedHttpClient},
-    tool::{ToolExecutionError, ToolOutput},
+    test_utils::{MockHttpResponse, RecordingHttpClient, SequencedHttpClient},
+    tool::{ToolContext, ToolErrorKind, ToolExecutionError, ToolOutput},
 };
 use rig_typesafeai::JevConfig;
 use rig_typesafeai_tools::evaluation_tool;
 use serde_json::{Value, json};
 use std::sync::Arc;
+
+#[tokio::test]
+async fn dispatcher_accepts_optional_noul_criteria_and_rejects_malformed_objects() {
+    let answers = json!({"ready": {"type": "noul", "noul": 0.73}});
+    let http =
+        RecordingHttpClient::new(json!({"model": "fixture", "answers": answers}).to_string());
+    let dispatcher = DynamicToolDispatcher::new([evaluation_tool(
+        JevConfig::new("unused").connect(http.clone()).evaluation(),
+    )])
+    .unwrap();
+    for (criteria, valid) in [
+        (None, true),
+        (Some(Value::Null), true),
+        (Some(json!({"true": "yes", "false": "no"})), true),
+        (Some(json!({"true": "yes"})), false),
+        (
+            Some(json!({"true": "yes", "false": "no", "extra": "unknown"})),
+            false,
+        ),
+    ] {
+        let mut question = json!({"type": "noul", "instructions": "Ready?"});
+        if let Some(criteria) = criteria {
+            question["criteria"] = criteria;
+        }
+        let outcome = dispatcher
+            .dispatch(Invocation::new(
+                "request-1",
+                0,
+                "jev_evaluate",
+                json!({"state": "ready", "questions": {"ready": question}}),
+                ToolContext::new(),
+            ))
+            .await;
+        if valid {
+            assert!(outcome.result.is_success(), "{:?}", outcome.result);
+            assert_eq!(
+                outcome.result.output().as_json(),
+                Some(&json!({"answers": answers, "model": "fixture", "usage": null}))
+            );
+        } else {
+            assert_eq!(
+                outcome.result.error().unwrap().kind(),
+                ToolErrorKind::InvalidArgs
+            );
+        }
+    }
+    assert_eq!(http.requests().len(), 3);
+}
 
 #[tokio::test]
 async fn scripts_compose_evaluations_under_host_call_and_result_policy() {
