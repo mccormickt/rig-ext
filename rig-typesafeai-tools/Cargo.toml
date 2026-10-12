@@ -1,0 +1,29 @@
+[package]
+name = "rig-typesafeai-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.95"
+description = "Expose host-configured TypeSafe Jev evaluations as Rig tools"
+readme = "README.md"
+repository = "https://github.com/mccormickt/rig-ext"
+
+[dependencies]
+jsonschema = { version = "0.58", default-features = false }
+rig-core.workspace = true
+rig-typesafeai = { version = "0.44.0", default-features = false }
+serde_json.workspace = true
+
+[dev-dependencies]
+rig-core = { workspace = true, features = ["test-utils"] }
+serde.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+rig-codemode = { path = "../rig-codemode", features = ["quickjs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[lints]
+workspace = true
