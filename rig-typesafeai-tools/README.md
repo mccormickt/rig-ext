@@ -2,13 +2,13 @@
 
 Expose a host-configured `rig-typesafeai` 0.44 evaluation model as the Rig
 `DynamicTool` named `jev_evaluate`. There is no production dependency on
-`rig-codemode`, celld, an agent runner, or a specific HTTP transport.
+a script engine, an agent runner, or a specific HTTP transport.
 
 ```rust,ignore
 use rig_typesafeai::JevConfig;
 use rig_typesafeai_tools::evaluation_tool;
 
-// The host supplies its credential and transport, such as a Workers HTTP client.
+// The host supplies its credential and HTTP transport.
 let model = JevConfig::new(token).connect(http).evaluation();
 let tool = evaluation_tool(model);
 ```
@@ -29,8 +29,8 @@ return { needsReview: result.answers.urgent.noul >= 0.8 };
 ## Contract
 
 - Input is `{state, questions}`. State is a string, object, or array. Question
-  IDs are nonempty; question types are native `choice`, `score`, and `noul`,
-  not Pi's `bool` alias. Instructions and criteria support the structured values
+  IDs are nonempty; question types are native `choice`, `score`, and `noul`.
+  Instructions and criteria support the structured values
   accepted by `rig-typesafeai`.
 - Both direct and dispatcher calls validate the input schema and construct a
   `DynamicQuery` before evaluation. The configured model is responsible for the
@@ -57,7 +57,7 @@ The adapter has no application-specific question-count or question-ID-length
 ceiling. Hosts that need these limits must check them in call policy, along with
 argument size and other budgets. Confidence is not authorization.
 
-An external executor such as CelD must supply its own safe guest-to-host bridge,
+An external executor must supply its own safe guest-to-host bridge,
 projection, accounting, and engine limits. Public report constructors do not
 provide those guarantees. No runtime-accounting abstraction is included here.
 
