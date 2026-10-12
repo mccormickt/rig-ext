@@ -140,6 +140,19 @@ pub struct ScriptDiagnostic {
     pub stack: Option<String>,
 }
 
+impl ScriptDiagnostic {
+    /// Build a diagnostic from model-safe guest text, without a source
+    /// location or stack. The caller must exclude host internals and secrets.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            line: None,
+            column: None,
+            stack: None,
+        }
+    }
+}
+
 /// Text the script emitted with `text()`, bounded by the output limit.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,7 +188,29 @@ pub struct ExecutionReport {
 }
 
 impl ExecutionReport {
-    pub(crate) fn new(status: ExecutionStatus) -> Self {
+    /// Build an empty report with the given status and zero elapsed time.
+    /// External executors can fill its public fields without deserialization.
+    /// This does not enforce limits or validate guest-supplied data; the
+    /// executor must enforce its own bounds and construct a trusted report.
+    ///
+    /// ```
+    /// use rig_codemode::{ExecutionReport, ExecutionStatus, ScriptDiagnostic};
+    /// use rig_core::tool::ToolErrorKind;
+    ///
+    /// let mut report = ExecutionReport::new(ExecutionStatus::TimedOut);
+    /// assert!(report.output.text.is_empty());
+    /// assert!(report.calls.is_empty());
+    /// assert!(report.returned.is_none());
+    /// assert!(report.elapsed.is_zero());
+    /// report.output.text = "partial output\n".into();
+    /// report.diagnostic = Some(ScriptDiagnostic::new("execution deadline exceeded"));
+    /// let error = report.into_tool_result().unwrap_err();
+    /// assert_eq!(error.kind(), ToolErrorKind::Timeout);
+    /// assert_eq!(error.model_feedback(), Some(
+    ///     "partial output\nScript timed out: execution deadline exceeded\n"
+    /// ));
+    /// ```
+    pub fn new(status: ExecutionStatus) -> Self {
         Self {
             status,
             output: ScriptOutput::default(),

@@ -124,8 +124,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(all(feature = "quickjs", target_family = "wasm"))]
+compile_error!("the `quickjs` backend requires a native target; disable it for Wasm contracts");
+
 pub mod analysis;
 // Bridge and runtime code is only reachable through a compiled backend.
+#[cfg(not(target_family = "wasm"))]
 #[cfg_attr(not(feature = "quickjs"), allow(dead_code))]
 mod bridge;
 pub mod catalog;
@@ -139,7 +143,9 @@ pub mod report;
 mod runtime;
 
 use std::sync::Arc;
+#[cfg(not(target_family = "wasm"))]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_family = "wasm"))]
 use std::time::Instant;
 
 use rig_core::message::{EmptyToolName, ToolName};
@@ -162,6 +168,7 @@ pub use runtime::SpawnError;
 /// Default name of the outer tool and the name scripts cannot call.
 pub const DEFAULT_TOOL_NAME: &str = "codemode";
 
+#[cfg(not(target_family = "wasm"))]
 static NEXT_PARENT: AtomicU64 = AtomicU64::new(1);
 
 /// Compiled script backends. Enable exactly one feature, or select one here
@@ -170,16 +177,17 @@ static NEXT_PARENT: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     /// Native QuickJS on a dedicated thread (`quickjs` feature).
-    #[cfg(feature = "quickjs")]
+    #[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
     QuickJs,
 }
 
 impl Backend {
     const COMPILED: &'static [Backend] = &[
-        #[cfg(feature = "quickjs")]
+        #[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
         Backend::QuickJs,
     ];
 
+    #[cfg(not(target_family = "wasm"))]
     #[cfg_attr(not(feature = "quickjs"), allow(unused_variables))]
     fn spawn(
         self,
@@ -413,7 +421,9 @@ impl CodeModeBuilder {
 
 struct Inner {
     catalog: Arc<Catalog>,
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     dispatcher: Arc<dyn HostDispatcher>,
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     script_policy: Option<Arc<dyn ScriptPolicy>>,
     limits: Limits,
     backend: Backend,
@@ -486,57 +496,66 @@ impl CodeMode {
         &self,
         request: ExecutionRequest,
     ) -> Result<ExecutionReport, ExecutionError> {
-        let inner = &self.inner;
-        if request.code.len() > inner.limits.source_bytes {
-            return Err(ExecutionError::SourceTooLarge {
-                size: request.code.len(),
-                limit: inner.limits.source_bytes,
-            });
+        #[cfg(target_family = "wasm")]
+        {
+            // No Wasm backend can be constructed by the builder.
+            let _ = request;
+            match self.inner.backend {}
         }
-        let limits = inner.limits.restrict(&request.limits)?;
-        let parent_call_id = request.parent_call_id.unwrap_or_else(|| {
-            format!(
-                "{}-{}",
-                inner.tool_name,
-                NEXT_PARENT.fetch_add(1, Ordering::Relaxed)
-            )
-        });
-        let grant = match &inner.script_policy {
-            None => ScriptGrant::catalog(request.context),
-            Some(policy) => {
-                let analysis = analyze(&request.code);
-                policy
-                    .review(ScriptReview {
-                        code: &request.code,
-                        analysis: &analysis,
-                        catalog: &inner.catalog,
-                        parent_call_id: &parent_call_id,
-                        context: request.context,
-                    })
-                    .await
-                    .map_err(ExecutionError::Refused)?
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let inner = &self.inner;
+            if request.code.len() > inner.limits.source_bytes {
+                return Err(ExecutionError::SourceTooLarge {
+                    size: request.code.len(),
+                    limit: inner.limits.source_bytes,
+                });
             }
-        };
-        let deadline = Instant::now() + limits.wall_time;
-        let (worker, host) = bridge::channels(&limits);
-        let config = bridge::WorkerConfig {
-            code: request.code,
-            catalog: inner.catalog.clone(),
-            limits,
-            deadline,
-        };
-        let worker = inner.backend.spawn(config, worker)?;
-        let report = bridge::run_host(
-            inner.dispatcher.clone(),
-            limits,
-            deadline,
-            parent_call_id,
-            grant,
-            host,
-        )
-        .await;
-        let _ = worker.join();
-        Ok(report)
+            let limits = inner.limits.restrict(&request.limits)?;
+            let parent_call_id = request.parent_call_id.unwrap_or_else(|| {
+                format!(
+                    "{}-{}",
+                    inner.tool_name,
+                    NEXT_PARENT.fetch_add(1, Ordering::Relaxed)
+                )
+            });
+            let grant = match &inner.script_policy {
+                None => ScriptGrant::catalog(request.context),
+                Some(policy) => {
+                    let analysis = analyze(&request.code);
+                    policy
+                        .review(ScriptReview {
+                            code: &request.code,
+                            analysis: &analysis,
+                            catalog: &inner.catalog,
+                            parent_call_id: &parent_call_id,
+                            context: request.context,
+                        })
+                        .await
+                        .map_err(ExecutionError::Refused)?
+                }
+            };
+            let deadline = Instant::now() + limits.wall_time;
+            let (worker, host) = bridge::channels(&limits);
+            let config = bridge::WorkerConfig {
+                code: request.code,
+                catalog: inner.catalog.clone(),
+                limits,
+                deadline,
+            };
+            let worker = inner.backend.spawn(config, worker)?;
+            let report = bridge::run_host(
+                inner.dispatcher.clone(),
+                limits,
+                deadline,
+                parent_call_id,
+                grant,
+                host,
+            )
+            .await;
+            let _ = worker.join();
+            Ok(report)
+        }
     }
 
     /// The model-facing description: usage rules plus inline declarations
