@@ -58,10 +58,9 @@
 //! asynchronous review separately, for example with `tokio::time::timeout`.
 
 use std::collections::BTreeSet;
-use std::future::Future;
-use std::pin::Pin;
 
 use rig_core::tool::{ToolContext, ToolExecutionError};
+use rig_core::wasm_compat::{WasmBoxedFuture, WasmCompatSend, WasmCompatSync};
 
 use crate::analysis::ScriptAnalysis;
 use crate::catalog::Catalog;
@@ -146,9 +145,9 @@ impl ScriptGrant {
     }
 }
 
-/// The future a policy returns.
-pub type ScriptPolicyFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<ScriptGrant, ToolExecutionError>> + Send + 'a>>;
+/// The future a policy returns. Requires `Send` except on
+/// `wasm32-unknown-unknown`, matching Rig's local callback support.
+pub type ScriptPolicyFuture<'a> = WasmBoxedFuture<'a, Result<ScriptGrant, ToolExecutionError>>;
 
 /// Reviews a script before it runs.
 ///
@@ -160,7 +159,7 @@ pub type ScriptPolicyFuture<'a> =
 /// ToolExecutionError>` implement this trait. Implement it directly when the
 /// review needs to await an approval. Review runs outside the execution
 /// deadline; the host must bound approval waits separately if needed.
-pub trait ScriptPolicy: Send + Sync + 'static {
+pub trait ScriptPolicy: WasmCompatSend + WasmCompatSync + 'static {
     /// Review one script.
     fn review<'a>(&'a self, review: ScriptReview<'a>) -> ScriptPolicyFuture<'a>;
 }
@@ -168,8 +167,8 @@ pub trait ScriptPolicy: Send + Sync + 'static {
 impl<F> ScriptPolicy for F
 where
     F: for<'r> Fn(ScriptReview<'r>) -> Result<ScriptGrant, ToolExecutionError>
-        + Send
-        + Sync
+        + WasmCompatSend
+        + WasmCompatSync
         + 'static,
 {
     fn review<'a>(&'a self, review: ScriptReview<'a>) -> ScriptPolicyFuture<'a> {

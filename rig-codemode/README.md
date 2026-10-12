@@ -14,6 +14,16 @@ The crate owns script execution, tool discovery, and bounded results. The host o
 
 Enabling `mcp` does not change dispatch or permissions for non-MCP tools. The builder never selects a backend by feature precedence: with several backends compiled, call `CodeModeBuilder::backend`.
 
+## Rust Workers and external executors
+
+Use `rig-codemode` with `default-features = false` for contracts and direct host dispatch on `wasm32-unknown-unknown`. Use matching `rig`/`rig-core` 0.44 dependencies; no Rig fork or `worker` feature is needed. `HostDispatcher`, `ScriptPolicy`, and their callbacks use Rig's portable bounds: local state and non-`Send` futures are allowed on this target, while native targets retain `Send`/`Sync`. Threaded Wasm is not supported by Rig.
+
+This is not a Workers script backend. The `quickjs` feature requires a native target. `CodeModeBuilder::backend` selects a compiled engine; it does not accept an external executor. On Wasm, `build()` returns `BuildError::NoBackend`. The native bridge uses a worker thread, Tokio task scheduling, timers, and a join handle; it is not compiled on Wasm.
+
+An application-owned executor can use `ExecutionRequest`, `Limits::restrict`, `ExecutionReport::new(status)`, `ScriptDiagnostic::new(message)`, and `ExecutionReport::into_tool_result`. Use `CallRecord::new(ordinal, name, status, delivery)` for child calls and set its public `error_kind` when needed; it defaults to `None`. Delivery is explicit and independent of tool success. Fill the report's public fields with trusted execution results; `ScriptOutput::default()` provides an empty output. The constructors do not sanitize guest data or enforce limits. The application must enforce the limits it supports and keep host details out of diagnostics. QuickJS heap and cancellation guarantees do not apply to celld or other external executors.
+
+A future external backend API must preserve host authorization, schema validation, result projection, and call accounting without requiring native scheduling. It must also define the engine's limit and cancellation guarantees. This crate does not provide that API yet.
+
 ## Threat model of the `quickjs` backend
 
 The script runs in a fresh QuickJS runtime on a dedicated thread inside the host process. The guest has no `fetch`, `require`, `process`, timers, `std`/`os`, module loader, or filesystem. Its heap is bounded by `Limits::memory_bytes`, its stack by a fixed guest limit, and its CPU time by an interrupt handler that reads a cancellation flag and the deadline. The host bounds every bridge message, the output buffer, and the number of pending calls.
@@ -153,6 +163,15 @@ cargo run -p rig-codemode --example mcp_tools --features quickjs,mcp   # in-proc
 cargo test -p rig-codemode                          # no backend: contracts and catalog
 cargo test -p rig-codemode --features quickjs       # acceptance suite with mock tools
 cargo test -p rig-codemode --features quickjs,mcp   # plus the fake rmcp server
+```
+
+The Wasm regression test runs direct dispatch and script review with `Rc` state and local timer futures. It checks refusal, effective-argument validation, redaction, grants, and external report construction, not guest execution. Install `wasm-bindgen-cli` at the version of `wasm-bindgen` in `Cargo.lock`, then run with Node.js:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo check --locked -p rig-codemode --target wasm32-unknown-unknown
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+  cargo test --locked -p rig-codemode --target wasm32-unknown-unknown --test wasm_dispatch
 ```
 
 ## Not in this release

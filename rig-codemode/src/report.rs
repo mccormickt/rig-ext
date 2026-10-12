@@ -122,6 +122,39 @@ pub struct CallRecord {
     pub delivery: ScriptDelivery,
 }
 
+impl CallRecord {
+    /// Build a child-call record with no error kind. Set [`Self::error_kind`]
+    /// when the outcome has a normalized error. Delivery is explicit because
+    /// a successful call does not prove that its reply reached the script.
+    /// The executor must supply trusted values and enforce call limits.
+    ///
+    /// ```
+    /// use rig_codemode::{CallRecord, CallStatus, ExecutionReport, ExecutionStatus, ScriptDelivery};
+    ///
+    /// let call = CallRecord::new(2, "lookup", CallStatus::Succeeded, ScriptDelivery::Discarded);
+    /// assert_eq!(serde_json::to_value(&call).unwrap(), serde_json::json!({
+    ///     "ordinal": 2, "name": "lookup", "status": "succeeded", "delivery": "discarded"
+    /// }));
+    /// let mut report = ExecutionReport::new(ExecutionStatus::Completed);
+    /// report.calls.push(call);
+    /// assert_eq!(report.render_text(), "Tool calls: 1 total, 1 succeeded\n");
+    /// ```
+    pub fn new(
+        ordinal: u32,
+        name: impl Into<String>,
+        status: CallStatus,
+        delivery: ScriptDelivery,
+    ) -> Self {
+        Self {
+            ordinal,
+            name: name.into(),
+            status,
+            error_kind: None,
+            delivery,
+        }
+    }
+}
+
 /// A script failure safe to show the model: the script's own exception text
 /// and position. Host and dispatcher internals never appear here.
 #[non_exhaustive]
@@ -138,6 +171,19 @@ pub struct ScriptDiagnostic {
     /// Guest stack trace, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack: Option<String>,
+}
+
+impl ScriptDiagnostic {
+    /// Build a diagnostic from model-safe guest text, without a source
+    /// location or stack. The caller must exclude host internals and secrets.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            line: None,
+            column: None,
+            stack: None,
+        }
+    }
 }
 
 /// Text the script emitted with `text()`, bounded by the output limit.
@@ -175,7 +221,29 @@ pub struct ExecutionReport {
 }
 
 impl ExecutionReport {
-    pub(crate) fn new(status: ExecutionStatus) -> Self {
+    /// Build an empty report with the given status and zero elapsed time.
+    /// External executors can fill its public fields without deserialization.
+    /// This does not enforce limits or validate guest-supplied data; the
+    /// executor must enforce its own bounds and construct a trusted report.
+    ///
+    /// ```
+    /// use rig_codemode::{ExecutionReport, ExecutionStatus, ScriptDiagnostic};
+    /// use rig_core::tool::ToolErrorKind;
+    ///
+    /// let mut report = ExecutionReport::new(ExecutionStatus::TimedOut);
+    /// assert!(report.output.text.is_empty());
+    /// assert!(report.calls.is_empty());
+    /// assert!(report.returned.is_none());
+    /// assert!(report.elapsed.is_zero());
+    /// report.output.text = "partial output\n".into();
+    /// report.diagnostic = Some(ScriptDiagnostic::new("execution deadline exceeded"));
+    /// let error = report.into_tool_result().unwrap_err();
+    /// assert_eq!(error.kind(), ToolErrorKind::Timeout);
+    /// assert_eq!(error.model_feedback(), Some(
+    ///     "partial output\nScript timed out: execution deadline exceeded\n"
+    /// ));
+    /// ```
+    pub fn new(status: ExecutionStatus) -> Self {
         Self {
             status,
             output: ScriptOutput::default(),

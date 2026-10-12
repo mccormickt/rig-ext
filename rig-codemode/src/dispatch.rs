@@ -44,11 +44,10 @@
 //! ```
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use rig_core::tool::{DynamicTool, ToolContext, ToolExecutionError, ToolResult, ToolResultContext};
+use rig_core::wasm_compat::{WasmBoxedFuture, WasmCompatSend, WasmCompatSync};
 
 /// One script-initiated tool call as the host sees it.
 #[derive(Debug, Clone)]
@@ -122,8 +121,9 @@ pub fn tool_result(result: Result<rig_core::tool::ToolOutput, ToolExecutionError
     }
 }
 
-/// The future a dispatcher returns.
-pub type DispatchFuture<'a> = Pin<Box<dyn Future<Output = DispatchOutcome> + Send + 'a>>;
+/// The future a dispatcher returns. Requires `Send` except on
+/// `wasm32-unknown-unknown`, matching Rig's local callback support.
+pub type DispatchFuture<'a> = WasmBoxedFuture<'a, DispatchOutcome>;
 
 /// Executes script-initiated tool calls with the host's authority.
 ///
@@ -131,7 +131,7 @@ pub type DispatchFuture<'a> = Pin<Box<dyn Future<Output = DispatchOutcome> + Sen
 /// in-flight dispatches when the script ends. A dropped future does not prove
 /// an external effect stopped; implementations that need stronger guarantees
 /// must handle cancellation inside the tool.
-pub trait HostDispatcher: Send + Sync + 'static {
+pub trait HostDispatcher: WasmCompatSend + WasmCompatSync + 'static {
     /// Run one call. Return a failed or refused [`ToolResult`] for denied or
     /// unknown calls instead of panicking or returning an application error.
     fn dispatch<'a>(&'a self, invocation: Invocation) -> DispatchFuture<'a>;
@@ -146,12 +146,24 @@ impl<T: HostDispatcher + ?Sized> HostDispatcher for Arc<T> {
 /// Per-call authorization and argument policy. It may rewrite
 /// `invocation.arguments`; the dispatcher validates the rewritten value. Return a
 /// refusal with [`ToolExecutionError::refused`] to deny the call.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub type CallPolicy = Arc<dyn Fn(&mut Invocation) -> Result<(), ToolExecutionError> + Send + Sync>;
+
+/// Per-call authorization and argument policy. May capture local Wasm state.
+/// Rewritten arguments are validated before the tool runs.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub type CallPolicy = Arc<dyn Fn(&mut Invocation) -> Result<(), ToolExecutionError>>;
 
 /// Result policy applied after the tool ran, such as redaction. The returned
 /// result is the only thing the script can observe, in both normal and `.raw`
 /// mode.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub type ResultPolicy = Arc<dyn Fn(&Invocation, ToolResult) -> ToolResult + Send + Sync>;
+
+/// Result policy applied after the tool ran. May capture local Wasm state.
+/// The returned result is the only script-visible result, including `.raw` mode.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub type ResultPolicy = Arc<dyn Fn(&Invocation, ToolResult) -> ToolResult>;
 
 /// A dispatcher over a fixed set of [`DynamicTool`]s with optional call and
 /// result policies. Suitable for explicit host mode with unmodified Rig; it
@@ -241,7 +253,10 @@ impl DynamicToolDispatcher {
     /// ```
     pub fn with_call_policy<F>(mut self, policy: F) -> Self
     where
-        F: Fn(&mut Invocation) -> Result<(), ToolExecutionError> + Send + Sync + 'static,
+        F: Fn(&mut Invocation) -> Result<(), ToolExecutionError>
+            + WasmCompatSend
+            + WasmCompatSync
+            + 'static,
     {
         self.call_policy = Some(Arc::new(policy));
         self
@@ -283,7 +298,7 @@ impl DynamicToolDispatcher {
     /// ```
     pub fn with_result_policy<F>(mut self, policy: F) -> Self
     where
-        F: Fn(&Invocation, ToolResult) -> ToolResult + Send + Sync + 'static,
+        F: Fn(&Invocation, ToolResult) -> ToolResult + WasmCompatSend + WasmCompatSync + 'static,
     {
         self.result_policy = Some(Arc::new(policy));
         self
