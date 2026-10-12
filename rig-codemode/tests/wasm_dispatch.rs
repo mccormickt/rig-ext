@@ -10,7 +10,7 @@ use rig_codemode::{
 };
 use rig_core::{
     message::ToolName,
-    tool::{DynamicTool, ToolContext, ToolErrorKind, ToolExecutionError, ToolOutput},
+    tool::{ContextValue, DynamicTool, ToolContext, ToolErrorKind, ToolExecutionError, ToolOutput},
     wasm_compat::sleep,
 };
 use serde_json::json;
@@ -150,4 +150,92 @@ async fn local_callbacks_keep_dispatch_and_policy_guarantees() {
         error.model_feedback(),
         Some("partial\nScript failed: guest failed\n")
     );
+}
+
+#[wasm_bindgen_test]
+async fn contextual_local_callback_borrows_context_across_await() {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Tenant(String);
+    impl ContextValue for Tenant {
+        const KEY: &'static str = "app.tenant";
+    }
+
+    let suffix = Rc::new("local");
+    let tool = DynamicTool::new_with_context(
+        ToolName::new("tenant").unwrap(),
+        "",
+        json!({"type": "object"}),
+        move |context: &mut ToolContext, _| {
+            let suffix = suffix.clone();
+            Box::pin(async move {
+                sleep(Duration::from_millis(1)).await;
+                let tenant = context.get::<Tenant>().unwrap().unwrap();
+                Ok(ToolOutput::text(format!("{}:{suffix}", tenant.0)))
+            })
+        },
+    );
+    let dispatcher = DynamicToolDispatcher::new([tool]).unwrap();
+    let mut context = ToolContext::new();
+    context.insert(Tenant("tenant-17".into())).unwrap();
+    let outcome = dispatcher
+        .dispatch(Invocation::new("p", 0, "tenant", json!({}), context))
+        .await;
+    assert!(outcome.result.is_success());
+    assert_eq!(outcome.result.output().as_text(), Some("tenant-17:local"));
+}
+
+#[wasm_bindgen_test]
+fn dropping_dispatch_drops_pending_local_tool() {
+    struct Dropped(Rc<Cell<bool>>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    let dropped = Rc::new(Cell::new(false));
+    let completed = Rc::new(Cell::new(false));
+    let redacted = Rc::new(Cell::new(false));
+    let tool = DynamicTool::new(
+        ToolName::new("pending").unwrap(),
+        "",
+        json!({"type": "object"}),
+        {
+            let dropped = dropped.clone();
+            let completed = completed.clone();
+            move |_| {
+                let guard = Dropped(dropped.clone());
+                let completed = completed.clone();
+                Box::pin(async move {
+                    std::future::pending::<()>().await;
+                    drop(guard);
+                    completed.set(true);
+                    Ok(ToolOutput::text("done"))
+                })
+            }
+        },
+    );
+    let dispatcher = DynamicToolDispatcher::new([tool])
+        .unwrap()
+        .with_result_policy({
+            let redacted = redacted.clone();
+            move |_, result| {
+                redacted.set(true);
+                result
+            }
+        });
+    let mut dispatch = dispatcher.dispatch(Invocation::new(
+        "p",
+        0,
+        "pending",
+        json!({}),
+        ToolContext::new(),
+    ));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(dispatch.as_mut().poll(&mut context).is_pending());
+    assert!(!dropped.get());
+    drop(dispatch);
+    assert!(dropped.get());
+    assert!(!completed.get());
+    assert!(!redacted.get());
 }

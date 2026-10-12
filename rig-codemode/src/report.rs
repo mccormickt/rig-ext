@@ -122,6 +122,39 @@ pub struct CallRecord {
     pub delivery: ScriptDelivery,
 }
 
+impl CallRecord {
+    /// Build a child-call record with no error kind. Set [`Self::error_kind`]
+    /// when the outcome has a normalized error. Delivery is explicit because
+    /// a successful call does not prove that its reply reached the script.
+    /// The executor must supply trusted values and enforce call limits.
+    ///
+    /// ```
+    /// use rig_codemode::{CallRecord, CallStatus, ExecutionReport, ExecutionStatus, ScriptDelivery};
+    ///
+    /// let call = CallRecord::new(2, "lookup", CallStatus::Succeeded, ScriptDelivery::Discarded);
+    /// assert_eq!(serde_json::to_value(&call).unwrap(), serde_json::json!({
+    ///     "ordinal": 2, "name": "lookup", "status": "succeeded", "delivery": "discarded"
+    /// }));
+    /// let mut report = ExecutionReport::new(ExecutionStatus::Completed);
+    /// report.calls.push(call);
+    /// assert_eq!(report.render_text(), "Tool calls: 1 total, 1 succeeded\n");
+    /// ```
+    pub fn new(
+        ordinal: u32,
+        name: impl Into<String>,
+        status: CallStatus,
+        delivery: ScriptDelivery,
+    ) -> Self {
+        Self {
+            ordinal,
+            name: name.into(),
+            status,
+            error_kind: None,
+            delivery,
+        }
+    }
+}
+
 /// A script failure safe to show the model: the script's own exception text
 /// and position. Host and dispatcher internals never appear here.
 #[non_exhaustive]
