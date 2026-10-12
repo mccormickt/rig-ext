@@ -123,6 +123,13 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![cfg_attr(
+    all(target_arch = "wasm32", target_os = "unknown"),
+    allow(
+        clippy::arc_with_non_send_sync,
+        reason = "Arc keeps shared ownership consistent across targets; Wasm callbacks are local."
+    )
+)]
 
 #[cfg(all(feature = "quickjs", target_family = "wasm"))]
 compile_error!("the `quickjs` backend requires a native target; disable it for Wasm contracts");
