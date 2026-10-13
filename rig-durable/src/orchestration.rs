@@ -651,7 +651,7 @@ pub(crate) fn check_route_policy(entry: &ToolEntry, name: &str) -> Result<(), St
     }
 }
 
-async fn schedule_with_retry(
+pub(crate) async fn schedule_with_retry(
     ctx: &OrchestrationContext,
     name: &str,
     payload: impl Fn(u32) -> Result<String, String>,

@@ -183,6 +183,8 @@ pub struct DurableAgentBuilder {
     config: DurableAgentConfig,
     guard: Option<Arc<dyn InvocationGuardStore>>,
     compaction: Option<Compaction>,
+    #[cfg(feature = "codemode")]
+    code_mode: Option<rig_codemode::Limits>,
 }
 
 impl DurableAgentBuilder {
@@ -199,6 +201,8 @@ impl DurableAgentBuilder {
             config: DurableAgentConfig::default(),
             guard: None,
             compaction: None,
+            #[cfg(feature = "codemode")]
+            code_mode: None,
         }
     }
 
@@ -300,6 +304,19 @@ impl DurableAgentBuilder {
             self.config.approval.enabled = true;
         }
         self.tool_options.insert(name, options);
+        self
+    }
+
+    /// Expose registered tools and sub-agents only through a durable `codemode`
+    /// tool. Each nested call is a separate activity or child workflow.
+    /// Results follow recorded host delivery order. Race losers are retained
+    /// and completed before the report returns. Limits cover each VM step;
+    /// tool retries and timeouts remain per tool. Nested approval is not
+    /// supported. Keep this configuration fixed for each live agent version.
+    /// The outer tool returns a JSON execution report, including script errors.
+    #[cfg(feature = "codemode")]
+    pub fn code_mode(mut self, limits: rig_codemode::Limits) -> Self {
+        self.code_mode = Some(limits);
         self
     }
 
@@ -415,8 +432,37 @@ impl DurableAgentBuilder {
             .with_registered_policies(self.config.tools.policies());
         let activities =
             activity_registry_with_names(self.model, executor, &names, self.compaction);
+        #[cfg(feature = "codemode")]
+        let (activities, code_orchestrations) = if let Some(limits) = self.code_mode {
+            let (entry, planning, workflows) = crate::codemode::duroxide::registries(
+                names.clone(),
+                &version,
+                self.config.tools.clone(),
+                self.config.contract,
+                limits,
+            )
+            .map_err(AgentOrchestratorError::InvalidToolPolicy)?;
+            self.config.tools = ToolCatalog::default();
+            self.config.tools.insert(entry);
+            let activities = ActivityRegistry::builder_from(&activities)
+                .merge(planning)
+                .build_result()
+                .map_err(AgentOrchestratorError::Registry)?;
+            (activities, Some(workflows))
+        } else {
+            (activities, None)
+        };
         let orchestrations =
             orchestration_registry_with_names(self.config.clone(), names.clone(), Some(&version));
+        #[cfg(feature = "codemode")]
+        let orchestrations = if let Some(workflows) = code_orchestrations {
+            OrchestrationRegistry::builder_from(&orchestrations)
+                .merge(workflows)
+                .build_result()
+                .map_err(AgentOrchestratorError::Registry)?
+        } else {
+            orchestrations
+        };
         let description = self.description.unwrap_or_else(|| self.name.clone());
         let contains_approval = self.config.approval.enabled
             || self.children.iter().any(|child| child.contains_approval);

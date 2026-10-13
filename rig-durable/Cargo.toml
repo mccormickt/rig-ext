@@ -33,6 +33,7 @@ duroxide = { workspace = true, optional = true }
 futures = "0.3"
 rig.workspace = true
 rig-memory.workspace = true
+rig-codemode = { path = "../rig-codemode", features = ["quickjs"], optional = true }
 rig-celld = { path = "../rig-celld", features = ["storage"], optional = true }
 worker = { workspace = true, optional = true }
 semver = "1"
@@ -55,6 +56,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 [features]
 default = ["duroxide", "sqlite"]
+codemode = ["dep:rig-codemode"]
 durable-object = ["dep:worker", "dep:rig-celld"]
 duroxide = ["dep:duroxide", "dep:tokio"]
 sqlite = ["duroxide", "duroxide/sqlite"]

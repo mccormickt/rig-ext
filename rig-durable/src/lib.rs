@@ -123,6 +123,8 @@
 pub mod activities;
 pub mod activity_types;
 pub mod approval;
+#[cfg(feature = "codemode")]
+pub mod codemode;
 pub mod compaction;
 pub mod config;
 #[cfg(any(feature = "duroxide", feature = "temporal", feature = "durable-object"))]

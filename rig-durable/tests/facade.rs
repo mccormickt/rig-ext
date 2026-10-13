@@ -674,3 +674,304 @@ async fn reconnects_to_a_run_after_runtime_restart_without_recalling_the_model_t
     assert_eq!(recovered_calls.load(Ordering::SeqCst), 1);
     second_orchestrator.shutdown(None).await;
 }
+
+#[cfg(feature = "codemode")]
+#[tokio::test]
+async fn code_mode_recovers_after_parallel_children_without_repeating_completed_work() {
+    use rig::test_utils::MockBarrierTool;
+    use rig_durable::{InvocationContract, ToolPolicy};
+    struct RecordKey {
+        tool: InterruptedTool,
+        keys: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl Tool for RecordKey {
+        const NAME: &'static str = "interruptible";
+        type Args = NoArgs;
+        type Output = &'static str;
+        type Error = Infallible;
+        fn description(&self) -> String {
+            self.tool.description()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            self.tool.parameters()
+        }
+        async fn call(
+            &self,
+            context: &mut ToolContext,
+            args: NoArgs,
+        ) -> Result<Self::Output, Infallible> {
+            let invocation = context.require::<rig_durable::ToolInvocation>().unwrap();
+            self.keys
+                .lock()
+                .unwrap()
+                .push(invocation.logical_key.unwrap().digest());
+            self.tool.call(context, args).await
+        }
+    }
+    let code = r#"
+        const answers = await Promise.all([
+            tools.research({prompt: "facts"}), tools.assess({prompt: "risks"})
+        ]);
+        if (answers[1] === "backup") {
+            await tools.interruptible({});
+            return await tools.review({prompt: answers.join("|")});
+        }
+        return "skipped";
+    "#;
+    let research_model = MockCompletionModel::from_turns([
+        MockTurn::tool_call("barrier", "barrier_tool", serde_json::json!({})),
+        MockTurn::text("staged rollout"),
+    ]);
+    let assess_model = MockCompletionModel::from_turns([
+        MockTurn::tool_call("barrier", "barrier_tool", serde_json::json!({})),
+        MockTurn::text("backup"),
+    ]);
+    let review_model = MockCompletionModel::from_turns([MockTurn::text("approved")]);
+    let parent_model = MockCompletionModel::from_turns([
+        MockTurn::tool_call("script", "codemode", serde_json::json!({"code":code})),
+        MockTurn::text("complete"),
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let build = |block| {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        DurableAgent::builder("workflow", parent_model.clone())
+            .invocation_contract(InvocationContract::Logical)
+            .sub_agent(
+                "research",
+                DurableAgent::builder("researcher", research_model.clone())
+                    .tool(MockBarrierTool::new(barrier.clone()))
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap()
+            .sub_agent(
+                "assess",
+                DurableAgent::builder("assessor", assess_model.clone())
+                    .tool(MockBarrierTool::new(barrier))
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap()
+            .sub_agent(
+                "review",
+                DurableAgent::builder("reviewer", review_model.clone())
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap()
+            .tool_with(
+                RecordKey {
+                    tool: InterruptedTool {
+                        calls: calls.clone(),
+                        block,
+                        entered: entered.clone(),
+                    },
+                    keys: keys.clone(),
+                },
+                ToolOptions::default()
+                    .retry(RetryPolicy::new(1))
+                    .policy(ToolPolicy::read_only()),
+            )
+            .code_mode(rig_codemode::Limits::default())
+            .build()
+            .unwrap()
+    };
+    let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+    let options = RuntimeOptions {
+        worker_lock_timeout: Duration::from_secs(1),
+        ..Default::default()
+    };
+    let first = AgentOrchestrator::builder(store.clone())
+        .register(build(true))
+        .unwrap()
+        .runtime_options(options.clone())
+        .start()
+        .await
+        .unwrap();
+    first
+        .agent("workflow")
+        .unwrap()
+        .start_with_id("recover-script", "plan")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(research_model.requests().len(), 2);
+    assert_eq!(assess_model.requests().len(), 2);
+    assert_eq!(review_model.requests().len(), 0);
+    first.shutdown(Some(0)).await;
+    let second = AgentOrchestrator::builder(store)
+        .register(build(false))
+        .unwrap()
+        .runtime_options(options)
+        .start()
+        .await
+        .unwrap();
+    let response = second
+        .agent("workflow")
+        .unwrap()
+        .run("recover-script")
+        .wait_timeout(Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(response.output(), "complete");
+    let attempts = calls.load(Ordering::SeqCst);
+    assert!(attempts >= 2, "the unfinished activity must be redelivered");
+    {
+        let keys = keys.lock().unwrap();
+        assert_eq!(keys.len(), attempts);
+        assert!(
+            keys.iter().all(|key| key == &keys[0]),
+            "redelivery must keep the logical call identity"
+        );
+    }
+    assert_eq!(research_model.requests().len(), 2);
+    assert_eq!(assess_model.requests().len(), 2);
+    assert_eq!(review_model.requests().len(), 1);
+    let review_request = serde_json::to_string(&review_model.requests()[0]).unwrap();
+    assert!(review_request.contains("staged rollout|backup"));
+    let requests = parent_model.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0]
+            .tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>(),
+        ["codemode"]
+    );
+    let report = serde_json::to_string(&requests[1]).unwrap();
+    assert!(report.contains("approved"));
+    assert!(report.contains("completed"));
+    second.shutdown(None).await;
+}
+
+#[cfg(feature = "codemode")]
+#[tokio::test]
+async fn code_mode_fast_result_advances_script_and_drains_race_loser() {
+    use rig_codemode::{ExecutionReport, ScriptDelivery};
+    use tokio::sync::Notify;
+
+    #[derive(Deserialize)]
+    struct Args {
+        key: String,
+    }
+    struct Probe {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        followed: Arc<Notify>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Tool for Probe {
+        const NAME: &'static str = "probe";
+        type Args = Args;
+        type Output = String;
+        type Error = Infallible;
+        fn description(&self) -> String {
+            "Return a key after its release".into()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{"key":{"type":"string"}},"required":["key"]})
+        }
+        async fn call(&self, _: &mut ToolContext, args: Args) -> Result<String, Infallible> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if args.key == "slow" {
+                self.started.notify_one();
+                self.release.notified().await;
+            } else if args.key == "follow:fast" {
+                self.followed.notify_one();
+            }
+            Ok(args.key)
+        }
+    }
+    let code = r#"
+        const slow = tools.probe({key: "slow"});
+        const invalid = tools.probe({key: 12}).catch(error => error.kind);
+        const schemaWinner = await Promise.race([slow, invalid]);
+        await tools.probe({key: "follow:" + schemaWinner});
+        const fast = tools.probe({key: "fast"});
+        const winner = await Promise.race([slow, fast]);
+        await tools.probe({key: "follow:" + winner});
+        return {schemaWinner, winner};
+    "#;
+    let model = MockCompletionModel::from_turns([
+        MockTurn::tool_call("script", "codemode", serde_json::json!({"code":code})),
+        MockTurn::text("done"),
+    ]);
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let followed = Arc::new(Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let definition = DurableAgent::builder("race", model.clone())
+        .tool_with(
+            Probe {
+                started: started.clone(),
+                release: release.clone(),
+                followed: followed.clone(),
+                calls: calls.clone(),
+            },
+            ToolOptions::default().retry(RetryPolicy::new(1)),
+        )
+        .code_mode(rig_codemode::Limits {
+            max_in_flight: 2,
+            ..Default::default()
+        })
+        .build()
+        .unwrap();
+    let runtime =
+        AgentOrchestrator::builder(Arc::new(SqliteProvider::new_in_memory().await.unwrap()))
+            .register(definition)
+            .unwrap()
+            .start()
+            .await
+            .unwrap();
+    let run = runtime.agent("race").unwrap().start("run").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        started.notified().await;
+        followed.notified().await;
+    })
+    .await
+    .expect("fast result must start follow-up before slow completion");
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), run.wait())
+            .await
+            .is_err(),
+        "the host must retain the unawaited race loser"
+    );
+    release.notify_one();
+    assert_eq!(
+        run.wait_timeout(Duration::from_secs(10))
+            .await
+            .unwrap()
+            .output(),
+        "done"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    let requests = model.requests();
+    fn find(value: &serde_json::Value) -> Option<ExecutionReport> {
+        if let Ok(report) = serde_json::from_value::<ExecutionReport>(value.clone()) {
+            return Some(report);
+        }
+        match value {
+            serde_json::Value::Object(map) => map.values().find_map(find),
+            serde_json::Value::Array(items) => items.iter().find_map(find),
+            serde_json::Value::String(text) => {
+                serde_json::from_str(text).ok().as_ref().and_then(find)
+            }
+            _ => None,
+        }
+    }
+    let report = find(&serde_json::to_value(&requests[1].chat_history).unwrap())
+        .expect("coordinator must receive an execution report");
+    assert_eq!(
+        report.returned,
+        Some(serde_json::json!({"schemaWinner":"invalid_args", "winner":"fast"}))
+    );
+    assert_eq!(report.calls[0].delivery, ScriptDelivery::Discarded);
+    assert_eq!(report.calls[3].delivery, ScriptDelivery::Delivered);
+    runtime.shutdown(None).await;
+}

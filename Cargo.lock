@@ -6625,6 +6625,7 @@ dependencies = [
  "futures",
  "rig",
  "rig-celld",
+ "rig-codemode",
  "rig-memory",
  "rusqlite",
  "semver",
