@@ -17,11 +17,11 @@
 //! | Request field | Behavior |
 //! | --- | --- |
 //! | `tools` | **Error.** A remote agent never emits a tool call, so registering local tools on an A2A-backed agent would advertise tools that can never be invoked. |
-//! | `output_schema` | **Error.** A2A cannot constrain the remote's output, so an [`Extractor`] over this model would silently return unvalidated text. |
+//! | `output_schema` | **Error.** A2A has no remote schema-enforcement contract. Parse and validate response text locally when needed. |
 //! | `tool_choice` | **Error** when it demands a tool; ignored when it merely permits one. |
 //! | `preamble` | Sent as a leading text part. The remote already has its own instructions and is free to disregard it. |
 //! | `documents` | Sent as one text part each, rendered by [`Document`]'s `Display`. |
-//! | `additional_params` | Reads only the [`THREAD_PARAMS_KEY`] threading block; ignores other fields (logged at debug). |
+//! | `additional_params` | Reads [`THREAD_PARAMS_KEY`], `configuration`, `metadata`, and `reference_task_ids`, merged over [`A2AOptions`](crate::A2AOptions). Other fields are ignored. |
 //! | `temperature`, `max_tokens`, `model` | Ignored (logged at debug). Sampling belongs to the remote agent. |
 //!
 //! `usage` reports every counter as absent (`None`): A2A has no token
@@ -43,16 +43,15 @@
 //! 2. **Name it on a builder or run.** [`A2AConversationExt`] sets both Rig's
 //!    memory key and the A2A conversation request parameter. Binding the
 //!    builder also works before [`Agent::into_tool`].
-//! 3. **Supply the ids.** Put the server-issued `contextId` — and a paused
-//!    task's `taskId` — under the [`THREAD_PARAMS_KEY`] block of
-//!    `additional_params` to resume a conversation this process never opened,
-//!    or one restored from your own storage.
+//! 3. **Supply the ids.** Set [`A2AOptions`](crate::A2AOptions) context/task IDs
+//!    to resume from your own storage. A task ID alone is valid. Raw identifiers
+//!    under [`THREAD_PARAMS_KEY`] override typed identifiers.
 //!
 //! The first two look the conversation up in the client's store; the third
 //! bypasses it. A model that sees none of them is single-turn.
 //!
-//! Threaded models send only the newest prompt, because the remote agent holds
-//! the history for that `contextId`; an unthreaded model renders the whole chat
+//! Threaded models assume the remote retains context and send only the newest
+//! prompt; an unthreaded model renders the whole chat
 //! history into the outbound message so a single-shot call still carries its
 //! context.
 //!
@@ -69,16 +68,13 @@
 //! [`A2AClient::agent`]: crate::A2AClient::agent
 //! [`A2AClient::model_for_conversation`]: crate::A2AClient::model_for_conversation
 //! [`A2AConversationExt`]: crate::A2AConversationExt
-//! [`Extractor`]: rig_agent::extractor::Extractor
 
 use std::sync::Arc;
 
 use a2a::{Message as A2AMessage, Part, Role, SendMessageRequest, SendMessageResponse};
 use a2a_client::{A2AClient as InnerClient, Transport};
 use futures::StreamExt;
-use rig_agent::agent::{
-    AgentBuilder, AgentHook, DispatchAction, DispatchEvent, HookContext, NoToolConfig,
-};
+use rig_agent::agent::{AgentBuilder, NoToolConfig};
 use rig_core::completion::{
     AssistantContent, CompletionRequest, CompletionResponse, FinishReason, Usage,
 };
@@ -86,10 +82,12 @@ use rig_core::driver::{Exchange, Model, Opened, Opening};
 use rig_core::error::{EncodeError, ProviderError};
 use rig_core::message::{Message as RigMessage, ToolChoice, UserContent};
 use rig_core::operation::{Block, Completion, Finish};
+use rig_core::serve::{Dispatch, Reply, Serve, adapters::ModelAdapter};
 use rig_core::streaming::Streamed;
 use rig_core::wire::{Decoder, Descriptor, Flow, Mode, Out, Wire, WireEvent};
 
 use crate::error::A2AError;
+use crate::options::MessageOptions;
 use crate::parts::{
     DEFAULT_TEXT_LIMIT, message_body_limited, state_label, status_text_limited, task_body_limited,
 };
@@ -117,6 +115,26 @@ impl std::fmt::Debug for A2AModel {
             .field("agent_name", &self.agent_name)
             .field("conversation", &self.conversation)
             .finish_non_exhaustive()
+    }
+}
+
+/// Register an A2A route with request preparation after application hooks.
+pub trait A2AModelRouteExt: Sized {
+    /// Add a remote model selected with Rig's `using_model(label)` or model
+    /// selection hooks. Local tools and output schemas remain unsupported on
+    /// requests routed to A2A; use a sub-agent tool for local tool orchestration.
+    fn a2a_model_route(self, label: impl Into<rig_agent::agent::ModelRef>, model: A2AModel)
+    -> Self;
+}
+
+impl<T> A2AModelRouteExt for AgentBuilder<T> {
+    fn a2a_model_route(
+        self,
+        label: impl Into<rig_agent::agent::ModelRef>,
+        model: A2AModel,
+    ) -> Self {
+        let label = label.into();
+        self.model_route_handler(label.clone(), model.handler(label))
     }
 }
 
@@ -161,14 +179,23 @@ impl A2AModel {
         Model::new(self.clone(), A2ATransport)
     }
 
+    fn handler(&self, label: impl Into<rig_agent::agent::ModelRef>) -> A2AHandler {
+        A2AHandler {
+            model: self.clone(),
+            adapter: ModelAdapter::new(label, self.driver()),
+        }
+    }
+
     /// Build a Rig agent with A2A request preparation before history adaptation.
     ///
     /// Use this builder or [`A2AClient::agent`](crate::A2AClient::agent), not a
     /// raw erased driver, to preserve the newest prompt's message boundary.
     pub fn agent(&self) -> AgentBuilder<NoToolConfig> {
+        // Rig registers the default model first. Its bus supports replacing
+        // a handler with one of the same family before serving any requests.
         AgentBuilder::new(self.driver())
             .name(crate::parts::agent_name(&self.agent_name))
-            .add_hook(self.clone())
+            .model_route_handler("default", self.handler("default"))
     }
 
     /// Complete one request against the remote agent.
@@ -191,12 +218,14 @@ impl A2AModel {
         &self,
         request: &CompletionRequest,
     ) -> Result<(Option<ConversationId>, Thread), A2AError> {
-        let params = thread_params(request.additional_params.as_ref())?;
-        if let Some(context_id) = params.context_id {
+        let merged = rig_core::completion::options::param(self, request, THREAD_PARAMS_KEY)
+            .map(|params| serde_json::json!({ THREAD_PARAMS_KEY: params }));
+        let params = thread_params(merged.as_ref())?;
+        if params.context_id.is_some() || params.task_id.is_some() {
             return Ok((
                 None,
                 Thread {
-                    context_id: Some(context_id),
+                    context_id: params.context_id,
                     task_id: params.task_id,
                     ..Thread::default()
                 },
@@ -207,9 +236,26 @@ impl A2AModel {
         // conversation. `A2AConversationExt` puts the run's id here.
         let conversation = params
             .conversation
+            .or_else(|| {
+                request
+                    .provider_options
+                    .get::<crate::conversation::Conversation>()
+                    .and_then(|sections| sections.get("*"))
+                    .and_then(|fields| fields.get("conversation"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
             .map(ConversationId::new)
             .or_else(|| self.conversation.clone());
 
+        if conversation
+            .as_ref()
+            .is_some_and(|id| id.as_str().trim().is_empty())
+        {
+            return Err(A2AError::InvalidThreadParams {
+                detail: "`conversation` must be a non-empty string",
+            });
+        }
         let thread = conversation
             .as_ref()
             .map(|id| self.threads.get(id))
@@ -223,7 +269,9 @@ impl A2AModel {
     ) -> Result<CompletionRequest, ProviderError> {
         request.validate_message_content()?;
         let (_, thread) = self.thread(&request)?;
-        if thread.context_id.is_some() && request.chat_history.len() > 1 {
+        if (thread.context_id.is_some() || thread.task_id.is_some())
+            && request.chat_history.len() > 1
+        {
             // The remote holds the older turns. Select the original newest
             // message before Rig merges user messages across failed turns.
             let newest = request.chat_history.remove(request.chat_history.len() - 1);
@@ -241,12 +289,38 @@ impl A2AModel {
     fn build_request(&self, request: CompletionRequest) -> Result<Outbound, A2AError> {
         reject_unsupported(&request)?;
         log_ignored(&request);
+        let options = MessageOptions {
+            a2a: None,
+            configuration: rig_core::completion::options::param(self, &request, "configuration")
+                .map(serde_json::from_value)
+                .transpose()?,
+            metadata: rig_core::completion::options::param(self, &request, "metadata")
+                .map(serde_json::from_value)
+                .transpose()?,
+            reference_task_ids: rig_core::completion::options::param(
+                self,
+                &request,
+                "reference_task_ids",
+            )
+            .map(serde_json::from_value)
+            .transpose()?,
+        };
+        if options
+            .configuration
+            .as_ref()
+            .is_some_and(|c| c.return_immediately == Some(true))
+        {
+            return Err(A2AError::Unsupported {
+                what: "return_immediately",
+                detail: "a Rig completion needs a finished or interrupted task; use the direct client API for background tasks",
+            });
+        }
         let (conversation, thread) = self.thread(&request)?;
         // A threaded remote already holds everything sent under this
         // `contextId`; replaying it would duplicate it on the remote side. An
         // unthreaded call has no server-side memory, so the whole request is
         // rendered into this one message.
-        let threaded = thread.context_id.is_some();
+        let threaded = thread.context_id.is_some() || thread.task_id.is_some();
 
         let mut parts = Vec::new();
         let mut context_fingerprints = Vec::new();
@@ -295,11 +369,14 @@ impl A2AModel {
         let mut message = A2AMessage::new(Role::User, parts);
         message.context_id = thread.context_id;
         message.task_id = thread.task_id;
+        message.reference_task_ids = options.reference_task_ids;
         Ok(Outbound {
             request: SendMessageRequest {
                 message,
-                configuration: None,
-                metadata: None,
+                configuration: options.configuration,
+                metadata: options
+                    .metadata
+                    .map(|metadata| metadata.into_iter().collect()),
                 tenant: self.tenant.clone(),
             },
             context_fingerprints,
@@ -357,11 +434,11 @@ pub const THREAD_PARAMS_KEY: &str = "a2a";
 
 /// A2A threading a caller attached to one request.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct ThreadParams {
+pub(crate) struct ThreadParams {
     /// Conversation whose tracked identifiers this request continues.
     conversation: Option<String>,
-    context_id: Option<String>,
-    task_id: Option<String>,
+    pub(crate) context_id: Option<String>,
+    pub(crate) task_id: Option<String>,
 }
 
 /// Read the identifiers a caller threaded onto this request.
@@ -371,7 +448,9 @@ struct ThreadParams {
 /// binding the model to a [`ConversationId`]. Malformed directives fail the
 /// request rather than being dropped: a typo that silently opened a fresh
 /// remote conversation would read as the remote losing its memory.
-fn thread_params(additional_params: Option<&serde_json::Value>) -> Result<ThreadParams, A2AError> {
+pub(crate) fn thread_params(
+    additional_params: Option<&serde_json::Value>,
+) -> Result<ThreadParams, A2AError> {
     let Some(params) = additional_params.and_then(|params| params.get(THREAD_PARAMS_KEY)) else {
         return Ok(ThreadParams::default());
     };
@@ -403,14 +482,6 @@ fn thread_params(additional_params: Option<&serde_json::Value>) -> Result<Thread
     if conversation.is_some() && (context_id.is_some() || task_id.is_some()) {
         return Err(A2AError::InvalidThreadParams {
             detail: "sets `conversation` together with explicit ids; supply one or the other",
-        });
-    }
-    // A task lives inside a context. Accepting a lone taskId would send a
-    // request the caller believes is threaded while the history replay that
-    // keys off the contextId still fires.
-    if task_id.is_some() && context_id.is_none() {
-        return Err(A2AError::InvalidThreadParams {
-            detail: "a `task_id` must be accompanied by the `context_id` that owns it",
         });
     }
     Ok(ThreadParams {
@@ -622,25 +693,31 @@ impl rig_core::completion::ReplayTarget for A2AModel {
     }
 }
 
-impl AgentHook for A2AModel {
-    async fn on_dispatch(&self, _ctx: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
-        use rig_core::{
-            effect::EffectKind,
-            error::{ErrorKind, ErrorReport},
-        };
+/// Select history after dispatch hooks, before the model's replay adaptation.
+struct A2AHandler {
+    model: A2AModel,
+    adapter: ModelAdapter<Completion>,
+}
 
-        let EffectKind::Completion { request, stream } = event.kind else {
-            return DispatchAction::Proceed;
-        };
-        match self.prepare_request(request.clone()) {
-            Ok(request) => DispatchAction::Patch(EffectKind::Completion {
-                request,
-                stream: *stream,
-            }),
-            Err(error) => {
-                DispatchAction::Deny(ErrorReport::new(ErrorKind::Other, error.to_string()))
+impl Serve for A2AHandler {
+    type Family = rig_core::effect::family::Completion;
+
+    fn descriptor(&self) -> rig_core::effect::HandlerDescriptor {
+        self.adapter.descriptor()
+    }
+
+    async fn serve(&self, kind: rig_core::effect::EffectKind, dispatch: Dispatch) -> Reply {
+        use rig_core::effect::EffectKind;
+        let kind = match kind {
+            EffectKind::Completion { request, stream } => {
+                match self.model.prepare_request(request) {
+                    Ok(request) => EffectKind::Completion { request, stream },
+                    Err(error) => return Reply::Outcome(Err(error.into())),
+                }
             }
-        }
+            other => other,
+        };
+        self.adapter.serve(kind, dispatch).await
     }
 }
 
@@ -823,7 +900,7 @@ fn reject_unsupported(request: &CompletionRequest) -> Result<(), A2AError> {
     if request.output_schema.is_some() {
         return Err(A2AError::Unsupported {
             what: "output_schema",
-            detail: "A2A cannot constrain a remote agent's output, so structured extraction would return unvalidated text",
+            detail: "A2A has no remote schema-enforcement contract; parse and validate the response locally",
         });
     }
     if matches!(
@@ -840,19 +917,19 @@ fn reject_unsupported(request: &CompletionRequest) -> Result<(), A2AError> {
 
 /// Note the sampling knobs the remote agent owns instead of the caller.
 ///
-/// The `a2a` block of `additional_params` is threading, not sampling, and is
-/// read by [`thread_params`] — only the rest of that object is ignored.
+/// Protocol fields are read through Rig's provider-options merge.
 fn log_ignored(request: &CompletionRequest) {
     let ignored_params = request.additional_params.as_ref().is_some_and(|params| {
-        params
-            .as_object()
-            .is_none_or(|fields| fields.keys().any(|key| key != THREAD_PARAMS_KEY))
+        params.as_object().is_none_or(|fields| {
+            fields.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    THREAD_PARAMS_KEY | "configuration" | "metadata" | "reference_task_ids"
+                )
+            })
+        })
     });
-    if request.temperature.is_some()
-        || request.max_tokens.is_some()
-        || ignored_params
-        || request.model.is_some()
-    {
+    if request.temperature.is_some() || request.max_tokens.is_some() || ignored_params {
         tracing::debug!(
             target: "rig_a2a",
             "sampling parameters are ignored: an A2A agent owns its own decoding settings"
@@ -1088,9 +1165,6 @@ mod tests {
             serde_json::json!({"a2a": {"contextId": "ctx-1"}}),
             serde_json::json!({"a2a": {"context_id": ""}}),
             serde_json::json!({"a2a": {"context_id": 7}}),
-            // A task id cannot stand on its own: history replay keys off the
-            // context id, so this would silently send an unthreaded request.
-            serde_json::json!({"a2a": {"task_id": "task-1"}}),
             // Two different claims; honoring one would ignore the other.
             serde_json::json!({"a2a": {"conversation": "c", "context_id": "ctx-1"}}),
         ] {

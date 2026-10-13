@@ -1222,6 +1222,250 @@ async fn model_stream_yields_status_message_text() {
     server.abort();
 }
 
+/// Wire fixtures deliberately bypass the server reducer so malformed EOF and
+/// repeated snapshots reach the client unchanged. Both real HTTP transports run.
+async fn serve_wire(
+    binding: StubBinding,
+    events: Vec<StreamResponse>,
+    streaming: bool,
+) -> (
+    A2AClient,
+    Arc<Mutex<Vec<serde_json::Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    serve_wire_script(binding, vec![events], streaming).await
+}
+
+async fn serve_wire_script(
+    binding: StubBinding,
+    script: Vec<Vec<StreamResponse>>,
+    streaming: bool,
+) -> (
+    A2AClient,
+    Arc<Mutex<Vec<serde_json::Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::response::IntoResponse;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let saved = recorded.clone();
+    let app = axum::Router::new().fallback(axum::routing::post(
+        move |axum::Json(request): axum::Json<serde_json::Value>| {
+            let events = {
+                let mut requests = saved.lock().unwrap();
+                let events = script[requests.len().min(script.len() - 1)].clone();
+                requests.push(request.clone());
+                events
+            };
+            async move {
+                let wrap = |event| match binding {
+                    StubBinding::JsonRpc => {
+                        serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": event})
+                    }
+                    StubBinding::Rest => event,
+                };
+                if streaming {
+                    let body = events
+                        .into_iter()
+                        .map(|event| {
+                            format!("data: {}\n\n", wrap(serde_json::to_value(event).unwrap()))
+                        })
+                        .collect::<String>();
+                    ([("content-type", "text/event-stream")], body).into_response()
+                } else {
+                    axum::Json(wrap(serde_json::to_value(&events[0]).unwrap())).into_response()
+                }
+            }
+        },
+    ));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut card = card_with_skills(&base, "wire", &[]);
+    card.supported_interfaces = vec![AgentInterface::new(
+        &base,
+        match binding {
+            StubBinding::JsonRpc => TRANSPORT_PROTOCOL_JSONRPC,
+            StubBinding::Rest => TRANSPORT_PROTOCOL_HTTP_JSON,
+        },
+    )];
+    (
+        A2AClient::from_agent_card(card).await.unwrap(),
+        recorded,
+        server,
+    )
+}
+
+#[tokio::test]
+async fn typed_options_compose_with_conversations_and_survive_serialization() {
+    use rig_a2a::{A2A, A2AOptions, A2AReply};
+    for binding in [StubBinding::JsonRpc, StubBinding::Rest] {
+        let reply = Message::new(Role::Agent, vec![Part::text("ok")]);
+        let (client, recorded, server) =
+            serve_wire(binding, vec![StreamResponse::Message(reply.clone())], false).await;
+        let options = A2AOptions::default()
+            .context("remote-context")
+            .reference_tasks(["related"])
+            .metadata(
+                serde_json::json!({"trace": "abc"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .configuration(a2a::SendMessageConfiguration {
+                accepted_output_modes: Some(vec!["text/plain".into()]),
+                history_length: Some(0),
+                task_push_notification_config: None,
+                return_immediately: Some(false),
+            });
+        let request = CompletionRequest::new("direct").provider_option(options.clone());
+        let request = serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
+        let response = client.model().completion(request).await.unwrap();
+        assert!(
+            matches!(response.extras::<A2A>().unwrap().unwrap(), A2AReply::Response(response) if *response == SendMessageResponse::Message(reply))
+        );
+        client
+            .agent()
+            .provider_option(options.clone())
+            .additional_params(serde_json::json!({"metadata": {"extra": true}}))
+            .a2a_conversation("local-key")
+            .build()
+            .prompt("agent")
+            .a2a_conversation("run-key")
+            .await
+            .unwrap();
+        client
+            .message("client")
+            .options(options)
+            .send()
+            .await
+            .unwrap();
+        let requests = recorded.lock().unwrap();
+        for (index, raw) in requests.iter().enumerate() {
+            let body = match binding {
+                StubBinding::JsonRpc => &raw["params"],
+                StubBinding::Rest => raw,
+            };
+            assert_eq!(body["message"]["contextId"], "remote-context");
+            assert_eq!(
+                body["message"]["referenceTaskIds"],
+                serde_json::json!(["related"])
+            );
+            assert_eq!(body["metadata"]["trace"], "abc");
+            assert_eq!(body["configuration"]["historyLength"], 0);
+            assert_eq!(
+                body["configuration"]["acceptedOutputModes"],
+                serde_json::json!(["text/plain"])
+            );
+            if index == 1 {
+                assert_eq!(body["metadata"]["extra"], true);
+            }
+        }
+        assert_eq!(requests.len(), 3);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn task_only_options_resume_a_paused_task_without_replaying_history() {
+    for binding in [StubBinding::JsonRpc, StubBinding::Rest] {
+        let (addr, recorded, server) = serve_script(
+            "pauser",
+            &[],
+            [
+                StubReply::InputRequired {
+                    prompt: "which file?".into(),
+                },
+                StubReply::CompletedText("done".into()),
+            ],
+            binding,
+        )
+        .await;
+        let client = A2AClient::from_url(format!("http://{addr}")).await.unwrap();
+        let SendMessageResponse::Task(task) = client.message("start").send().await.unwrap() else {
+            panic!("expected task")
+        };
+        client
+            .agent()
+            .build()
+            .prompt("README.md")
+            .history([RigMessage::user("must not repeat")])
+            .provider_option(rig_a2a::A2AOptions::default().task(&task.id))
+            .await
+            .unwrap();
+        assert_eq!(recorded_texts(&recorded, 1), ["README.md"]);
+        assert_eq!(
+            recorded.lock().unwrap()[1].message.task_id.as_deref(),
+            Some(task.id.as_str())
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn routing_away_from_a2a_keeps_the_selected_models_history() {
+    let card = card_with_skills("http://127.0.0.1:1", "unreachable", &[]);
+    let client = A2AClient::from_agent_card(card).await.unwrap();
+    let mock = MockCompletionModel::from_turns([MockTurn::text("local answer")]);
+    let agent = client.agent().model_route("local", mock.clone()).build();
+    let response = agent
+        .prompt("new question")
+        .merge_additional_params(
+            serde_json::json!({"a2a": {"context_id": "remote-context"}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .history([
+            RigMessage::user("old question"),
+            RigMessage::assistant("old answer"),
+        ])
+        .using_model("local")
+        .await
+        .unwrap();
+    assert_eq!(response.to_string(), "local answer");
+    let requests = mock.requests();
+    let history = &requests[0].chat_history;
+    assert!(history.iter().any(|message| matches!(message, RigMessage::User { content } if content.iter().any(|part| matches!(part, UserContent::Text(text) if text.text.contains("old question"))))));
+    assert!(history.iter().any(|message| matches!(message, RigMessage::Assistant(message) if message.content.iter().any(|part| matches!(part, rig_core::message::AssistantContent::Text(text) if text.text == "old answer")))));
+}
+
+#[tokio::test]
+async fn a_registered_remote_route_keeps_the_original_message_boundary() {
+    use rig_a2a::A2AModelRouteExt;
+    let (addr, recorded, server) = serve_stub(
+        "routed",
+        &[],
+        StubReply::CompletedText("remote answer".into()),
+    )
+    .await;
+    let client = A2AClient::from_url(format!("http://{addr}")).await.unwrap();
+    let agent = AgentBuilder::new(MockCompletionModel::from_turns([MockTurn::text("local")]))
+        .a2a_model_route("remote", client.model())
+        .build();
+    for streaming in [false, true] {
+        let run = agent
+            .prompt("only this prompt")
+            .history([
+                RigMessage::user("old user message"),
+                RigMessage::assistant(""),
+            ])
+            .provider_option(rig_a2a::A2AOptions::default().context("ctx-1"))
+            .using_model("remote");
+        if streaming {
+            let mut stream = run.stream();
+            while let Some(item) = stream.next().await {
+                item.unwrap();
+            }
+        } else {
+            assert_eq!(run.await.unwrap().to_string(), "remote answer");
+        }
+    }
+    assert_eq!(recorded_texts(&recorded, 0), ["only this prompt"]);
+    assert_eq!(recorded_texts(&recorded, 1), ["only this prompt"]);
+    server.abort();
+}
 /// An artifact update names its task but reports no task state, so it says
 /// nothing about resumability. Letting it clear the paused task's id would
 /// strand the conversation: the next turn would open a new task and the remote
@@ -1588,34 +1832,63 @@ async fn selected_interface_must_be_an_absolute_http_url() {
 
 #[tokio::test]
 async fn selected_interface_tenant_reaches_direct_and_model_requests() {
-    let (addr, recorded, server) =
-        serve_stub("tenant", &["chat"], StubReply::CompletedText("ok".into())).await;
-    let mut card = card_with_skills(&format!("http://{addr}"), "tenant", &["chat"]);
-    card.supported_interfaces[0].tenant = Some("tenant-a".to_string());
+    for binding in [StubBinding::JsonRpc, StubBinding::Rest] {
+        let (addr, recorded, server) = serve_stub_with_binding(
+            "tenant",
+            &["chat"],
+            StubReply::CompletedText("ok".into()),
+            binding,
+        )
+        .await;
+        let mut card = card_with_skills(&format!("http://{addr}"), "tenant", &["chat"]);
+        card.supported_interfaces[0] = match binding {
+            StubBinding::JsonRpc => {
+                AgentInterface::new(format!("http://{addr}/jsonrpc"), TRANSPORT_PROTOCOL_JSONRPC)
+            }
+            StubBinding::Rest => {
+                AgentInterface::new(format!("http://{addr}"), TRANSPORT_PROTOCOL_HTTP_JSON)
+            }
+        };
+        card.supported_interfaces[0].tenant = Some("tenant-a".to_string());
 
-    let client = A2AClient::from_agent_card(card)
-        .await
-        .expect("client should use supplied card");
-    client
-        .message("direct")
-        .send()
-        .await
-        .expect("direct request should succeed");
-    client
-        .model()
-        .completion(text_request("model"))
-        .await
-        .expect("model request should succeed");
+        let client = A2AClient::from_agent_card(card)
+            .await
+            .expect("client should use supplied card");
+        client
+            .message("direct")
+            .send()
+            .await
+            .expect("direct request should succeed");
+        client
+            .model()
+            .completion(text_request("model"))
+            .await
+            .expect("model request should succeed");
+        let mut events = client.message("direct stream").stream().await.unwrap();
+        while let Some(event) = events.next().await {
+            event.unwrap();
+        }
+        client
+            .model()
+            .stream(text_request("model stream"))
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
 
-    let requests = recorded.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert!(
-        requests
-            .iter()
-            .all(|request| request.tenant.as_deref() == Some("tenant-a"))
-    );
+        {
+            let requests = recorded.lock().unwrap();
+            assert_eq!(requests.len(), 4);
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.tenant.as_deref() == Some("tenant-a"))
+            );
+        }
 
-    server.abort();
+        server.abort();
+        let _ = server.await;
+    }
 }
 
 #[tokio::test]
