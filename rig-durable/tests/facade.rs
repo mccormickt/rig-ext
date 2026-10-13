@@ -141,6 +141,89 @@ async fn approval_is_managed_through_the_run_handle() {
 }
 
 #[tokio::test]
+async fn next_approval_times_out_with_running_non_json_custom_status() {
+    use duroxide::{ClientError, OrchestrationStatus, runtime::registry::OrchestrationRegistry};
+
+    let definition = DurableAgent::builder(
+        "malformed-approval-status",
+        MockCompletionModel::from_turns([MockTurn::text("unused")]),
+    )
+    .build()
+    .unwrap();
+    let raw = OrchestrationRegistry::builder()
+        .register("NonJsonStatus", |ctx, _input| async move {
+            ctx.set_custom_status("not JSON");
+            ctx.schedule_wait("never-released").await;
+            Ok("done".into())
+        })
+        .build();
+    let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+    let orchestrator = AgentOrchestrator::builder(store)
+        .register(definition)
+        .unwrap()
+        .merge_orchestrations(raw)
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let run = orchestrator
+        .agent("malformed-approval-status")
+        .unwrap()
+        .run("malformed-status-deadline");
+    orchestrator
+        .client()
+        .start_orchestration(run.instance_id(), "NonJsonStatus", "")
+        .await
+        .unwrap();
+
+    // Observe persisted malformed status, not merely a scheduled/not-found run,
+    // before pausing time or starting the approval deadline.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let OrchestrationStatus::Running {
+                custom_status: Some(status),
+                ..
+            } = orchestrator
+                .client()
+                .get_orchestration_status(run.instance_id())
+                .await
+                .unwrap()
+                && status == "not JSON"
+            {
+                assert!(serde_json::from_str::<serde_json::Value>(&status).is_err());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("raw orchestration must be running with non-JSON custom status");
+
+    tokio::time::pause();
+    let approval = run.next_approval();
+    tokio::pin!(approval);
+    // Poll the same future before advancing past its internally created deadline.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), &mut approval)
+            .await
+            .is_err(),
+        "a running malformed status must keep waiting before the deadline"
+    );
+    tokio::time::advance(Duration::from_secs(300)).await;
+    // SQLite uses real worker threads; give them a real-time budget rather than
+    // letting paused Tokio time auto-advance the outer guard ahead of their IO.
+    tokio::time::resume();
+    let result = tokio::time::timeout(Duration::from_secs(1), &mut approval)
+        .await
+        .expect("malformed status must not bypass the approval deadline");
+    assert!(matches!(
+        result,
+        Err(AgentOrchestratorError::Client(ClientError::Timeout))
+    ));
+    orchestrator.shutdown(Some(0)).await;
+}
+
+#[tokio::test]
 async fn steering_runs_as_a_follow_up_turn_before_completion() {
     let definition = DurableAgent::builder(
         "steerable",

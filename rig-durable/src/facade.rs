@@ -961,14 +961,9 @@ impl DurableRun {
                     custom_status: Some(status),
                     ..
                 } => {
-                    let status: serde_json::Value = match serde_json::from_str(&status) {
-                        Ok(status) => status,
-                        Err(_) => {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                            continue;
-                        }
-                    };
-                    if status["phase"] == "approval" {
+                    if let Ok(status) = serde_json::from_str::<serde_json::Value>(&status)
+                        && status["phase"] == "approval"
+                    {
                         return serde_json::from_value(status["request"].clone())
                             .map_err(|error| AgentOrchestratorError::Run(error.to_string()));
                     }

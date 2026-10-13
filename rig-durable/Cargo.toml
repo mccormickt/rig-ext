@@ -55,7 +55,7 @@ uuid = { version = "1", features = ["v4"] }
 duroxide = { workspace = true, features = ["sqlite"] }
 rig = { workspace = true, features = ["test-utils"] }
 temporalio-client.workspace = true
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [features]
