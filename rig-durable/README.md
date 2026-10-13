@@ -12,6 +12,9 @@
 Use only Temporal with `default-features = false, features = ["temporal"]`.
 Use both native backends with `features = ["temporal"]`.
 Use Workers with `default-features = false, features = ["durable-object"]`.
+Use `features = ["codemode"]` for [durable JavaScript workflows](#durable-code-mode-workflows)
+with the native QuickJS runtime. The feature is backend-neutral; combine it with
+`duroxide` (enabled by default) or `temporal`.
 The backend-neutral core also builds without any features on WASM.
 
 ## Rig 0.44
@@ -585,6 +588,131 @@ let assistant = DurableAgent::builder("assistant", main_model)
     .sub_agent("research", researcher)?
     .build()?;
 ```
+
+## Durable code-mode workflows
+
+Enable the optional native `codemode` feature, then use
+`DurableAgentBuilder::code_mode(...)` or `TemporalAgent::code_mode(...)`. Registered
+tools and `.sub_agent(...)` children remain callable from JavaScript, but the
+coordinator model sees only `codemode({ code })`. This prevents direct calls
+from bypassing the script boundary.
+Use `.code_mode(Default::default())` for default limits without naming the
+dependency. Add `rig-codemode` as a direct dependency to configure its `Limits`.
+
+```rust,ignore
+let coordinator = DurableAgent::builder("coordinator", main_model)
+    .sub_agent("research", researcher)?
+    .sub_agent("assess", assessor)?
+    .sub_agent("review", reviewer)?
+    .code_mode(rig_codemode::Limits::default())
+    .build()?;
+```
+
+A script can use `Promise.all` to run researchers concurrently, inspect their
+answers, then call a reviewer only when those answers require review. Every
+nested Rig tool is a separate durable activity; every durable sub-agent is a
+child orchestration. Script planning runs in a pure QuickJS activity. After
+each selected result, the next planning activity persists its delivery position
+and reconstructs the VM from the ordered journal. The shared scheduler retains
+pending operations, so a fast answer can start a follow-up before a slow sibling
+finishes. Ready-result ties use stable admission order. `Promise.all` retains
+input ordering; `Promise.race` uses recorded host delivery order, not physical
+timestamps. A restart reuses completed activities and children rather than
+rerunning the whole script as one tool activity. Interrupted activities still
+have at-least-once delivery and need the existing replay-safety policies.
+Under `Logical`, nested Rig tools receive a key scoped to the script's child
+workflow instance and call ordinal. Keys differ across script calls and remain
+stable across activity attempts. Temporal scopes keys to the execution chain,
+parent prompt, model turn, outer script call, and nested ordinal.
+Guard stores and per-tool retries still apply.
+
+Race losers are not cancelled. The host completes all admitted calls, including
+queued calls, before returning the final report. Late replies are `Discarded`.
+This prevents returning a successful script while its external effects remain
+untracked, but a slow loser can delay the outer tool's return.
+
+The outer tool returns a JSON `ExecutionReport`. Script exceptions are reports
+with `status: "script_error"`, not rollback. Exhausted nested activity or child
+failures reject their JavaScript promises; scripts can catch them or use `.raw`.
+Schema errors cannot start an effect. Replay divergence fails the workflow
+closed. Duroxide status records include admitted/completed counts. Both backends
+retain separate child histories for inspection.
+
+Planning failures stop admission but do not cancel admitted work. The scheduler
+drains active and queued calls, then persists their final journal in one last
+planning activity. That activity cannot admit new effects. The original error
+fails the workflow on both backends; it is not coordinator tool feedback.
+
+The [`dynamic_workflow`](examples/dynamic_workflow.rs) example runs without
+an API key and prints the actual report received by the coordinator:
+
+```sh
+cargo run -p rig-durable --features codemode --example dynamic_workflow
+cargo test -p rig-durable --features codemode --test facade code_mode
+```
+
+### Temporal
+
+Enable only Temporal and code mode without pulling in Duroxide:
+
+```toml
+rig-durable = { version = "0.1", default-features = false, features = ["temporal", "codemode"] }
+```
+
+Temporal child agents are registered independently on their own worker queues.
+Calling `.sub_agent(...)` captures the child's configuration and queue:
+
+```rust,ignore
+let researcher = TemporalAgent::new(research_model);
+let coordinator = TemporalAgent::new(main_model)
+    .sub_agent("research", &researcher, "research-workers")?
+    .tool(lookup)
+    .code_mode(Default::default());
+let input = coordinator.input("Research and check the result.");
+researcher.register(&mut research_worker_options)?;
+coordinator.register(&mut coordinator_worker_options)?;
+// Start both workers, then start TemporalAgentWorkflow::run with input.
+```
+
+The live regression test uses mocked models, a blocked child, out-of-order
+results, worker restart, and recorded-history replay. Start a local Temporal
+development server and run:
+
+```sh
+cargo test -p rig-durable --no-default-features --features temporal,codemode \
+  --test temporal temporal_code_mode -- --include-ignored
+```
+
+The public `rig_durable::codemode` module owns configuration, step inputs, and
+the shared scheduler. Backend adapters supply durable planning and tool
+operations. VM execution never runs inside backend workflow code.
+
+### Pi reference and boundaries
+
+Pi's [codemode adapter](https://github.com/earendil-works/pi/blob/main/packages/durable/src/codemode/codemode.ts)
+maps VM calls to keyed `executeTool` tasks and journals results before delivery.
+Its [foreground sub-agent example](https://github.com/earendil-works/pi/blob/main/packages/durable/test/examples/22-subagent-foreground.ts)
+creates a conversation owned by the tool task and deduplicates its submission
+by task ID. Dynamic workflows come from composing those tools with JavaScript,
+not from a separate workflow language. Rig uses the same separation, with
+backend activity records and durable child workflows in place of Pi task documents.
+
+This integration supports native Duroxide and Temporal. `Date`, `Math.random`,
+weak references, and finalizers are unavailable.
+`wall_time` bounds each VM step, not the complete workflow. `max_in_flight`
+bounds active nested operations across steps; sub-agents own limits for their
+internal work. Await new calls or compose them in awaited promises before
+returning. Nested human approval and Pi-style child
+conversation steering are not supported. Parent steering keeps its existing
+follow-up-turn behavior; it does not modify a running script or child.
+
+Treat enabling code mode, changing the nested catalog or policies, changing
+limits, or upgrading the VM as an agent-version boundary. Keep each registered
+version fixed while its histories live. Duroxide's parent configuration snapshot
+does not snapshot nested script configuration; Temporal inputs record it.
+Step inputs retain prior results,
+so history grows with both the number of calls and their result sizes. This
+feature does not add continue-as-new or bounded transcript storage to scripts.
 
 ## Human approval
 

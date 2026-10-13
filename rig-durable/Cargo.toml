@@ -28,6 +28,10 @@ required-features = ["duroxide", "sqlite"]
 name = "temporal_retrying_tool"
 required-features = ["temporal"]
 
+[[example]]
+name = "dynamic_workflow"
+required-features = ["codemode", "sqlite"]
+
 [dependencies]
 duroxide = { workspace = true, optional = true }
 futures = "0.3"

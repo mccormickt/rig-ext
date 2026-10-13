@@ -76,6 +76,27 @@ let tool: rig_core::tool::DynamicTool = codemode.tool();
 
 `codemode.description()` renders usage rules plus TypeScript declarations for inline catalog entries within a byte budget. Entries marked `Presentation::Deferred`, or beyond the budget, stay callable and discoverable from scripts.
 
+## Sub-agents
+
+Rig agents are tools. Give each agent a name and description with `AgentBuilder`,
+then register `agent.into_tool()?` in `DynamicToolDispatcher`. Scripts call the
+agent with `await tools.research({ prompt: "Find supporting facts." })` and get
+its text answer. `Promise.all` can run independent agents in parallel; a later
+call can use their answers. The dispatcher applies the same argument validation
+and call/result policies as for other tools. The agent tool inherits dispatch
+context; the coordinator's agent hooks do not run for nested calls.
+
+The API-key-free [`sub_agents`](examples/sub_agents.rs) example uses two Rig
+agents, not tool callbacks that imitate agents:
+
+```sh
+cargo run -p rig-codemode --example sub_agents --features quickjs
+```
+
+This is ordinary execution, not durable execution. Use `rig-durable`'s
+`codemode` feature and `DurableAgentBuilder::code_mode` when each nested effect
+must survive recovery.
+
 ## Script policy
 
 Per-call policy lives in the dispatcher (`CallPolicy`, `ResultPolicy`). `DynamicToolDispatcher::new` compiles input schemas once and returns `InputSchemaError` for an invalid schema. Every call validates its effective arguments after call-policy rewrites, before the callback runs. This validation is part of core, without the `mcp` feature. A `ScriptPolicy` adds one review of the whole script before it runs, so a host can approve a script, attach credentials, or refuse it without seeing each nested call.
@@ -114,6 +135,45 @@ A policy `Err` refuses the script. Nothing runs; `execute` returns `ExecutionErr
 Both discovery helpers serialize borrowed catalog data through the message byte and nesting limits. Oversized queries or responses throw `RangeError`. Catalog search indexes are built once at host construction. The host stops admitting tool calls at the execution deadline and joins the interrupted worker before returning a report.
 
 `tools` is a frozen null-prototype object. Names route exactly: `a-b`, `a_b`, and `__proto__` are three different tools, and `tools.constructor` is `undefined`. There is no `fetch`, `require`, `process`, `setTimeout`, `std`, `os`, or module loading; `import()` rejects. Each execution gets a fresh runtime, so globals and prototype changes never cross scripts.
+
+Every execution excludes `Date`, `Math.random`, weak references, and finalizers.
+There is no nondeterministic guest mode. Get time or random values through
+explicit host tools so a durable host can record their results. These guest
+restrictions alone do not make live execution durable; recovery still requires
+a durable host and its delivery journal.
+
+## Durable script steps
+
+With `quickjs`, `replay::step(code, catalog, limits, admitted, history)` reconstructs a
+fresh VM and returns either `ScriptStep::Calls` or `ScriptStep::Done`. It does
+not have a dispatcher and cannot run tools. A durable host must authorize and
+persist new calls before execution. `admitted` retains accepted calls, including
+queued and pending calls. Persist each `SettledCall` in delivery order and supply
+that journal to the next step. `Calls` includes existing unresolved admissions;
+the host must retain their operations, not dispatch them again.
+Input schemas are checked before calls are returned;
+ordinary result projection, raw envelopes, and message limits still apply.
+Replay checks the name, ordinal, arguments, and raw flag of recorded calls
+before it returns new calls. The durable backend must also persist the source
+and version the catalog, limits, and engine together.
+
+Results settle in **recorded delivery order**, which can differ from invocation
+order. A later call can win `Promise.race` and start a follow-up while an earlier
+call remains pending. `Promise.all` still returns values in input order. A host
+must record its observed delivery order before replay, not race tools again on
+recovery. Local schema errors settle deterministically before external results.
+`Date`, `Math.random`, weak references, and finalizers are unavailable.
+The wall-time limit covers each reconstruction step, not external tool waits.
+If a script terminates with new unresolved calls, the step rejects those calls
+without execution. Calls admitted at an earlier wait are not rolled back if
+the script later fails. A terminal step may leave admitted race losers pending;
+the host must complete them and replay with their results for the final report.
+Late results are marked `Discarded`, not cancelled.
+
+This follows Pi's [durable codemode integration](https://github.com/earendil-works/pi/blob/main/packages/durable/src/codemode/codemode.ts),
+including its journal-before-delivery separation. Rig disables clock/random
+APIs rather than seeding them. See the [`rig-durable` example](../rig-durable/examples/dynamic_workflow.rs)
+and its shared Duroxide/Temporal scheduler for separate durable nested calls.
 
 ## Limits
 
