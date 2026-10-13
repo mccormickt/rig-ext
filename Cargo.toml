@@ -19,6 +19,7 @@ license = "MIT"
 [workspace.dependencies]
 duroxide = "0.1.30"
 rig = "0.44.0"
+rig-agent = { version = "0.44.0", default-features = false }
 rig-core = { version = "0.44.0", default-features = false }
 rig-memory = "0.44.0"
 serde = { version = "1", features = ["derive"] }
