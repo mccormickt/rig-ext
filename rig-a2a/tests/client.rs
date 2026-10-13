@@ -1847,6 +1847,124 @@ async fn multimodal_input_and_direct_events_keep_bytes_mime_types_and_order() {
         wire_server.abort();
     }
 }
+
+#[tokio::test]
+async fn a_restored_agent_run_can_resume_remote_work_with_a_fresh_client() {
+    use rig_agent::agent::{AgentRun, AgentRunStep, ModelTurn, RetryRequest};
+    for binding in [StubBinding::JsonRpc, StubBinding::Rest] {
+        let (addr, recorded, server) = serve_script(
+            "durable",
+            &[],
+            [
+                StubReply::InputRequired {
+                    prompt: "which file?".into(),
+                },
+                StubReply::CompletedText("updated".into()),
+            ],
+            binding,
+        )
+        .await;
+        let client = A2AClient::from_url(format!("http://{addr}")).await.unwrap();
+        let mut run = AgentRun::new("update a file").max_turns(2);
+        let AgentRunStep::CallModel { prompt, .. } = run.next_step().unwrap() else {
+            panic!("expected a pending model call")
+        };
+        let pending = serde_json::to_vec(&run).unwrap();
+        let error = client
+            .agent()
+            .build()
+            .resume(serde_json::from_slice(&pending).unwrap())
+            .provider_option(rig_a2a::A2AOptions::default().task("does-not-reissue"))
+            .run()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("model response is pending"),
+            "{error}"
+        );
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "AwaitingModel must not resend the pending call"
+        );
+
+        let response = client
+            .model()
+            .completion(CompletionRequest::new(prompt).accept_unknown_finish_reasons(true))
+            .await
+            .unwrap();
+        let rig_a2a::A2AReply::Response(reply) =
+            response.extras::<rig_a2a::A2A>().unwrap().unwrap()
+        else {
+            panic!("expected unary reply")
+        };
+        let SendMessageResponse::Task(task) = *reply else {
+            panic!("expected task")
+        };
+        // A host persists the pending run and the response to its issued call.
+        // The A2A completion advertises no local tools.
+        let turn =
+            ModelTurn::from_response_parts(&response, Default::default(), Default::default());
+        let saved_turn = serde_json::to_vec(&turn).unwrap();
+        let mut run: AgentRun = serde_json::from_slice(&pending).unwrap();
+        run.model_response(serde_json::from_slice(&saved_turn).unwrap())
+            .unwrap();
+        assert_eq!(run.turn(), 1);
+        assert_eq!(run.completion_calls().len(), 1);
+
+        // Resuming an accepted turn finalizes it without another HTTP request.
+        let accepted = serde_json::to_vec(&run).unwrap();
+        assert_eq!(
+            client
+                .agent()
+                .build()
+                .resume(serde_json::from_slice(&accepted).unwrap())
+                .run()
+                .await
+                .unwrap()
+                .output(),
+            "which file?"
+        );
+        assert_eq!(recorded.lock().unwrap().len(), 1);
+
+        run.retry_model_turn(RetryRequest::Feedback("README.md".into()))
+            .unwrap();
+        let saved_run = serde_json::to_vec(&run).unwrap();
+        let saved_options = serde_json::to_vec(
+            &rig_a2a::A2AOptions::default()
+                .context(&task.context_id)
+                .task(&task.id),
+        )
+        .unwrap();
+        drop(client);
+        let client = A2AClient::from_url(format!("http://{addr}")).await.unwrap();
+        let restored: AgentRun = serde_json::from_slice(&saved_run).unwrap();
+        let options: rig_a2a::A2AOptions = serde_json::from_slice(&saved_options).unwrap();
+        assert_eq!(
+            client
+                .agent()
+                .build()
+                .resume(restored)
+                .provider_option(options)
+                .run()
+                .await
+                .unwrap()
+                .to_string(),
+            "updated"
+        );
+        assert_eq!(recorded_texts(&recorded, 1), ["README.md"]);
+        let requests = recorded.lock().unwrap();
+        assert_eq!(
+            requests[1].message.task_id.as_deref(),
+            Some(task.id.as_str())
+        );
+        assert_eq!(
+            requests[1].message.context_id.as_deref(),
+            Some(task.context_id.as_str())
+        );
+        server.abort();
+    }
+}
+
 /// An artifact update names its task but reports no task state, so it says
 /// nothing about resumability. Letting it clear the paused task's id would
 /// strand the conversation: the next turn would open a new task and the remote

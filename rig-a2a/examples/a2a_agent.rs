@@ -17,13 +17,21 @@
 //! [`Agent`]: rig_agent::agent::Agent
 
 use futures::StreamExt;
-use rig_a2a::{A2AClient, A2AConversationExt};
-use rig_agent::agent::AgentBuilder;
+use rig_a2a::{A2A, A2AClient, A2AConversationExt, A2AModelRouteExt, A2AOptions, A2AReply};
+use rig_agent::agent::{AgentBuilder, AgentRun, AgentRunStep, ModelTurn, RetryRequest};
 use rig_agent::test_utils::{MockCompletionModel, MockTurn};
 use rig_core::streaming::{Item, StreamEvent};
 
 #[path = "./fixtures/lib.rs"]
 mod fixture;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedRemoteRun {
+    endpoint: String,
+    tenant: Option<String>,
+    run: AgentRun,
+    options: A2AOptions,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -32,6 +40,10 @@ async fn main() -> anyhow::Result<()> {
         fixture::Reply::completed("Earlier you asked what I do."),
         fixture::Reply::completed("Streaming works the same way."),
         fixture::Reply::completed("Three documents mention the migration."),
+        fixture::Reply::completed("The remote route answered."),
+        fixture::Reply::input_required("Which document?"),
+        fixture::Reply::completed("Updated README.md."),
+        fixture::Reply::completed("Live protocol events retain their task state."),
     ])
     .await;
     let remote = A2AClient::from_url(&stub.base_url).await?;
@@ -56,7 +68,8 @@ async fn main() -> anyhow::Result<()> {
             .await?
     );
 
-    // Stream directly from the A2A completion model.
+    // The completion stream buffers replaceable artifacts until EOF. Use the
+    // direct protocol stream below for live status and artifact events.
     let request = rig_core::completion::CompletionRequest::new("Stream me a reply.");
     let mut stream = remote.model().stream(request)?;
     print!("streamed: ");
@@ -89,6 +102,76 @@ async fn main() -> anyhow::Result<()> {
             .max_turns(3)
             .await?
     );
+
+    // The remote handler prepares history after application hooks.
+    let routed = AgentBuilder::new(MockCompletionModel::from_turns([MockTurn::text("local")]))
+        .a2a_model_route("remote", remote.model())
+        .build();
+    println!(
+        "routed: {}",
+        routed
+            .prompt("Use the remote.")
+            .using_model("remote")
+            .await?
+    );
+
+    // Persist the remote IDs separately from the sans-IO AgentRun. No local
+    // conversation cache is needed when resuming through explicit IDs.
+    let mut run = AgentRun::new("Update a document.").max_turns(2);
+    let AgentRunStep::CallModel { prompt, .. } = run.next_step()? else {
+        anyhow::bail!("expected initial model call");
+    };
+    let response = remote
+        .model()
+        .completion(
+            rig_core::completion::CompletionRequest::new(prompt)
+                .accept_unknown_finish_reasons(true),
+        )
+        .await?;
+    if let Some(Ok(A2AReply::Response(reply))) = response.extras::<A2A>()
+        && let rig_a2a::SendMessageResponse::Task(task) = *reply
+    {
+        println!("remote state: {:?}", task.status.state);
+        // An AwaitingModel run needs the issued call's response before it can
+        // advance. A host must persist that response with its pending run.
+        run.model_response(ModelTurn::from_response_parts(
+            &response,
+            Default::default(),
+            Default::default(),
+        ))?;
+        run.retry_model_turn(RetryRequest::Feedback("README.md".into()))?;
+        println!(
+            "checkpoint: {} model turn recorded",
+            run.completion_calls().len()
+        );
+        let saved = serde_json::to_vec(&SavedRemoteRun {
+            endpoint: stub.base_url.clone(),
+            tenant: remote.interface().tenant.clone(),
+            run,
+            options: A2AOptions::default().context(task.context_id).task(task.id),
+        })?;
+        let saved: SavedRemoteRun = serde_json::from_slice(&saved)?;
+        let fresh_client = A2AClient::from_url(&saved.endpoint).await?;
+        anyhow::ensure!(
+            fresh_client.interface().tenant == saved.tenant,
+            "remote tenant changed"
+        );
+        println!(
+            "resumed: {}",
+            fresh_client
+                .agent()
+                .build()
+                .resume(saved.run)
+                .provider_option(saved.options)
+                .run()
+                .await?
+        );
+    }
+
+    let mut events = remote.message("Report progress.").stream().await?;
+    while let Some(event) = events.next().await {
+        println!("protocol event: {:?}", event?);
+    }
 
     // A2A hides the remote's tools by design, so a remote agent never returns a
     // tool call. Registering local tools would advertise tools that can never
