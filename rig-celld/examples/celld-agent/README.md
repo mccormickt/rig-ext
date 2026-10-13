@@ -22,9 +22,9 @@ curl -fsSL https://celld.dev/install.sh | sh
 npm install --global esbuild
 ```
 
-Use celld 0.6.0 or later. The turn transaction contains the nested transaction of the index upsert, and earlier releases reject that nesting.
+Use celld 0.6.0 or later for the nested transaction of the index upsert.
 
-The workspace pins workers-rs 0.8.3 because it shares the `wasm-streams` 0.5 ABI used by Rig 0.44 and reqwest 0.13. See the [workspace constraints](../../../README.md#constraints).
+The Workers ABI must match Rig and reqwest. See the [workspace constraints](../../../README.md#constraints).
 
 ## Build
 
@@ -46,7 +46,7 @@ chmod 600 .dev.vars
 celld dev
 ```
 
-celld 0.5.0 and later read `.dev.vars` in `celld dev` only, and reload the application when the file changes. `celld deploy` does not send the file to a fleet. celld removed `CELLD_VAR_<NAME>` and `CELLD_VARS_FILE`, and a node that has one of them set does not start.
+`celld dev` reads `.dev.vars` and reloads the application when the file changes. `celld deploy` does not send the file to a fleet.
 
 celld treats these values as normal Worker variables, not as a dedicated encrypted secret binding. It also writes them into the local deployment record under `.celld/dev`. Protect the file and that directory. On Cloudflare, use `wrangler secret put OPENAI_API_KEY`.
 

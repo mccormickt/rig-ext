@@ -12,7 +12,7 @@
 
 ## Configure celld
 
-Use celld 0.6.0 or later. Earlier releases fail when a `transactionSync()` call starts inside another one through the root storage handle ([denoland/celld#226](https://github.com/denoland/celld/issues/226)). The examples are tested with celld 0.6.1.
+Use celld 0.6.0 or later for nested `transactionSync()` calls. The examples are tested with celld 0.6.1.
 
 Enable `sqlite_vec` and use a SQLite-backed Durable Object:
 
@@ -57,7 +57,7 @@ The index accepts any Rig embedding `Model` or `DynModel<Embedding>` through the
 
 ## Transactions
 
-workers-rs 0.8.3 does not expose `ctx.storage.transactionSync()`. `CellStorage::transaction_sync` adds it. The closure runs synchronously. If it returns an error, the runtime rolls back all writes of the closure, and the method returns that error. Return recoverable failures as `Err`. A panic traps the Wasm instance: the runtime rolls back the database writes, but Rust destructors do not run and in-memory state is not restored.
+`CellStorage::transaction_sync` exposes `ctx.storage.transactionSync()`. The closure runs synchronously. If it returns an error, the runtime rolls back all writes of the closure, and the method returns that error. Return recoverable failures as `Err`. A panic traps the Wasm instance: the runtime rolls back the database writes, but Rust destructors do not run and in-memory state is not restored.
 
 Schema initialization, each upsert, and each `insert_documents` batch run in their own `transactionSync()` call. `delete` and `collect_garbage` are each one SQL statement, which is atomic without a transaction. In a call that is already open, celld runs the inner call as a nested savepoint. An inner failure discards only the inner writes, and the outer transaction can continue. Thus an application can commit its own rows and index writes together. Embed the text before the transaction, because the closure cannot await:
 
@@ -101,7 +101,7 @@ Do not change a Durable Object's storage backend or vector width in place.
 4. Verify counts and retrieval before routing traffic to the target class.
 5. Keep the source class available until rollback is no longer required.
 
-The append-only sqlite-vec prototype does not have generation columns. `SqliteVecIndex` rejects that table as `SchemaMigrationRequired`; it does not alter or reinterpret it. Schema initialization runs in one transaction, so a rejected open does not leave new tables behind.
+`SqliteVecIndex` rejects an incompatible table layout as `SchemaMigrationRequired`; it does not alter or reinterpret it. Schema initialization runs in one transaction, so a rejected open does not leave new tables behind.
 
 ## Conformance
 
@@ -123,7 +123,7 @@ curl -fsSL https://celld.dev/install.sh | sh
 npm install --global esbuild
 ```
 
-The examples are architecture references. Add authentication, history compaction, and request idempotency before you use them in production. The workspace pins `worker` to 0.8.3; see the [workspace constraints](../README.md#constraints).
+The examples are architecture references. Add authentication, history compaction, and request idempotency before you use them in production. See the [workspace constraints](../README.md#constraints) for the Workers ABI requirement.
 
 ## Portability
 

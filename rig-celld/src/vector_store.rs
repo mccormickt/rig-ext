@@ -64,7 +64,7 @@ pub enum SqliteVecError {
     /// A generated SQL identifier was not safe to interpolate.
     #[error("invalid SQLite identifier: {0}")]
     InvalidIdentifier(String),
-    /// The table exists with the append-only schema from the first prototype.
+    /// The table layout does not match the index schema.
     #[error(
         "SQLite table '{0}' uses an incompatible schema; migrate it explicitly instead of changing it in place"
     )]
@@ -194,8 +194,8 @@ where
     /// Create a named index and select the JSON field used by [`InsertDocuments`].
     ///
     /// `table` must contain only ASCII letters, digits, and underscores, and it
-    /// must not start with a digit. Existing append-only prototype tables must
-    /// be migrated explicitly.
+    /// must not start with a digit. Incompatible table layouts require an
+    /// explicit migration.
     pub fn named(
         storage: CellStorage,
         model: M,
@@ -323,7 +323,7 @@ where
         })
     }
 
-    /// Compatibility alias whose behavior is now upsert, not append.
+    /// Upsert text and discard the assigned generation.
     pub async fn insert_text<T: Serialize>(
         &self,
         id: impl AsRef<str>,
@@ -333,7 +333,7 @@ where
         self.upsert_text(id, document, text).await.map(|_| ())
     }
 
-    /// Compatibility alias whose behavior is now upsert, not append.
+    /// Upsert an embedding and discard the assigned generation.
     pub fn insert_embedding<T: Serialize>(
         &self,
         id: impl AsRef<str>,
