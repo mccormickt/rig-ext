@@ -13,7 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let definition = DurableAgent::builder("checkpointed-calculator", model)
         .tool(MockAddTool)
         .checkpoint(CheckpointConfig {
-            policy: CheckpointPolicy::Every(NonZeroU32::new(1).unwrap()),
+            policy: CheckpointPolicy::Every(NonZeroU32::MIN),
             target_version: None,
         })
         .build()?;

@@ -1,4 +1,5 @@
 #![cfg(feature = "duroxide")]
+#![allow(clippy::unwrap_used, clippy::panic)]
 
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 

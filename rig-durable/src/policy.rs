@@ -20,9 +20,8 @@ pub const DEFAULT_METADATA_MAX_BYTES: usize = 16 * 1024;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplaySafety {
-    /// Retries may repeat the tool; the application owns idempotency. This is
-    /// the behavior of registrations made before replay safety existed, and
-    /// the default so those registrations keep their policy.
+    /// Retries may repeat the tool; the application owns idempotency.
+    /// This is the default policy.
     #[default]
     ApplicationManaged,
     /// The tool performs no external write. It can run again, but once an
@@ -225,6 +224,7 @@ pub fn error_handling(error: &ToolExecutionError, safety: ReplaySafety) -> Error
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

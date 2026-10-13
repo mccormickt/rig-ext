@@ -59,10 +59,14 @@ impl Tool for FlakyLookup {
         context: &mut ToolContext,
         args: LookupArgs,
     ) -> Result<Self::Output, Self::Error> {
+        let invocation = context
+            .require::<ToolInvocation>()
+            .map_err(io::Error::other)?
+            .clone();
         self.invocations
             .lock()
-            .unwrap()
-            .push(context.require::<ToolInvocation>().unwrap().clone());
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .push(invocation);
         let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
         println!("lookup activity attempt {attempt}");
         if attempt == 1 {
@@ -119,7 +123,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let response = response?;
 
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    let invocations = invocations.lock().unwrap();
+    let invocations = invocations
+        .lock()
+        .map_err(|error| io::Error::other(error.to_string()))?;
     assert_eq!(invocations.len(), 2);
     assert_eq!(invocations[0], invocations[1]);
     assert_eq!(response.output(), "The service is available.");

@@ -272,9 +272,17 @@ impl Builder {
             }
             Ok(())
         })?;
+        #[cfg_attr(
+            target_family = "wasm",
+            expect(
+                clippy::arc_with_non_send_sync,
+                reason = "ToolExecutor uses Arc across targets; Workers execute local tools without threads"
+            )
+        )]
+        let executor = ToolExecutor::new(Arc::new(self.tools))
+            .with_registered_policies(self.config.tools.policies());
         Ok(Engine {
-            executor: ToolExecutor::new(Arc::new(self.tools))
-                .with_registered_policies(self.config.tools.policies()),
+            executor,
             db,
             wake,
             model: self.model,
@@ -1027,4 +1035,5 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests;

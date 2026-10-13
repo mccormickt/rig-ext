@@ -26,7 +26,7 @@ pub enum CompletionMode {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointPolicy {
-    /// Never checkpoint. This is the default for backwards compatibility.
+    /// Never checkpoint. This is the default.
     #[default]
     Disabled,
     /// Checkpoint after this many completed model operations or tool batches.
@@ -339,6 +339,7 @@ impl RetrySnapshot {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::tools::activity_tool;

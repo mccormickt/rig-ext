@@ -178,6 +178,10 @@ where
                 })
                 .await;
             }
+            #[expect(
+                clippy::expect_used,
+                reason = "the wait completes only with a nonempty ready queue"
+            )]
             let (call, result) = ready.pop_front().expect("a completion is ready");
             state.history.push(SettledCall {
                 call,

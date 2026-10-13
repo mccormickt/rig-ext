@@ -196,6 +196,7 @@ fn serialized_len<T: Serialize>(value: &T) -> usize {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use rig::{
         message::{ToolCall, ToolFunction, ToolName},

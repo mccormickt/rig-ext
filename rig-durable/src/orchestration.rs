@@ -15,9 +15,8 @@ use crate::{
     identity::{AttemptMetadata, LogicalCallKey},
     names::RuntimeNames,
     outcome::{CallPosition, RetainedOutcomes, ToolOutcome},
-    policy::ReplaySafety,
     streaming::apply as apply_streamed_turn,
-    tools::{ToolEntry, ToolRoute},
+    tools::ToolRoute,
     types::{AgentInput, ResumedRun},
 };
 
@@ -162,8 +161,7 @@ pub(crate) async fn run_with_names(
                     }
                     continue;
                 }
-                // Retained after every awaited event of the run, so histories
-                // recorded before this key existed still replay.
+                // Retain outcomes after the final awaited event of the run.
                 if let Some(outcomes) = RetainedOutcomes::new(tool_outcomes, KV_VALUE_LIMIT) {
                     ctx.set_kv_value_typed(RUN_OUTCOMES_KEY, &outcomes);
                 }
@@ -378,7 +376,7 @@ impl Engine<'_> {
             .ok_or_else(|| format!("tool `{}` is not in catalog", call.function.name))?;
         let arguments =
             serde_json::to_string(&call.function.arguments).map_err(|e| e.to_string())?;
-        check_route_policy(entry, &call.function.name)?;
+        entry.check_route_policy()?;
         let (content, outcome) = match &entry.route {
             ToolRoute::RigTool => {
                 let name = call.function.name.to_string();
@@ -630,25 +628,6 @@ fn last_steering_id_from_status(status: &str) -> Option<String> {
         .get("last_steering_id")?
         .as_str()
         .map(str::to_owned)
-}
-
-/// Routes other than Rig tools receive raw arguments, so they cannot use a
-/// logical key or an invocation guard.
-pub(crate) fn check_route_policy(entry: &ToolEntry, name: &str) -> Result<(), String> {
-    if matches!(entry.route, ToolRoute::RigTool) {
-        return Ok(());
-    }
-    match entry.policy.safety() {
-        ReplaySafety::ApplicationManaged | ReplaySafety::ReadOnly => Ok(()),
-        ReplaySafety::Idempotent => Err(format!(
-            "tool `{name}` declares idempotent replay safety, but its route cannot deliver a \
-             logical call key"
-        )),
-        ReplaySafety::InterruptOnUncertain => Err(format!(
-            "tool `{name}` declares interrupt-on-uncertain replay safety, but its route cannot \
-             use an invocation guard"
-        )),
-    }
 }
 
 pub(crate) async fn schedule_with_retry(

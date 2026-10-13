@@ -61,23 +61,7 @@ pub fn apply(
     transcript: StreamTranscript,
 ) -> Result<(), String> {
     use rig::{agent::run::StreamedTurn, completion::ResponseIdentity};
-    use std::collections::BTreeSet;
-    let executable: BTreeSet<_> = request
-        .tools
-        .iter()
-        .map(|tool| tool.name.to_string())
-        .collect();
-    let allowed = match request.tool_choice.as_ref() {
-        Some(rig::message::ToolChoice::None) => BTreeSet::new(),
-        Some(rig::message::ToolChoice::Specific { function_names }) => function_names
-            .iter()
-            .filter(|name| executable.contains(name.as_str()))
-            .map(ToString::to_string)
-            .collect(),
-        Some(rig::message::ToolChoice::Auto | rig::message::ToolChoice::Required) | None => {
-            executable.clone()
-        }
-    };
+    let (executable, allowed) = crate::tools::request_tool_names(request);
     for content in &transcript.response.choice {
         if let rig::completion::AssistantContent::ToolCall(call) = content {
             let name = call.function.name.as_str();

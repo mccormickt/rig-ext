@@ -1,5 +1,7 @@
 //! Old histories must never resolve to incompatible generation 2 code.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 #[cfg(feature = "temporal")]
 #[tokio::test]
 async fn temporal_excludes_every_legacy_workflow_identity() {

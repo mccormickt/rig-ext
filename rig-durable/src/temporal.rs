@@ -125,8 +125,8 @@ pub struct TemporalAgentConfig {
     pub activity_timeout_secs: u64,
     pub activity_max_attempts: u32,
     pub session_history_max_bytes: usize,
-    /// Tool activity contract. Inputs recorded before this field existed
-    /// deserialize as [`InvocationContract::Legacy`]; new inputs built by
+    /// Tool activity contract. An omitted field deserializes as
+    /// [`InvocationContract::Legacy`]; inputs built by
     /// [`TemporalAgent`] use [`InvocationContract::Logical`].
     #[serde(default)]
     pub contract: InvocationContract,
@@ -1122,8 +1122,7 @@ impl TemporalActivities {
             .map_err(activity_error)
     }
 
-    /// Legacy invocation shape within persistence generation 2. This does not
-    /// register or adapt pre-0.44 activity identities.
+    /// Minimal invocation payloads with application-managed replay safety.
     #[activity(name = "RigTemporalToolExecutionG2V1")]
     async fn execute_tool(
         self: Arc<Self>,
@@ -1173,7 +1172,7 @@ fn activity_error(message: String) -> ActivityError {
 /// tools unless [`Self::invocation_guard`] supplies a shared store.
 pub struct TemporalAgent {
     model: DynModel<Completion>,
-    tools: Arc<ToolSet>,
+    tools: ToolSet,
     guard: Option<Arc<dyn InvocationGuardStore>>,
     config: TemporalAgentConfig,
     compaction: Option<Compaction>,
@@ -1184,7 +1183,7 @@ impl TemporalAgent {
     pub fn new(model: impl Into<DynModel<Completion>>) -> Self {
         Self {
             model: model.into(),
-            tools: Arc::new(ToolSet::default()),
+            tools: ToolSet::default(),
             guard: None,
             config: TemporalAgentConfig::default(),
             compaction: None,
@@ -1361,9 +1360,11 @@ impl TemporalAgent {
     where
         T: Tool + 'static,
     {
-        let tools =
-            Arc::get_mut(&mut self.tools).expect("tools are unique while building an agent");
-        let name = tools.add_tool(tool);
+        let name = self.tools.add_tool(tool);
+        #[expect(
+            clippy::expect_used,
+            reason = "ToolSet retains the definition of each added tool"
+        )]
         let definition = self
             .tools
             .tool_definitions()
@@ -1466,7 +1467,7 @@ impl TemporalAgent {
             .map(|tool| (tool.definition.name.to_string(), tool.policy.clone()));
         options.register_activities(TemporalActivities {
             model: self.model,
-            tools: ToolExecutor::new(self.tools)
+            tools: ToolExecutor::new(Arc::new(self.tools))
                 .with_guard(self.guard)
                 .with_registered_policies(policies),
             compaction: self.compaction,
@@ -1734,6 +1735,7 @@ where
     .await?;
     let decision = ctx.state_mut(|workflow| {
         let runtime = workflow.runtime_mut();
+        #[expect(clippy::expect_used, reason = "the wait condition found a matching decision and workflow access is synchronous")]
         let index = runtime
             .decisions
             .iter()

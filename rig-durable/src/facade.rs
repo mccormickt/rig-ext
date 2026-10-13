@@ -31,7 +31,7 @@ use crate::{
     config::ConfigSnapshot,
     guard::InvocationGuardStore,
     names::RuntimeNames,
-    orchestration::{RUN_RESULT_KEY, STEERING_QUEUE_NAME, SteeringCommand, check_route_policy},
+    orchestration::{RUN_RESULT_KEY, STEERING_QUEUE_NAME, SteeringCommand},
     outcome::DurableResponse,
     policy::ToolPolicy,
     registry::{activity_registry_with_names, orchestration_registry_with_names},
@@ -46,7 +46,6 @@ use crate::{
     tools::{ToolCatalog, ToolEntry, durable_agent_tool},
 };
 
-const DEFAULT_VERSION: &str = "1.0.0";
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Error)]
@@ -191,7 +190,7 @@ impl DurableAgentBuilder {
     fn new(name: impl Into<String>, model: DynModel<Completion>) -> Self {
         Self {
             name: name.into(),
-            version: Version::parse(DEFAULT_VERSION).expect("default version is valid semver"),
+            version: Version::new(1, 0, 0),
             description: None,
             model,
             tools: ToolSet::default(),
@@ -419,7 +418,9 @@ impl DurableAgentBuilder {
                     name.to_owned(),
                 ));
             }
-            check_route_policy(entry, name).map_err(AgentOrchestratorError::InvalidToolPolicy)?;
+            entry
+                .check_route_policy()
+                .map_err(AgentOrchestratorError::InvalidToolPolicy)?;
             if entry.policy.safety().requires_guard() && self.guard.is_none() {
                 return Err(AgentOrchestratorError::GuardStoreRequired(name.to_owned()));
             }
@@ -1231,33 +1232,43 @@ impl DurableSession {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let receipt = self.receipt(request_id).await?;
-            match receipt.map(|receipt| receipt.state) {
-                Some(SubmissionState::Answered) => {
-                    let receipt = self
-                        .receipt(request_id)
-                        .await?
-                        .expect("receipt was present a moment ago");
+            match receipt {
+                Some(Submission {
+                    state: SubmissionState::Answered,
+                    submission_id,
+                    ..
+                }) => {
                     return self
                         .run
                         .client
                         .get_kv_value_typed(
                             &self.run.instance_id,
-                            &session_result_key(&receipt.submission_id),
+                            &session_result_key(&submission_id),
                         )
                         .await?
                         .ok_or_else(|| AgentOrchestratorError::ResultNotRetained {
                             request_id: request_id.to_owned(),
                         });
                 }
-                Some(SubmissionState::Failed { error }) => {
+                Some(Submission {
+                    state: SubmissionState::Failed { error },
+                    ..
+                }) => {
                     return Err(AgentOrchestratorError::Run(error));
                 }
-                Some(SubmissionState::Cancelled) => {
+                Some(Submission {
+                    state: SubmissionState::Cancelled,
+                    ..
+                }) => {
                     return Err(AgentOrchestratorError::SubmissionCancelled {
                         request_id: request_id.to_owned(),
                     });
                 }
-                pending @ (None | Some(SubmissionState::Queued | SubmissionState::Running)) => {
+                pending @ (None
+                | Some(Submission {
+                    state: SubmissionState::Queued | SubmissionState::Running,
+                    ..
+                })) => {
                     match self.run.status().await? {
                         OrchestrationStatus::NotFound => {
                             return Err(AgentOrchestratorError::SessionNotFound(

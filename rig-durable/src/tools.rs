@@ -1,10 +1,38 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::retry::RetryPolicy;
-use rig::{completion::ToolDefinition, tool::ToolSet};
+use rig::{
+    completion::{CompletionRequest, ToolDefinition},
+    message::ToolChoice,
+    tool::ToolSet,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::policy::ToolPolicy;
+
+pub(crate) fn request_tool_names(
+    request: &CompletionRequest,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let executable = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect();
+    let allowed = allowed_names(&executable, request.tool_choice.as_ref());
+    (executable, allowed)
+}
+
+fn allowed_names(executable: &BTreeSet<String>, choice: Option<&ToolChoice>) -> BTreeSet<String> {
+    match choice {
+        Some(ToolChoice::None) => BTreeSet::new(),
+        Some(ToolChoice::Specific { function_names }) => function_names
+            .iter()
+            .filter(|name| executable.contains(name.as_str()))
+            .map(ToString::to_string)
+            .collect(),
+        Some(ToolChoice::Auto | ToolChoice::Required) | None => executable.clone(),
+    }
+}
 
 /// Retry, routing, approval, and replay settings for one Rig tool.
 /// Approval pauses execution; it does not make a tool safe to retry.
@@ -79,6 +107,28 @@ impl ToolEntry {
         self.policy = policy;
         self
     }
+
+    /// Non-Rig routes receive raw arguments, without invocation metadata.
+    #[cfg(feature = "duroxide")]
+    pub(crate) fn check_route_policy(&self) -> Result<(), String> {
+        use crate::ReplaySafety;
+
+        if matches!(self.route, ToolRoute::RigTool) {
+            return Ok(());
+        }
+        let name = &self.definition.name;
+        match self.policy.safety() {
+            ReplaySafety::ApplicationManaged | ReplaySafety::ReadOnly => Ok(()),
+            ReplaySafety::Idempotent => Err(format!(
+                "tool `{name}` declares idempotent replay safety, but its route cannot deliver a \
+                 logical call key"
+            )),
+            ReplaySafety::InterruptOnUncertain => Err(format!(
+                "tool `{name}` declares interrupt-on-uncertain replay safety, but its route cannot \
+                 use an invocation guard"
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -105,16 +155,7 @@ impl ToolCatalog {
         self.0.keys().cloned().collect()
     }
     pub fn allowed_names(&self, choice: Option<&rig::message::ToolChoice>) -> BTreeSet<String> {
-        use rig::message::ToolChoice;
-        match choice {
-            Some(ToolChoice::None) => BTreeSet::new(),
-            Some(ToolChoice::Specific { function_names }) => function_names
-                .iter()
-                .filter(|n| self.0.contains_key(n.as_str()))
-                .map(ToString::to_string)
-                .collect(),
-            _ => self.executable_names(),
-        }
+        allowed_names(&self.executable_names(), choice)
     }
 }
 
@@ -203,6 +244,7 @@ pub(crate) fn durable_agent_tool(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use rig::message::ToolChoice;

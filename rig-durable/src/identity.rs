@@ -72,6 +72,7 @@ pub fn arguments_digest(arguments: &serde_json::Value) -> Result<String, serde_j
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -17,7 +17,7 @@
 //! | No features | Shared configuration, policy, identity, result, and compaction types | Native and WASM; no runtime |
 //!
 //! Enable `temporal` with the default features to use both native backends. Use Rig
-//! 0.44 models and tools directly; an already-built `rig::Agent` cannot be
+//! models and tools directly; an already-built `rig::Agent` cannot be
 //! converted because it does not expose all required configuration.
 //!
 //! # Run a Rig model with SQLite
@@ -197,6 +197,7 @@ pub use tools::{ToolCatalog, ToolEntry, ToolRoute, activity_tool, catalog_from_t
 pub use types::AgentInput;
 
 #[cfg(all(test, feature = "duroxide"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use std::{
         convert::Infallible,

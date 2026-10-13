@@ -1,6 +1,4 @@
-use std::collections::BTreeSet;
-
-use rig::{DynModel, completion::CompletionRequest, message::ToolChoice, operation::Completion};
+use rig::{DynModel, completion::CompletionRequest, operation::Completion};
 
 use crate::streaming::{StreamItem, StreamTranscript};
 use futures::StreamExt;
@@ -11,20 +9,7 @@ pub async fn complete(
     model: &DynModel<Completion>,
     request: CompletionRequest,
 ) -> Result<rig::agent::ModelTurn, String> {
-    let executable: BTreeSet<_> = request
-        .tools
-        .iter()
-        .map(|tool| tool.name.to_string())
-        .collect();
-    let allowed = match request.tool_choice.as_ref() {
-        Some(ToolChoice::None) => BTreeSet::new(),
-        Some(ToolChoice::Specific { function_names }) => function_names
-            .iter()
-            .filter(|name| executable.contains(name.as_str()))
-            .map(ToString::to_string)
-            .collect(),
-        Some(ToolChoice::Auto | ToolChoice::Required) | None => executable.clone(),
-    };
+    let (executable, allowed) = crate::tools::request_tool_names(&request);
     let response = model
         .call(request)
         .await

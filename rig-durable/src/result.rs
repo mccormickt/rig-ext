@@ -182,6 +182,7 @@ fn retain_metadata(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use rig::tool::{ContextValue, ToolContext, ToolExecutionError, ToolOutput};
 

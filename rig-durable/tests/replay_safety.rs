@@ -5,6 +5,7 @@
 //! completion, so another worker receives the same attempt.
 
 #![cfg(feature = "duroxide")]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::{
     sync::{

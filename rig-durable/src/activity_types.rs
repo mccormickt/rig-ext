@@ -14,12 +14,10 @@ use crate::{
 /// Changing the contract of a registered orchestration version changes its
 /// activity names and payloads, so existing histories can no longer replay.
 /// Select the contract per version and keep old versions registered.
-/// This policy is independent of the crate-owned Rig persistence generation;
-/// neither contract makes pre-0.44 histories compatible with generation 2.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InvocationContract {
-    /// The pre-policy payload shape, within the current persistence generation.
+    /// Minimal invocation payloads without logical identity or policy metadata.
     /// Every tool runs with application-managed replay safety.
     #[default]
     Legacy,

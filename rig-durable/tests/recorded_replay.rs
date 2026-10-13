@@ -1,4 +1,6 @@
-//! Replay generation 2 histories recorded through Rig 0.44 runtimes.
+//! Replay recorded histories without provider or tool I/O.
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 #[cfg(feature = "temporal")]
 #[tokio::test]

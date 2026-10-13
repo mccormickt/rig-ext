@@ -525,6 +525,7 @@ async fn checkpoint(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::submission::{DEFAULT_LEDGER_MAX_BYTES, SubmissionMode};

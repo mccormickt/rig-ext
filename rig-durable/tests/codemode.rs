@@ -1,4 +1,5 @@
 #![cfg(feature = "codemode")]
+#![allow(clippy::unwrap_used, clippy::panic)]
 
 use rig::{
     test_utils::MockAddTool,
