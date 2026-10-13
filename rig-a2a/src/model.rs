@@ -359,7 +359,7 @@ impl A2AModel {
             &history
         };
         for message in messages {
-            push_message_text(&mut parts, message);
+            push_message_parts(&mut parts, message)?;
         }
 
         if parts.is_empty() {
@@ -646,7 +646,24 @@ impl rig_core::completion::ReplayTarget for A2AModel {
         &self.agent_name
     }
     fn accepts(&self, _model: &str) -> rig_core::completion::Accepts {
-        rig_core::completion::Accepts::TEXT
+        rig_core::completion::Accepts {
+            tools: false,
+            ..rig_core::completion::Accepts::ALL
+        }
+    }
+    fn encodes(&self, _model: &str, media: rig_core::completion::Media<'_>) -> bool {
+        use rig_core::completion::Media;
+        use rig_core::message::DocumentSourceKind;
+        let source = match media {
+            Media::Image(image, _) => &image.data,
+            Media::Audio(audio) => &audio.data,
+            Media::Video(video) => &video.data,
+            Media::Document(document) => &document.data,
+        };
+        !matches!(
+            source,
+            DocumentSourceKind::FileId(_) | DocumentSourceKind::Unknown
+        )
     }
     fn takes_documents(&self) -> bool {
         true
@@ -937,82 +954,118 @@ fn log_ignored(request: &CompletionRequest) {
     }
 }
 
-/// Append a Rig message's text to the outbound parts.
-///
-/// Prefixes assistant turns so a rendered history reads as a dialogue rather
-/// than one undifferentiated block. Non-text content has no A2A projection and
-/// is skipped.
-fn push_message_text(parts: &mut Vec<Part>, message: &RigMessage) {
-    let (prefix, text) = match message {
-        RigMessage::User { content } => ("", user_text(content)),
-        RigMessage::Assistant(message) => ("assistant: ", assistant_text(&message.content)),
-        RigMessage::System { content, .. } => ("", content.clone()),
-    };
+/// Preserve media and its position; join adjacent text within each message.
+fn push_message_parts(parts: &mut Vec<Part>, message: &RigMessage) -> Result<(), A2AError> {
+    use rig_core::message::ToolResultContent;
+    let mut message_parts = Vec::new();
+    match message {
+        RigMessage::User { content } => {
+            for item in content {
+                match item {
+                    UserContent::Text(text) => push_text(&mut message_parts, &text.text),
+                    UserContent::Image(image) => {
+                        message_parts.push(media_part(&image.data, image.media_type.as_ref())?)
+                    }
+                    UserContent::Audio(audio) => {
+                        message_parts.push(media_part(&audio.data, audio.media_type.as_ref())?)
+                    }
+                    UserContent::Video(video) => {
+                        message_parts.push(media_part(&video.data, video.media_type.as_ref())?)
+                    }
+                    UserContent::Document(document) => message_parts
+                        .push(media_part(&document.data, document.media_type.as_ref())?),
+                    UserContent::ToolResult(result) => {
+                        for item in &result.content {
+                            match item {
+                                ToolResultContent::Text(text) => {
+                                    push_text(&mut message_parts, &text.text)
+                                }
+                                ToolResultContent::Image(image) => message_parts
+                                    .push(media_part(&image.data, image.media_type.as_ref())?),
+                                ToolResultContent::Json { value } => message_parts.push(Part {
+                                    content: a2a::PartContent::Data(value.clone()),
+                                    media_type: Some("application/json".into()),
+                                    filename: None,
+                                    metadata: None,
+                                }),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        RigMessage::Assistant(message) => {
+            for item in &message.content {
+                match item {
+                    AssistantContent::Text(text) => push_text(&mut message_parts, &text.text),
+                    AssistantContent::Image(image) => {
+                        message_parts.push(media_part(&image.data, image.media_type.as_ref())?)
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(Part {
+                content: a2a::PartContent::Text(text),
+                ..
+            }) = message_parts.first_mut()
+            {
+                text.insert_str(0, "assistant: ");
+            }
+        }
+        RigMessage::System { content } => push_text(&mut message_parts, content),
+    }
+    parts.extend(message_parts);
+    Ok(())
+}
+
+fn push_text(parts: &mut Vec<Part>, text: &str) {
     if text.trim().is_empty() {
         return;
     }
-    parts.push(Part::text(format!("{prefix}{text}")));
-}
-
-fn user_text(content: &[UserContent]) -> String {
-    content
-        .iter()
-        .filter_map(|item| match item {
-            UserContent::Text(text) => Some(text.text.clone()),
-            UserContent::ToolResult(result) => Some(
-                result
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        rig_core::message::ToolResultContent::Text(text) => Some(text.text.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
-            other => {
-                log_dropped_content(content_label(other));
-                None
-            }
-        })
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn assistant_text(content: &[AssistantContent]) -> String {
-    content
-        .iter()
-        .filter_map(|item| match item {
-            AssistantContent::Text(text) => Some(text.text.clone()),
-            AssistantContent::ToolCall(_) => None,
-            _ => {
-                log_dropped_content("assistant");
-                None
-            }
-        })
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn content_label(content: &UserContent) -> &'static str {
-    match content {
-        UserContent::Image(_) => "image",
-        UserContent::Audio(_) => "audio",
-        UserContent::Document(_) => "document",
-        _ => "user",
+    if let Some(Part {
+        content: a2a::PartContent::Text(previous),
+        ..
+    }) = parts.last_mut()
+    {
+        previous.push('\n');
+        previous.push_str(text);
+    } else {
+        parts.push(Part::text(text));
     }
 }
 
-/// Non-text history has no A2A projection. Say so rather than dropping it
-/// silently, mirroring the binary-part log in [`crate::parts`].
-fn log_dropped_content(kind: &'static str) {
-    tracing::debug!(
-        target: "rig_a2a",
-        kind,
-        "skipping non-text message content while projecting to an A2A message"
-    );
+fn media_part(
+    source: &rig_core::message::DocumentSourceKind,
+    media_type: Option<&impl rig_core::message::MimeType>,
+) -> Result<Part, A2AError> {
+    use base64::Engine;
+    use rig_core::message::DocumentSourceKind;
+    let media_type = media_type.map(|mime| mime.to_mime_type().to_owned());
+    let content = match source {
+        DocumentSourceKind::Url(url) => a2a::PartContent::Url(url.clone()),
+        DocumentSourceKind::Raw(bytes) => a2a::PartContent::Raw(bytes.clone()),
+        DocumentSourceKind::Base64(data) => a2a::PartContent::Raw(
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|_| A2AError::Unsupported {
+                    what: "media",
+                    detail: "invalid base64 media",
+                })?,
+        ),
+        DocumentSourceKind::String(text) => a2a::PartContent::Raw(text.as_bytes().to_vec()),
+        DocumentSourceKind::FileId(_) | DocumentSourceKind::Unknown => {
+            return Err(A2AError::Unsupported {
+                what: "media",
+                detail: "A2A requires bytes or a URL, not a provider-local file ID or unknown source",
+            });
+        }
+    };
+    Ok(Part {
+        content,
+        media_type,
+        filename: None,
+        metadata: None,
+    })
 }
 
 /// A task's assistant text, or the error a content-free reply deserves.
@@ -1186,9 +1239,9 @@ mod tests {
     #[test]
     fn history_renders_with_assistant_turns_prefixed() {
         let mut parts = Vec::new();
-        push_message_text(&mut parts, &RigMessage::user("hi"));
-        push_message_text(&mut parts, &RigMessage::assistant("hello there"));
-        push_message_text(&mut parts, &RigMessage::user("and again"));
+        push_message_parts(&mut parts, &RigMessage::user("hi")).unwrap();
+        push_message_parts(&mut parts, &RigMessage::assistant("hello there")).unwrap();
+        push_message_parts(&mut parts, &RigMessage::user("and again")).unwrap();
 
         let rendered: Vec<String> = parts
             .iter()
@@ -1203,7 +1256,7 @@ mod tests {
     #[test]
     fn empty_messages_are_skipped() {
         let mut parts = Vec::new();
-        push_message_text(&mut parts, &RigMessage::user("   "));
+        push_message_parts(&mut parts, &RigMessage::user("   ")).unwrap();
         assert!(parts.is_empty());
     }
 

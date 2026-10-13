@@ -1466,6 +1466,116 @@ async fn a_registered_remote_route_keeps_the_original_message_boundary() {
     assert_eq!(recorded_texts(&recorded, 1), ["only this prompt"]);
     server.abort();
 }
+
+#[tokio::test]
+async fn multimodal_input_and_direct_events_keep_bytes_mime_types_and_order() {
+    use rig_core::message::{
+        Audio, AudioMediaType, Document as MediaDocument, DocumentMediaType,
+        DocumentSourceKind as Source, Image, ImageMediaType, Video, VideoMediaType,
+    };
+    let prompt = RigMessage::User {
+        content: vec![
+            UserContent::text("inspect these"),
+            UserContent::Image(Image {
+                data: Source::Url("https://example.com/image.png".into()),
+                media_type: Some(ImageMediaType::PNG),
+                ..Default::default()
+            }),
+            UserContent::Audio(Audio {
+                data: Source::Base64("AQIDBA==".into()),
+                media_type: Some(AudioMediaType::WAV),
+            }),
+            UserContent::Video(Video {
+                data: Source::Raw(vec![5, 6, 7]),
+                media_type: Some(VideoMediaType::MP4),
+                ..Default::default()
+            }),
+            UserContent::Document(MediaDocument {
+                data: Source::String("plain document".into()),
+                media_type: Some(DocumentMediaType::TXT),
+                ..Default::default()
+            }),
+            UserContent::text("end"),
+        ],
+    };
+    for binding in [StubBinding::JsonRpc, StubBinding::Rest] {
+        let (addr, recorded, server) =
+            serve_stub_with_binding("media", &[], StubReply::CompletedText("ok".into()), binding)
+                .await;
+        let client = A2AClient::from_url(format!("http://{addr}")).await.unwrap();
+        let agent = client.agent().build();
+        for streaming in [false, true] {
+            let runner = agent.prompt(prompt.clone()).a2a_conversation("media");
+            if streaming {
+                let mut stream = runner.stream();
+                while let Some(item) = stream.next().await {
+                    item.unwrap();
+                }
+            } else {
+                runner.await.unwrap();
+            }
+        }
+        {
+            let requests = recorded.lock().unwrap();
+            for request in requests.iter() {
+                let parts = &request.message.parts;
+                assert_eq!(parts.len(), 6);
+                assert_eq!(
+                    parts[0].content,
+                    a2a::PartContent::Text("inspect these".into())
+                );
+                assert_eq!(
+                    parts[1].content,
+                    a2a::PartContent::Url("https://example.com/image.png".into())
+                );
+                assert_eq!(parts[1].media_type.as_deref(), Some("image/png"));
+                assert_eq!(parts[2].content, a2a::PartContent::Raw(vec![1, 2, 3, 4]));
+                assert_eq!(parts[2].media_type.as_deref(), Some("audio/wav"));
+                assert_eq!(parts[3].content, a2a::PartContent::Raw(vec![5, 6, 7]));
+                assert_eq!(parts[3].media_type.as_deref(), Some("video/mp4"));
+                assert_eq!(
+                    parts[4].content,
+                    a2a::PartContent::Raw(b"plain document".to_vec())
+                );
+                assert_eq!(parts[4].media_type.as_deref(), Some("text/plain"));
+                assert_eq!(parts[5].content, a2a::PartContent::Text("end".into()));
+            }
+        }
+        let events = vec![StreamResponse::Message(Message::new(
+            Role::Agent,
+            vec![Part {
+                content: a2a::PartContent::Raw(vec![0, 1, 255]),
+                media_type: Some("application/octet-stream".into()),
+                filename: Some("result.bin".into()),
+                metadata: None,
+            }],
+        ))];
+        let (wire_client, recorded, wire_server) = serve_wire(binding, events.clone(), true).await;
+        let mut message = Message::new(Role::User, vec![Part::text("go")]);
+        message.message_id = "stable-id".into();
+        let actual = wire_client
+            .request(message)
+            .part(Part::text("more"))
+            .stream()
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(
+            actual.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
+            events
+        );
+        let raw = recorded.lock().unwrap();
+        let body = match binding {
+            StubBinding::JsonRpc => &raw[0]["params"],
+            StubBinding::Rest => &raw[0],
+        };
+        assert_eq!(body["message"]["messageId"], "stable-id");
+        assert_eq!(body["message"]["parts"].as_array().unwrap().len(), 2);
+        server.abort();
+        wire_server.abort();
+    }
+}
 /// An artifact update names its task but reports no task state, so it says
 /// nothing about resumability. Letting it clear the paused task's id would
 /// strand the conversation: the next turn would open a new task and the remote
@@ -2145,6 +2255,109 @@ async fn oversized_agent_card_is_rejected() {
     server_task.abort();
 }
 
+/// Application hooks run after the adapter was added to the builder.
+#[tokio::test]
+async fn oracle_later_hooks_control_the_sent_multipart_prompt() {
+    use rig_agent::agent::{AgentHook, DispatchAction, DispatchEvent, HookContext};
+    use rig_core::effect::EffectKind;
+    struct Redact;
+    impl AgentHook for Redact {
+        async fn on_dispatch(&self, _: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
+            let EffectKind::Completion { request, stream } = event.kind else {
+                return DispatchAction::Proceed;
+            };
+            let mut request = request.clone();
+            if let Some(RigMessage::User { content }) = request.chat_history.last_mut() {
+                for part in content {
+                    if let UserContent::Text(text) = part {
+                        text.text = text.text.replace("private-token", "[redacted]");
+                    }
+                }
+            }
+            DispatchAction::Patch(EffectKind::Completion {
+                request,
+                stream: *stream,
+            })
+        }
+    }
+    use rig_a2a::{A2AModelRouteExt, A2AOptions};
+    use rig_core::message::{DocumentSourceKind, Image, ImageMediaType};
+    for binding in [StubBinding::JsonRpc, StubBinding::Rest] {
+        let (addr, recorded, server) = serve_stub_with_binding(
+            "redaction",
+            &[],
+            StubReply::CompletedText("safe".into()),
+            binding,
+        )
+        .await;
+        let client = A2AClient::from_url(format!("http://{addr}")).await.unwrap();
+        for routed in [false, true] {
+            let agent = if routed {
+                AgentBuilder::new(MockCompletionModel::from_turns([MockTurn::text("local")]))
+                    .a2a_model_route("remote", client.model())
+            } else {
+                client.agent()
+            }
+            .add_hook(Redact)
+            .build();
+            for explicit in [false, true] {
+                for streaming in [false, true] {
+                    let prompt = RigMessage::User {
+                        content: vec![
+                            UserContent::text("private-token"),
+                            UserContent::Image(Image {
+                                data: DocumentSourceKind::Url(
+                                    "https://example.com/safe.png".into(),
+                                ),
+                                media_type: Some(ImageMediaType::PNG),
+                                ..Default::default()
+                            }),
+                        ],
+                    };
+                    let mut run = agent
+                        .prompt(prompt)
+                        .history([RigMessage::user("do not resend"), RigMessage::assistant("")])
+                        .a2a_conversation("redaction");
+                    if routed {
+                        run = run.using_model("remote");
+                    }
+                    if explicit {
+                        run = run.provider_option(A2AOptions::default().context("ctx-explicit"));
+                    }
+                    if streaming {
+                        let mut events = run.stream();
+                        while let Some(event) = events.next().await {
+                            event.unwrap();
+                        }
+                    } else {
+                        assert_eq!(run.await.unwrap().output(), "safe");
+                    }
+                    let requests = recorded.lock().unwrap();
+                    let message = &requests.last().unwrap().message;
+                    let text = message
+                        .parts
+                        .iter()
+                        .filter_map(|part| part.as_text())
+                        .collect::<String>();
+                    assert!(
+                        !text.contains("private-token"),
+                        "server received unredacted text"
+                    );
+                    assert!(text.contains("[redacted]"));
+                    if message.context_id.is_some() {
+                        assert!(!text.contains("do not resend"));
+                    }
+                    assert!(message.parts.iter().any(|part| matches!(&part.content, a2a::PartContent::Url(url) if url.ends_with("safe.png"))));
+                }
+            }
+        }
+        println!(
+            "redaction: server inspected 8 requests; both routes, both thread modes, unary and stream"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+}
 #[tokio::test]
 async fn card_fetch_failure_surfaces_status_and_body_snippet() {
     let _ = tracing_subscriber::fmt::try_init();
