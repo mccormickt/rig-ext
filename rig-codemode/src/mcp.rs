@@ -9,7 +9,8 @@
 //!
 //! # Build an executor from MCP tools
 //!
-//! Enable `rig-codemode` features `quickjs,mcp` and add `rig-rmcp = "0.44"`.
+//! Enable `rig-codemode` features `quickjs,mcp` and add `rig-rmcp` as a dependency.
+//! Both features require a native target.
 //! Obtain tools with [`rig_rmcp::tools_from_server`] from a connected client's
 //! definitions and peer. Keep that client connection open during execution.
 //! Build the catalog **before** converting the tools to Rig `DynamicTool`s:

@@ -11,12 +11,13 @@
 //!
 //! # Add the crate
 //!
-//! Enable `quickjs` to run scripts. Use Rig 0.44 for compatible tool types.
+//! This crate is unpublished. From a sibling crate in this workspace, enable
+//! `quickjs` to run scripts:
 //!
 //! ```toml
 //! [dependencies]
-//! rig-codemode = { version = "0.1", features = ["quickjs"] }
-//! rig-core = { version = "0.44", default-features = false }
+//! rig-codemode = { path = "../rig-codemode", features = ["quickjs"] }
+//! rig-core = { workspace = true }
 //! serde_json = "1"
 //! tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 //! ```
@@ -118,7 +119,7 @@
 //! - `quickjs`: the native QuickJS backend. Without a backend feature the
 //!   crate builds catalog and contract code but [`CodeModeBuilder::build`]
 //!   fails with [`BuildError::NoBackend`]. A native C compiler is required.
-//! - `mcp`: catalog entries and output-schema validation for `rig-rmcp` 0.44
+//! - `mcp`: native-only catalog entries and output-schema validation for `rig-rmcp`
 //!   tools. Enable both `quickjs` and `mcp` to execute MCP-backed scripts.
 
 #![forbid(unsafe_code)]
@@ -145,6 +146,9 @@ pub mod limits;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod policy;
+#[cfg(not(target_family = "wasm"))]
+#[cfg_attr(not(feature = "quickjs"), allow(dead_code))]
+mod projection;
 #[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
 pub mod replay;
 pub mod report;
@@ -599,7 +603,7 @@ impl CodeMode {
     ///
     /// # Register with a Rig agent
     ///
-    /// Add `rig = "0.44"` with its default features to use `AgentBuilder` and
+    /// Add `rig` with its default features to use `AgentBuilder` and
     /// the OpenAI client. This example accepts the configured executor from
     /// the [crate-level example](crate). It needs `OPENAI_API_KEY` at runtime.
     ///

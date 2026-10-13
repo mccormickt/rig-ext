@@ -22,9 +22,10 @@ use rquickjs::{Context, Ctx, Exception, FromJs, Function, Object, Promise, Runti
 
 use super::{PRELUDE, SCRIPT_FILENAME, SpawnError, locate, wrap_source, write_text};
 use crate::bridge::{
-    Payload, Reply, Request, ScriptError, WorkerChannels, WorkerConfig, WorkerOutcome, bounded_json,
+    Payload, Reply, Request, ScriptError, WorkerChannels, WorkerConfig, WorkerOutcome,
 };
 use crate::catalog::{MAX_NAME_BYTES, MAX_QUERY_BYTES};
+use crate::projection::bounded_json;
 use crate::report::{ExecutionStatus, ScriptDiagnostic, ScriptOutput};
 
 const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
@@ -579,11 +580,7 @@ fn plain(message: &str) -> ScriptDiagnostic {
 }
 
 fn truncate(text: &str, limit: usize) -> &str {
-    let mut end = text.len().min(limit);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
+    &text[..text.floor_char_boundary(limit)]
 }
 
 fn to_guest<'js>(

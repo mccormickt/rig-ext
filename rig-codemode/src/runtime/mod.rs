@@ -80,10 +80,7 @@ pub(crate) fn write_text(output: &mut crate::report::ScriptOutput, limit: usize,
         output.text.push('\n');
         return;
     }
-    let mut cut = remaining.min(text.len());
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
+    let cut = text.floor_char_boundary(remaining);
     output.text.push_str(&text[..cut]);
     output.truncated = true;
 }

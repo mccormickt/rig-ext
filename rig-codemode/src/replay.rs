@@ -14,6 +14,7 @@ use rig_core::tool::{ToolExecutionError, ToolResult};
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{self, HostChannels, Reply, Request, WorkerConfig, WorkerOutcome};
+use crate::projection::{bound_payload, project};
 use crate::{CallRecord, CallStatus, Catalog, ExecutionReport, Limits, ScriptDelivery};
 
 /// One script call. The ordinal is stable when the script is replayed.
@@ -313,9 +314,8 @@ impl<'a> ReplayState<'a> {
             return self.unresolved().map(Some);
         };
         let call = self.pending.get(&ordinal).ok_or(ReplayError::Diverged)?;
-        let payload = bridge::project(&call.name, result, call.raw, self.limits.message_bytes);
-        let (payload, delivery) =
-            bridge::bound_payload(&call.name, payload, self.limits.message_bytes);
+        let payload = project(&call.name, result, call.raw, self.limits.message_bytes);
+        let (payload, delivery) = bound_payload(&call.name, payload, self.limits.message_bytes);
         let (status, error_kind) = bridge::status_of(result);
         let mut record = CallRecord::new(ordinal, &call.name, status, delivery);
         record.error_kind = error_kind;
