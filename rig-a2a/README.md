@@ -8,19 +8,21 @@ an ordinary Rig `Agent`. The model supports unary and streaming requests over
 JSON-RPC or HTTP+JSON. Server-issued A2A context and task identifiers stay
 host-side.
 
-## Installation
+## Dependency
+
+This crate is unpublished. From a sibling crate in this workspace:
 
 ```toml
 [dependencies]
-rig-a2a = "0.1"
-rig-agent = "0.44.0"
-rig-core = "0.44.0"
+rig-a2a = { path = "../rig-a2a" }
+rig-agent = { workspace = true }
+rig-core = { workspace = true }
 ```
 
 The default feature uses Rustls. To use native TLS instead:
 
 ```toml
-rig-a2a = { version = "0.1", default-features = false, features = ["native-tls"] }
+rig-a2a = { path = "../rig-a2a", default-features = false, features = ["native-tls"] }
 ```
 
 `rig-a2a` currently supports native targets only.
@@ -86,7 +88,7 @@ agent, and Rig's `Agent::into_tool` performs the standard sub-agent conversion.
 Use `a2a_conversation` on the agent builder before conversion when repeated
 calls must continue one remote A2A thread.
 
-Rig 0.44 does not expose a run's conversation ID to completion hooks and does
+Rig does not expose a run's conversation ID to completion hooks and does
 not copy it from an outer agent into a sub-agent run. Therefore, a converted
 sub-agent cannot infer the outer conversation automatically. Bind the
 conversation when constructing the sub-agent, or create one orchestrator tool
@@ -105,7 +107,7 @@ unsupported-option policy.
 
 An `input-required` task retains its context and task IDs for the next turn
 and reports `FinishReason::Other("input_required")`, distinct from completion.
-Rig 0.44 defaults to treating unknown finish reasons as errors. No acceptance
+Rig defaults to treating unknown finish reasons as errors. No acceptance
 policy is forced by this adapter. For a remote that intentionally asks for
 more input, opt in on that A2A run with
 `.accept_unknown_finish_reasons(true)` (or on its agent builder or direct
@@ -117,3 +119,13 @@ errors even when acceptance is enabled.
 
 See the examples for direct requests, model-backed agents, streaming, and
 sub-agent composition.
+
+## Examples and checks
+
+- [`a2a_agent`](examples/a2a_agent.rs): model-backed agents and sub-agent tools.
+- [`a2a_client`](examples/a2a_client.rs): direct requests and streaming.
+
+```sh
+cargo test --locked -p rig-a2a
+cargo clippy --locked -p rig-a2a --all-targets --all-features -- -D warnings
+```
