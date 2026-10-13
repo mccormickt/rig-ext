@@ -1,6 +1,6 @@
 # rig-typesafeai-tools
 
-Expose a host-configured `rig-typesafeai` 0.44 evaluation model as the Rig
+Expose a host-configured `rig-typesafeai` evaluation model as the Rig
 `DynamicTool` named `jev_evaluate`. There is no production dependency on
 a script engine, an agent runner, or a specific HTTP transport.
 
