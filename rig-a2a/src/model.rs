@@ -546,6 +546,42 @@ impl rig_core::wire::document::Reassemble<A2AFrame> for A2ADocument {
     }
 }
 
+// Bound serialized protocol content before the driver retains it for extras.
+// This is independent of the 1 MiB final text projection limit.
+const RESPONSE_BYTES_LIMIT: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct ResponseBudget(usize);
+
+impl ResponseBudget {
+    fn retain(&mut self, value: &impl serde::Serialize) -> Result<(), A2AError> {
+        serde_json::to_writer(&mut *self, value).map_err(|error| {
+            if self.0 > RESPONSE_BYTES_LIMIT {
+                A2AError::PayloadTooLarge {
+                    what: "retained protocol response",
+                    limit: RESPONSE_BYTES_LIMIT,
+                }
+            } else {
+                A2AError::Serde(error)
+            }
+        })
+    }
+}
+
+impl std::io::Write for ResponseBudget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        if self.0 > RESPONSE_BYTES_LIMIT {
+            return Err(std::io::Error::other("protocol response limit exceeded"));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 struct A2ATransport;
 
@@ -553,6 +589,7 @@ impl rig_core::driver::Transport<A2AModel> for A2ATransport {
     fn send(&self, payload: A2APayload, _exchange: Exchange) -> Opening<A2AFrame> {
         Opening::new(async move {
             let conversation = payload.outbound.conversation.clone();
+            let mut budget = ResponseBudget::default();
             match payload.mode {
                 Mode::Unary => {
                     let response = payload
@@ -571,6 +608,7 @@ impl rig_core::driver::Transport<A2AModel> for A2ATransport {
                             &payload.outbound.context_fingerprints,
                         );
                     }
+                    budget.retain(&response)?;
                     let frame = A2AFrame::Unary(response);
                     Ok(Opened::new(futures::stream::once(async { Ok(frame) })))
                 }
@@ -620,6 +658,7 @@ impl rig_core::driver::Transport<A2AModel> for A2ATransport {
                         }
                         message_reply = matches!(event, a2a::StreamResponse::Message(_));
                         last = Some(info);
+                        budget.retain(&event)?;
                         Ok(A2AFrame::Stream(event))
                     })))
                 }

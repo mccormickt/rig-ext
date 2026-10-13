@@ -2686,6 +2686,99 @@ async fn oracle_unary_and_stream_accept_the_same_media_and_escaped_text() {
 }
 
 #[tokio::test]
+async fn oversized_replies_update_conversation_before_rejecting_content() {
+    let task = |state, oversized: bool| {
+        StreamResponse::Task(Task {
+            id: "task-1".into(),
+            context_id: "ctx-1".into(),
+            status: TaskStatus {
+                state,
+                message: Some(Message::new(Role::Agent, vec![Part::text("answer")])),
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: oversized.then(|| {
+                std::collections::HashMap::from([(
+                    "large".into(),
+                    serde_json::json!("x".repeat(16 * 1024 * 1024)),
+                )])
+            }),
+        })
+    };
+    for binding in [StubBinding::JsonRpc, StubBinding::Rest] {
+        for streaming in [false, true] {
+            for (seed_paused, state) in [
+                (true, TaskState::Completed),
+                (false, TaskState::InputRequired),
+            ] {
+                let mut script = Vec::new();
+                if seed_paused {
+                    script.push(vec![task(TaskState::InputRequired, false)]);
+                }
+                script.push(vec![task(state.clone(), true)]);
+                script.push(vec![task(TaskState::Completed, false)]);
+                let (client, recorded, server) =
+                    serve_wire_script(binding, script, streaming).await;
+                let model = client.model_for_conversation("size-limit");
+                if seed_paused {
+                    let request = text_request("start");
+                    if streaming {
+                        model.stream(request).unwrap().finish().await.unwrap();
+                    } else {
+                        model.completion(request).await.unwrap();
+                    }
+                }
+                let mut request = text_request("continue");
+                request.documents = vec![document("delivered", "standing context")];
+                let result = if streaming {
+                    model.stream(request.clone()).unwrap().finish().await
+                } else {
+                    model.completion(request.clone()).await
+                };
+                let Err(error) = result else {
+                    panic!("oversized reply must fail")
+                };
+                assert!(
+                    error.to_string().contains("retained protocol response"),
+                    "{error}"
+                );
+                if streaming {
+                    model.stream(request).unwrap().finish().await.unwrap();
+                } else {
+                    model.completion(request).await.unwrap();
+                }
+                let requests = recorded.lock().unwrap().clone();
+                let last = requests.last().unwrap();
+                let body = match binding {
+                    StubBinding::JsonRpc => &last["params"],
+                    StubBinding::Rest => last,
+                };
+                assert_eq!(body["message"]["contextId"], "ctx-1");
+                if state == TaskState::InputRequired {
+                    assert_eq!(body["message"]["taskId"], "task-1");
+                } else {
+                    assert!(
+                        body["message"]["taskId"].is_null(),
+                        "completed task must not be resumed"
+                    );
+                }
+                assert!(
+                    !body["message"]["parts"]
+                        .to_string()
+                        .contains("standing context")
+                );
+                println!(
+                    "oversize bookkeeping: stream={streaming} seed_paused={seed_paused} state={state:?}; next request has correct IDs and no repeated context"
+                );
+                server.abort();
+                let _ = server.await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn stream_identity_errors_do_not_replace_valid_conversation() {
     for binding in [StubBinding::JsonRpc, StubBinding::Rest] {
         for (invalid, expected) in [
@@ -2767,6 +2860,86 @@ async fn stream_identity_errors_do_not_replace_valid_conversation() {
             server.abort();
             let _ = server.await;
         }
+    }
+}
+
+#[tokio::test]
+async fn completion_limits_cover_text_boundary_and_protocol_metadata() {
+    for binding in [StubBinding::JsonRpc, StubBinding::Rest] {
+        for streaming in [false, true] {
+            for (text_size, metadata_size, expected_error) in [
+                (1024 * 1024, 0, None),
+                (1024 * 1024 + 1, 0, Some("1048576")),
+                (2, 17 * 1024 * 1024, Some("retained protocol response")),
+            ] {
+                let mut message =
+                    Message::new(Role::Agent, vec![Part::text("x".repeat(text_size))]);
+                if metadata_size > 0 {
+                    message.metadata = Some(std::collections::HashMap::from([(
+                        "detail".into(),
+                        serde_json::json!("m".repeat(metadata_size)),
+                    )]));
+                }
+                let (client, _, server) =
+                    serve_wire(binding, vec![StreamResponse::Message(message)], streaming).await;
+                let result = if streaming {
+                    client
+                        .model()
+                        .stream(text_request("go"))
+                        .unwrap()
+                        .finish()
+                        .await
+                } else {
+                    client.model().completion(text_request("go")).await
+                };
+                if let Some(expected) = expected_error {
+                    let Err(error) = result else {
+                        panic!("over-limit response must fail");
+                    };
+                    assert!(error.to_string().contains(expected), "{error}");
+                } else {
+                    assert_eq!(result.unwrap().text().len(), text_size);
+                }
+                println!(
+                    "boundary: stream={streaming} text={text_size} metadata={metadata_size} rejected={}",
+                    expected_error.is_some()
+                );
+                server.abort();
+                let _ = server.await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn oracle_repeated_replacements_have_a_cumulative_response_limit() {
+    for binding in [StubBinding::JsonRpc, StubBinding::Rest] {
+        let mut events = vec![artifact_event("a", &"x".repeat(600_000), None); 30];
+        events.push(StreamResponse::StatusUpdate(status_update(
+            "task-1",
+            "ctx-1",
+            TaskState::Completed,
+            None,
+        )));
+        let (client, _, server) = serve_wire(binding, events, true).await;
+        let result = client
+            .model()
+            .stream(text_request("go"))
+            .unwrap()
+            .finish()
+            .await;
+        let Err(error) = result else {
+            panic!(
+                "18 MB of retained events must fail even when the final artifact is only 600 KB"
+            );
+        };
+        assert!(
+            error.to_string().contains("retained protocol response"),
+            "{error}"
+        );
+        println!("repeated replacements rejected: {error}");
+        server.abort();
+        let _ = server.await;
     }
 }
 
