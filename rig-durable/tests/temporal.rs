@@ -132,6 +132,384 @@ async fn live_client() -> (Runtime, Client) {
     (runtime, client)
 }
 
+#[cfg(feature = "codemode")]
+#[test]
+fn temporal_code_mode_snapshots_catalog_and_registers_independent_child() {
+    let child = TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::text("child")]))
+        .preamble("child instructions");
+    let agent = TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::text("done")]))
+        .code_mode(rig_codemode::Limits::default())
+        .tool(MockAddTool)
+        .sub_agent("research", &child, "child-queue")
+        .unwrap();
+    let input = agent.input("task");
+    let json = serde_json::to_value(&input).unwrap();
+    assert_eq!(
+        json["config"]["code_mode"]["definitions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(input.config.tools.len(), 2);
+    let advertised = input.config.advertised_tools().unwrap();
+    assert_eq!(advertised.len(), 1);
+    assert_eq!(advertised[0].name, "codemode");
+    let route = input.config.tools[1].child.as_ref().unwrap();
+    assert_eq!(route.task_queue, "child-queue");
+    assert_eq!(route.config.preamble.as_deref(), Some("child instructions"));
+    let restored: TemporalAgentInput = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(serde_json::to_value(restored).unwrap(), json);
+    let mut old = json;
+    old["config"].as_object_mut().unwrap().remove("code_mode");
+    old["config"]["tools"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("child");
+    let old: TemporalAgentInput = serde_json::from_value(old).unwrap();
+    assert_eq!(old.config.advertised_tools().unwrap().len(), 2);
+    assert!(old.config.tools[1].child.is_none());
+    agent
+        .register(&mut WorkerOptions::new("parent-queue").build())
+        .unwrap();
+    child
+        .register(&mut WorkerOptions::new("child-queue").build())
+        .unwrap();
+}
+
+#[cfg(feature = "codemode")]
+#[test]
+fn temporal_code_mode_rejects_approval_and_invalid_limits() {
+    let make = || TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::text("done")]));
+    let mut options = WorkerOptions::new("invalid-code-mode").build();
+    assert!(matches!(
+        make()
+            .approval_tool(MockAddTool)
+            .code_mode(Default::default())
+            .register(&mut options),
+        Err(TemporalAgentError::InvalidConfiguration(_))
+    ));
+    let limits = rig_codemode::Limits {
+        max_in_flight: 0,
+        ..Default::default()
+    };
+    assert!(matches!(
+        make()
+            .tool(MockAddTool)
+            .code_mode(limits)
+            .register(&mut options),
+        Err(TemporalAgentError::InvalidConfiguration(_))
+    ));
+    let child = make();
+    assert!(make().sub_agent("codemode", &child, "child").is_err());
+    let child = make().approval_tool(MockAddTool);
+    assert!(make().sub_agent("child", &child, "child").is_err());
+}
+
+#[cfg(feature = "codemode")]
+#[tokio::test]
+#[ignore = "requires a live Temporal server configured with TEMPORAL_* variables"]
+async fn temporal_code_mode_planning_failure_stops_the_coordinator() {
+    let (runtime, client) = live_client().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    let model = MockCompletionModel::from_turns([
+        MockTurn::tool_call(
+            "code",
+            "codemode",
+            serde_json::json!({"code": r#"
+                await tools.lookup({key: "committed"});
+                tools.lookup({key: "unawaited"});
+                return "done";
+            "#}),
+        ),
+        MockTurn::text("must not continue"),
+    ]);
+    let agent = TemporalAgent::new(model.clone())
+        .code_mode(Default::default())
+        .activity_max_attempts(1)
+        .tool(FlakyLookup {
+            attempts: attempts.clone(),
+            fail_until: 0,
+            invocations: invocations.clone(),
+        });
+    let input = agent.input("run script");
+    let suffix = uuid::Uuid::new_v4();
+    let queue = format!("rig-code-mode-failure-{suffix}");
+    let mut options = WorkerOptions::new(queue.clone()).build();
+    agent.register(&mut options).unwrap();
+    let mut worker = Worker::new(&runtime, client.clone(), options).unwrap();
+    let shutdown = worker.shutdown_handle();
+    let run = async {
+        let handle = client
+            .start_workflow(
+                TemporalAgentWorkflow::run,
+                input,
+                WorkflowStartOptions::new(queue, format!("rig-code-mode-failure-{suffix}")).build(),
+            )
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            handle.get_result(WorkflowGetResultOptions::default()),
+        )
+        .await
+        .unwrap();
+        shutdown();
+        result
+    };
+    let (worker_result, result) = tokio::join!(worker.run(), run);
+    worker_result.unwrap();
+    assert!(result.is_err(), "a planning failure must fail the workflow");
+    let error = format!("{:?}", result.unwrap_err());
+    assert!(error.contains("must await every new tool call"), "{error}");
+    assert_eq!(model.requests().len(), 1);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(invocations.lock().unwrap().len(), 1);
+}
+
+#[cfg(feature = "codemode")]
+#[derive(Clone)]
+struct CodeModeProbe {
+    invocations: Arc<Mutex<Vec<(String, ToolInvocation)>>>,
+    followup: Arc<Notify>,
+    loser_started: Arc<Notify>,
+    loser_release: Arc<Notify>,
+    loser_finished: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "codemode")]
+impl Tool for CodeModeProbe {
+    const NAME: &'static str = "probe";
+    type Args = LookupArgs;
+    type Output = String;
+    type Error = Infallible;
+    fn description(&self) -> String {
+        "Return the key immediately".into()
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"key":{"type":"string"}},"required":["key"]})
+    }
+    async fn call(
+        &self,
+        context: &mut ToolContext,
+        args: LookupArgs,
+    ) -> Result<String, Infallible> {
+        self.invocations.lock().unwrap().push((
+            args.key.clone(),
+            context.require::<ToolInvocation>().unwrap().clone(),
+        ));
+        if args.key.starts_with("followup:") {
+            self.followup.notify_one();
+        }
+        if args.key == "loser" {
+            self.loser_started.notify_one();
+            self.loser_release.notified().await;
+            self.loser_finished.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(args.key)
+    }
+}
+
+#[cfg(feature = "codemode")]
+#[tokio::test]
+#[ignore = "requires a live Temporal server configured with TEMPORAL_* variables"]
+async fn temporal_code_mode_out_of_order_child_race_restart_and_replay() {
+    use temporalio_sdk::workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions};
+    let (runtime, client) = live_client().await;
+    let namespace = client.options().namespace.clone();
+    let suffix = uuid::Uuid::new_v4();
+    let queue = format!("rig-code-mode-parent-{suffix}");
+    let child_queue = format!("rig-code-mode-child-{suffix}");
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let followup = Arc::new(Notify::new());
+    let loser_started = Arc::new(Notify::new());
+    let loser_release = Arc::new(Notify::new());
+    let loser_finished = Arc::new(AtomicUsize::new(0));
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    let child = TemporalAgent::new(MockCompletionModel::from_turns([
+        MockTurn::tool_call("slow", "blocking_lookup", serde_json::json!({"key":"slow"})),
+        MockTurn::text("slow"),
+    ]))
+    .tool(BlockingLookup {
+        started: started.clone(),
+        release: release.clone(),
+    });
+    let script = r#"
+        const slow = tools.child({prompt: "slow"});
+        const fast = tools.probe({key: "fast"});
+        const winner = await Promise.race([slow, fast]);
+        await tools.probe({key: "followup:" + winner});
+        const ordered = await Promise.all([slow, fast]);
+        text({winner, ordered});
+        const lastWinner = await Promise.race([
+            tools.probe({key: "loser"}), tools.probe({key: "last-fast"})
+        ]);
+        const refusal = await tools.disposition.raw({mode: "refused"});
+        return {winner, ordered, lastWinner, refusal: refusal.error.kind};
+    "#;
+    let model = MockCompletionModel::from_turns([
+        MockTurn::tool_call("code", "codemode", serde_json::json!({"code":script})),
+        MockTurn::text("finished"),
+    ]);
+    let make_parent = || {
+        TemporalAgent::new(model.clone())
+            .code_mode(Default::default())
+            .tool(CodeModeProbe {
+                invocations: invocations.clone(),
+                followup: followup.clone(),
+                loser_started: loser_started.clone(),
+                loser_release: loser_release.clone(),
+                loser_finished: loser_finished.clone(),
+            })
+            .tool(Disposition)
+            .sub_agent("child", &child, child_queue.clone())
+            .unwrap()
+    };
+    let parent = make_parent();
+    let input = parent.input("run race");
+    let mut options = WorkerOptions::new(queue.clone()).build();
+    parent.register(&mut options).unwrap();
+    let mut worker = Worker::new(&runtime, client.clone(), options).unwrap();
+    let stop = worker.shutdown_handle();
+    let mut child_options = WorkerOptions::new(child_queue.clone()).build();
+    // Build the replacement before the independently registered child is consumed.
+    let replacement = make_parent();
+    child.register(&mut child_options).unwrap();
+    let mut child_worker = Worker::new(&runtime, client.clone(), child_options).unwrap();
+    let stop_child = child_worker.shutdown_handle();
+    let run = async {
+        let handle = client
+            .start_workflow(
+                TemporalAgentWorkflow::run,
+                input,
+                WorkflowStartOptions::new(queue.clone(), format!("rig-code-mode-{suffix}")).build(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            started.notified().await;
+            followup.notified().await;
+        })
+        .await
+        .expect("fast-result follow-up must start while the slow child is blocked");
+        assert_eq!(invocations.lock().unwrap()[1].0, "followup:fast");
+        stop();
+        handle
+    };
+    let parent_run = async {
+        let (worker_result, handle) = tokio::join!(worker.run(), run);
+        worker_result.unwrap();
+        let before = invocations.lock().unwrap().clone();
+        let mut options = WorkerOptions::new(queue.clone()).build();
+        replacement.register(&mut options).unwrap();
+        let mut worker = Worker::new(&runtime, client.clone(), options).unwrap();
+        let stop = worker.shutdown_handle();
+        let finish = async {
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(30), loser_started.notified())
+                .await
+                .unwrap();
+            assert_eq!(loser_finished.load(Ordering::SeqCst), 0);
+            // This loser is not awaited after Promise.race. The scheduler must
+            // retain it, drain it without cancellation, then run the final plan.
+            tokio::time::timeout(Duration::from_secs(30), async {
+                use temporalio_common::protos::temporal::api::history::v1::history_event::Attributes;
+                loop {
+                    let events = handle.fetch_history(Default::default()).into_events().await.unwrap();
+                    let recorded_winner = events.iter().any(|event| {
+                        let Some(Attributes::ActivityTaskScheduledEventAttributes(activity)) = &event.attributes else { return false; };
+                        if activity.activity_type.as_ref().is_none_or(|kind| kind.name != "RigTemporalCodeModeStepG2V1") { return false; }
+                        activity.input.as_ref().is_some_and(|input| input.payloads.iter().any(|payload| {
+                            serde_json::from_slice::<serde_json::Value>(&payload.data).is_ok_and(|value| {
+                                value["input"]["history"].as_array().is_some_and(|history| history.iter().any(|entry| entry["call"]["arguments"]["key"] == "last-fast"))
+                            })
+                        }))
+                    });
+                    if recorded_winner { break; }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.expect("race winner must be durably delivered before releasing loser");
+            loser_release.notify_one();
+            let response = tokio::time::timeout(
+                Duration::from_secs(30),
+                handle.get_result(WorkflowGetResultOptions::default()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.output(), "finished");
+            assert_eq!(loser_finished.load(Ordering::SeqCst), 1);
+            stop();
+            stop_child();
+        };
+        let (worker_result, ()) = tokio::join!(worker.run(), finish);
+        worker_result.unwrap();
+        let after = invocations.lock().unwrap().clone();
+        assert_eq!(
+            before,
+            after[..2],
+            "restart must not rerun settled calls or change their identity"
+        );
+        assert_eq!(after.len(), 4);
+        assert_eq!(after[0].1.logical_key.as_ref().unwrap().call_index, 1);
+        assert_eq!(after[1].1.logical_key.as_ref().unwrap().call_index, 2);
+        assert!(
+            after[0]
+                .1
+                .logical_key
+                .as_ref()
+                .unwrap()
+                .logical_execution_id
+                .ends_with("/codemode/0/1/0")
+        );
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].tools.len(), 1);
+        assert_eq!(requests[0].tools[0].name, "codemode");
+        let feedback = serde_json::to_string(&requests[1].chat_history).unwrap();
+        assert!(
+            feedback.contains("fast") && feedback.contains("slow"),
+            "{feedback}"
+        );
+        // Check structured report output rather than merely final model prose.
+        let transcript = serde_json::to_value(&requests[1].chat_history).unwrap();
+        fn find_order(value: &serde_json::Value) -> bool {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.get("ordered") == Some(&serde_json::json!(["slow", "fast"]))
+                        && map.get("winner") == Some(&serde_json::json!("fast"))
+                        && map.get("refusal") == Some(&serde_json::json!("permission_denied"))
+                        || map.values().any(find_order)
+                }
+                serde_json::Value::Array(items) => items.iter().any(find_order),
+                serde_json::Value::String(text) => serde_json::from_str::<serde_json::Value>(text)
+                    .is_ok_and(|value| find_order(&value)),
+                _ => false,
+            }
+        }
+        assert!(find_order(&transcript), "{transcript}");
+        assert!(
+            serde_json::to_string(&transcript)
+                .unwrap()
+                .contains("last-fast"),
+            "{transcript}"
+        );
+        let mut replay_options = WorkflowReplayerOptions::new().namespace(namespace).build();
+        replay_options
+            .register_workflow::<TemporalAgentWorkflow>()
+            .unwrap();
+        WorkflowReplayer::new(replay_options)
+            .unwrap()
+            .replay_workflow(handle.fetch_history(Default::default()))
+            .await
+            .unwrap();
+    };
+    let ((), child_result) = tokio::join!(parent_run, child_worker.run());
+    child_result.unwrap();
+}
+
 #[test]
 fn temporal_agent_builds_reusable_inputs_and_registers_a_worker() {
     let agent = TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::text("done")]))

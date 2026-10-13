@@ -80,8 +80,9 @@ use rig::{
 use serde::{Deserialize, Serialize};
 use temporalio_common::RetryPolicy;
 use temporalio_sdk::{
-    ActivityOptions, ApplicationFailure, ContinueAsNewOptions, SyncWorkflowContext, WorkerOptions,
-    WorkflowContext, WorkflowContextView, WorkflowRegistrationError, WorkflowResult,
+    ActivityOptions, ApplicationFailure, ChildWorkflowOptions, ContinueAsNewOptions,
+    SyncWorkflowContext, WorkerOptions, WorkflowContext, WorkflowContextView,
+    WorkflowRegistrationError, WorkflowResult,
     activities::{ActivityContext, ActivityError, activities},
     workflows::{join_all, workflow, workflow_methods},
 };
@@ -132,6 +133,9 @@ pub struct TemporalAgentConfig {
     /// Completed-prompt compaction for session workflows. `None` disables it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionConfig>,
+    #[cfg(feature = "codemode")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_mode: Option<crate::codemode::CodeModeConfig>,
 }
 
 impl Default for TemporalAgentConfig {
@@ -149,7 +153,24 @@ impl Default for TemporalAgentConfig {
             session_history_max_bytes: DEFAULT_SESSION_HISTORY_MAX_BYTES,
             contract: InvocationContract::Logical,
             compaction: None,
+            #[cfg(feature = "codemode")]
+            code_mode: None,
         }
+    }
+}
+
+impl TemporalAgentConfig {
+    /// Definitions visible to the model, not the nested executor catalog.
+    pub fn advertised_tools(&self) -> Result<Vec<ToolDefinition>, String> {
+        #[cfg(feature = "codemode")]
+        if let Some(config) = &self.code_mode {
+            return config.definition().map(|definition| vec![definition]);
+        }
+        Ok(self
+            .tools
+            .iter()
+            .map(|tool| tool.definition.clone())
+            .collect())
     }
 }
 
@@ -160,11 +181,22 @@ pub struct TemporalTool {
     /// Replay policy the tool activity enforces under the logical contract.
     #[serde(default)]
     pub policy: ToolPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child: Option<TemporalChildAgent>,
+}
+
+/// A child agent is registered independently on its own worker queue.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TemporalChildAgent {
+    pub task_queue: String,
+    pub config: Box<TemporalAgentConfig>,
 }
 
 /// Errors from [`TemporalAgent::register`].
 #[derive(Debug, thiserror::Error)]
 pub enum TemporalAgentError {
+    #[error("invalid agent configuration: {0}")]
+    InvalidConfiguration(String),
     #[error(transparent)]
     Registration(#[from] WorkflowRegistrationError),
     #[error(
@@ -1054,6 +1086,29 @@ struct TemporalActivities {
     compaction: Option<Compaction>,
 }
 
+#[cfg(feature = "codemode")]
+#[derive(Clone, Serialize, Deserialize)]
+struct TemporalCodeModeStepInput {
+    config: crate::codemode::CodeModeConfig,
+    input: crate::codemode::StepInput,
+}
+
+#[cfg(feature = "codemode")]
+struct TemporalCodeModeActivities;
+
+#[cfg(feature = "codemode")]
+#[activities]
+impl TemporalCodeModeActivities {
+    #[activity(name = "RigTemporalCodeModeStepG2V1")]
+    async fn code_mode_step(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: TemporalCodeModeStepInput,
+    ) -> Result<rig_codemode::replay::ScriptStep, ActivityError> {
+        input.config.step(input.input).await.map_err(activity_error)
+    }
+}
+
 #[activities]
 impl TemporalActivities {
     #[activity(name = "RigTemporalModelCompletionG2V1")]
@@ -1160,6 +1215,74 @@ impl TemporalAgent {
         self
     }
 
+    /// Advertise one JavaScript tool while retaining nested execution policies.
+    #[cfg(feature = "codemode")]
+    pub fn code_mode(mut self, limits: rig_codemode::Limits) -> Self {
+        self.config.code_mode = Some(crate::codemode::CodeModeConfig {
+            limits,
+            definitions: Vec::new(),
+        });
+        self
+    }
+
+    /// Expose a child agent registered independently on `task_queue`.
+    /// The child configuration is captured here; register the referenced agent
+    /// on its worker before starting parent workflows. Child approval routing
+    /// is not supported.
+    pub fn sub_agent(
+        mut self,
+        name: impl Into<String>,
+        child: &TemporalAgent,
+        task_queue: impl Into<String>,
+    ) -> Result<Self, TemporalAgentError> {
+        let name = name.into();
+        let task_queue = task_queue.into();
+        if child.config.tools.iter().any(|tool| tool.requires_approval) {
+            return Err(TemporalAgentError::InvalidConfiguration(
+                "durable child agents do not support parent-routed human approval".into(),
+            ));
+        }
+        if name == "codemode"
+            || task_queue.is_empty()
+            || self
+                .config
+                .tools
+                .iter()
+                .any(|tool| tool.definition.name == name)
+        {
+            return Err(TemporalAgentError::InvalidConfiguration(
+                "invalid or duplicate child route".into(),
+            ));
+        }
+        let name = rig::message::ToolName::new(name)
+            .map_err(|error| TemporalAgentError::InvalidConfiguration(error.to_string()))?;
+        self.config.tools.push(TemporalTool {
+            definition: ToolDefinition {
+                name,
+                description: "Ask a durable child agent to complete a task.".into(),
+                parameters: serde_json::json!({"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"],"additionalProperties":false}),
+            },
+            requires_approval: false,
+            policy: ToolPolicy::default(),
+            child: Some(TemporalChildAgent { task_queue, config: Box::new(child.snapshot_config()) }),
+        });
+        Ok(self)
+    }
+
+    fn snapshot_config(&self) -> TemporalAgentConfig {
+        #[allow(unused_mut)]
+        let mut config = self.config.clone();
+        #[cfg(feature = "codemode")]
+        if let Some(code_mode) = &mut config.code_mode {
+            code_mode.definitions = config
+                .tools
+                .iter()
+                .map(|tool| tool.definition.clone())
+                .collect();
+        }
+        config
+    }
+
     pub fn temperature(mut self, temperature: f64) -> Self {
         self.config.temperature = Some(temperature);
         self
@@ -1251,6 +1374,7 @@ impl TemporalAgent {
             definition,
             requires_approval,
             policy,
+            child: None,
         };
         if let Some(existing) = self
             .config
@@ -1270,7 +1394,7 @@ impl TemporalAgent {
         TemporalAgentInput {
             prompt: prompt.into(),
             history: Vec::new(),
-            config: self.config.clone(),
+            config: self.snapshot_config(),
         }
     }
 
@@ -1283,7 +1407,7 @@ impl TemporalAgent {
         TemporalAgentInput {
             prompt: prompt.into(),
             history,
-            config: self.config.clone(),
+            config: self.snapshot_config(),
         }
     }
 
@@ -1291,7 +1415,7 @@ impl TemporalAgent {
     pub fn session_input(&self, history: Vec<Message>) -> TemporalAgentSessionInput {
         TemporalAgentSessionInput {
             history,
-            config: self.config.clone(),
+            config: self.snapshot_config(),
             queued_steering: Vec::new(),
             next_prompt_index: 0,
             compaction: None,
@@ -1307,6 +1431,17 @@ impl TemporalAgent {
     /// Registration consumes the agent because the worker retains its model and tool set.
     /// It fails closed when a tool policy needs a contract or guard store the agent lacks.
     pub fn register(self, options: &mut WorkerOptions) -> Result<(), TemporalAgentError> {
+        #[cfg(feature = "codemode")]
+        if let Some(code_mode) = self.snapshot_config().code_mode {
+            code_mode
+                .validate()
+                .map_err(TemporalAgentError::InvalidConfiguration)?;
+            if self.config.tools.iter().any(|tool| tool.requires_approval) {
+                return Err(TemporalAgentError::InvalidConfiguration(
+                    "code-mode nested calls do not support human approval".into(),
+                ));
+            }
+        }
         for tool in &self.config.tools {
             let name = tool.definition.name.as_str();
             if self.config.contract == InvocationContract::Legacy
@@ -1322,6 +1457,8 @@ impl TemporalAgent {
         }
         options.register_workflow::<TemporalAgentWorkflow>()?;
         options.register_workflow::<TemporalAgentSessionWorkflow>()?;
+        #[cfg(feature = "codemode")]
+        options.register_activities(TemporalCodeModeActivities);
         let policies = self
             .config
             .tools
@@ -1394,11 +1531,7 @@ where
     loop {
         let options = CompletionOptions {
             preamble: config.preamble.clone(),
-            tools: config
-                .tools
-                .iter()
-                .map(|tool| tool.definition.clone())
-                .collect(),
+            tools: config.advertised_tools().map_err(workflow_error)?,
             temperature: config.temperature,
             max_tokens: config.max_tokens,
             tool_choice: config.tool_choice.clone(),
@@ -1429,6 +1562,11 @@ where
                     let mut denied = false;
                     if pending.preresolved_result.is_none() {
                         let call = &pending.tool_call;
+                        #[cfg(feature = "codemode")]
+                        if config.code_mode.is_some() {
+                            resolved.push(ResolvedCall { pending, denied });
+                            continue;
+                        }
                         let tool = config
                             .tools
                             .iter()
@@ -1619,11 +1757,6 @@ async fn execute_tool<W>(
     position: CallPosition,
 ) -> Result<(UserContent, ToolOutcome), temporalio_sdk::WorkflowTermination> {
     let ResolvedCall { pending, denied } = resolved;
-    let CallPosition {
-        prompt_index,
-        turn,
-        call_index,
-    } = position;
     if let Some(result) = pending.preresolved_result {
         let outcome = if denied {
             ToolOutcome::denied(position, &pending.tool_call)
@@ -1634,8 +1767,101 @@ async fn execute_tool<W>(
     }
     let call = pending.tool_call;
     let name = call.function.name.to_string();
-    let arguments = serde_json::to_string(&call.function.arguments).map_err(workflow_error)?;
-    let execution_id = format!("{}:{}", ctx.workflow_id(), ctx.run_id());
+    #[cfg(feature = "codemode")]
+    if let Some(code_mode) = &config.code_mode {
+        let result = if name == "codemode" {
+            match serde_json::from_value::<crate::codemode::ScriptInput>(serde_json::Value::Object(
+                call.function.arguments.clone(),
+            )) {
+                Ok(input) => Ok(run_code_mode(ctx, config, code_mode, input.code, position)
+                    .await
+                    .map_err(workflow_error)?),
+                Err(_) => Err("code-mode requires a string code argument".into()),
+            }
+        } else {
+            Err("only the codemode tool is available".into())
+        };
+        let output = routed_output("codemode", result);
+        let outcome = ToolOutcome::from_activity(position, &call, &output);
+        return Ok((driver::tool_result(&call, output.content), outcome));
+    }
+    let output = route_tool(
+        ctx,
+        config,
+        &name,
+        &serde_json::Value::Object(call.function.arguments.clone()),
+        position,
+        None,
+    )
+    .await?;
+    let outcome = ToolOutcome::from_activity(position, &call, &output);
+    Ok((driver::tool_result(&call, output.content), outcome))
+}
+
+async fn route_tool<W>(
+    ctx: &WorkflowContext<W>,
+    config: &TemporalAgentConfig,
+    name: &str,
+    args: &serde_json::Value,
+    position: CallPosition,
+    scope: Option<usize>,
+) -> Result<ToolActivityOutput, temporalio_sdk::WorkflowTermination> {
+    let CallPosition {
+        prompt_index,
+        turn,
+        call_index,
+    } = position;
+    let tool = config
+        .tools
+        .iter()
+        .find(|tool| tool.definition.name == name)
+        .ok_or_else(|| workflow_error("tool is not registered"))?;
+    if let Some(child) = &tool.child {
+        let result = async {
+            let prompt = args
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("child agent requires a string prompt")?;
+            let id = format!(
+                "rig-child-{}-{}-{}-{}-{}",
+                execution_chain_id(&ctx.info()),
+                prompt_index,
+                turn,
+                scope
+                    .map(|index| index.to_string())
+                    .unwrap_or_else(|| "direct".into()),
+                call_index
+            );
+            let started = ctx
+                .start_child_workflow(
+                    TemporalAgentWorkflow::run,
+                    TemporalAgentInput {
+                        prompt: prompt.into(),
+                        history: Vec::new(),
+                        config: *child.config.clone(),
+                    },
+                    ChildWorkflowOptions::builder()
+                        .task_queue(child.task_queue.clone())
+                        .workflow_id(id)
+                        .build(),
+                )
+                .await
+                .map_err(|_| "child agent could not start")?;
+            let response = started.result().await.map_err(|_| "child agent failed")?;
+            Ok(rig::tool::ToolOutput::text(response.output()))
+        }
+        .await;
+        return Ok(routed_output(name, result.map_err(str::to_owned)));
+    }
+    let name = name.to_owned();
+    let arguments = serde_json::to_string(args).map_err(workflow_error)?;
+    let mut execution_id = format!("{}:{}", ctx.workflow_id(), ctx.run_id());
+    let mut key = logical_key(ctx, prompt_index, turn, call_index);
+    if let Some(parent) = scope {
+        let suffix = format!("/codemode/{prompt_index}/{turn}/{parent}");
+        key.logical_execution_id.push_str(&suffix);
+        execution_id.push_str(&suffix);
+    }
     let output = match config.contract {
         InvocationContract::Legacy => {
             ctx.execute_activity(
@@ -1672,7 +1898,7 @@ async fn execute_tool<W>(
                         prompt_index,
                         turn,
                         call_index,
-                        logical_key: Some(logical_key(ctx, prompt_index, turn, call_index)),
+                        logical_key: Some(key),
                         attempt: Some(AttemptMetadata {
                             backend_execution_id: execution_id,
                             activity_attempt: None,
@@ -1685,8 +1911,76 @@ async fn execute_tool<W>(
             .await?
         }
     };
-    let outcome = ToolOutcome::from_activity(position, &call, &output);
-    Ok((driver::tool_result(&call, output.content), outcome))
+    Ok(output)
+}
+
+fn routed_output(name: &str, result: Result<rig::tool::ToolOutput, String>) -> ToolActivityOutput {
+    let result = match result {
+        Ok(output) => rig::tool::ToolResult::success(output),
+        Err(_) => rig::tool::ToolResult::failed(
+            rig::tool::ToolExecutionError::other("The durable tool failed.").with_retryable(false),
+        ),
+    };
+    let (result, _) = crate::result::DurableToolResult::from_rig(
+        result,
+        &Default::default(),
+        &Default::default(),
+    );
+    ToolActivityOutput::from_result(name, result)
+}
+
+#[cfg(feature = "codemode")]
+async fn run_code_mode<W>(
+    ctx: &WorkflowContext<W>,
+    config: &TemporalAgentConfig,
+    code_mode: &crate::codemode::CodeModeConfig,
+    code: String,
+    parent: CallPosition,
+) -> Result<rig::tool::ToolOutput, String> {
+    let report = crate::codemode::run(
+        code,
+        code_mode.limits,
+        |input| async move {
+            ctx.execute_activity(
+                TemporalCodeModeActivities::code_mode_step,
+                TemporalCodeModeStepInput {
+                    config: code_mode.clone(),
+                    input,
+                },
+                activity_options(config),
+            )
+            .await
+            .map_err(|error| format!("code-mode planning failed: {error:?}"))
+        },
+        |call| async move {
+            let output = match route_tool(
+                ctx,
+                config,
+                &call.name,
+                &call.arguments,
+                CallPosition {
+                    call_index: call.ordinal as usize,
+                    ..parent
+                },
+                Some(parent.call_index),
+            )
+            .await
+            {
+                Ok(output) => output,
+                Err(_) => {
+                    return Ok(rig::tool::ToolResult::failed(
+                        rig::tool::ToolExecutionError::other("The nested durable tool failed.")
+                            .with_retryable(false),
+                    ));
+                }
+            };
+            crate::codemode::activity_result(output, &call.name)
+        },
+    )
+    .await?;
+    serde_json::to_value(report)
+        .map(rig::tool::ToolOutput::json)
+        .map_err(|error| error.to_string())
 }
 
 fn activity_options(config: &TemporalAgentConfig) -> ActivityOptions {
