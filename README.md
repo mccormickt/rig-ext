@@ -14,18 +14,28 @@ Extensions and integrations for the [Rig](https://github.com/0xPlaygrounds/rig) 
 
 ## Build
 
-You need Rust 1.95 or later, as required by Rig 0.44. Check the native crates:
+Use the stable Rust toolchain. All crates use the Rust 2024 edition. Run the
+native checks from the workspace root:
 
 ```sh
-cargo check --workspace
+cargo check --locked --workspace
+cargo test --locked --workspace --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
 ```
 
-Each crate README lists its examples and any extra build requirements.
+The crates are unpublished. Use a local path dependency when integrating them
+into another workspace. Dependency versions and features are defined in
+[`Cargo.toml`](Cargo.toml) and each crate's manifest.
+
+Each crate README lists its API guide, examples, feature choices, and extra
+build requirements. Native tests do not exercise Workers bindings; use the
+Wasm checks and celld conformance example for those integrations. Temporal's
+live tests require a development server and are ignored by default.
 
 ## Constraints
 
-- The workspace pins `worker` to 0.8.3. Rig 0.44 uses `wasm-streams` 0.5. workers-rs 0.8.4 and later use `wasm-streams` 0.6. Both versions in one Worker make duplicate WASM symbols.
+- The workspace pins `worker` because its `wasm-streams` ABI must match Rig and reqwest. Mixing those ABIs in one Worker creates duplicate WASM symbols.
 - `rig-a2a` supports native targets only.
 - `rig-durable` supports WASM with default features disabled. Its `duroxide` and `temporal` backends are native-only; use `durable-object` on Workers.
-- Rig 0.44 changes durable persistence formats. Existing runs and schema-1 Durable Objects need the old deployment. Read the [`rig-durable` upgrade notes](rig-durable/README.md#rig-044) before deployment.
 - `rig-celld/storage` supports Cloudflare and celld SQLite Durable Objects. `sqlite-vec` requires celld 0.6.0 or later. See the [`rig-celld` README](rig-celld/README.md#configure-celld).
