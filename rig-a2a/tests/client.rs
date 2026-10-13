@@ -1548,11 +1548,15 @@ async fn client_selects_first_supported_interface_in_card_order() {
     let mut unsupported_version =
         AgentInterface::new("http://127.0.0.1:2/jsonrpc", TRANSPORT_PROTOCOL_JSONRPC);
     unsupported_version.protocol_version = "2.0".to_string();
+    let mut unsupported_minor =
+        AgentInterface::new("http://127.0.0.1:5/jsonrpc", TRANSPORT_PROTOCOL_JSONRPC);
+    unsupported_minor.protocol_version = "1.1".to_string();
     let mut rest = AgentInterface::new("http://127.0.0.1:3", TRANSPORT_PROTOCOL_HTTP_JSON);
-    rest.protocol_version = "1.1".to_string();
+    rest.protocol_version = "1.0.1".to_string();
     rest.tenant = Some("tenant-a".to_string());
     card.supported_interfaces = vec![
         unsupported_version,
+        unsupported_minor,
         rest,
         AgentInterface::new("http://127.0.0.1:4/jsonrpc", TRANSPORT_PROTOCOL_JSONRPC),
     ];

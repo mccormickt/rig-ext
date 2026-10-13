@@ -461,7 +461,7 @@ fn protocol_version_matches(version: &str) -> bool {
     else {
         return false;
     };
-    interface_major == client_major && interface_minor >= client_minor
+    interface_major == client_major && interface_minor == client_minor
 }
 
 fn validate_http_interface_url(interface: &AgentInterface) -> Result<url::Url, A2AError> {
@@ -554,7 +554,7 @@ mod tests {
     fn protocol_version_matches_supported_major_and_minor() {
         assert!(protocol_version_matches("1.0"));
         assert!(protocol_version_matches("1.0.1"));
-        assert!(protocol_version_matches("1.1"));
+        assert!(!protocol_version_matches("1.1"));
         assert!(!protocol_version_matches("0.3"));
         assert!(!protocol_version_matches("2.0"));
         assert!(!protocol_version_matches("1"));
