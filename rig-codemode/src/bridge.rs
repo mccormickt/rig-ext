@@ -25,6 +25,8 @@ use crate::report::{
 /// Guest-to-host message.
 #[derive(Debug)]
 pub(crate) enum Request {
+    /// The worker has drained its jobs and waits for a tool result.
+    Idle,
     /// The script called `tools[name](args)` or `.raw(args)`.
     Call {
         ordinal: u32,
@@ -124,10 +126,10 @@ pub(crate) struct HostChannels {
     pub cancel: Arc<AtomicBool>,
 }
 
-/// Build both ends. The request channel holds at most `max_calls` messages;
-/// the guest never sends more than that many admitted calls.
+/// Build both ends. The request channel holds `max_calls` messages plus one
+/// idle notification. Admitted calls cannot exceed `max_calls`.
 pub(crate) fn channels(limits: &Limits) -> (WorkerChannels, HostChannels) {
-    let (request_tx, request_rx) = mpsc::channel(limits.max_calls as usize);
+    let (request_tx, request_rx) = mpsc::channel(limits.max_calls as usize + 1);
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = oneshot::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -344,7 +346,7 @@ pub(crate) fn bound_payload(
 
 /// Interrupts the guest when the host future is dropped before the worker
 /// reports.
-struct CancelOnDrop(Arc<AtomicBool>);
+pub(crate) struct CancelOnDrop(pub(crate) Arc<AtomicBool>);
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -550,6 +552,7 @@ pub(crate) async fn run_host(
             },
             request = requests.recv(), if requests_open => match request {
                 None => requests_open = false,
+                Some(Request::Idle) => {},
                 Some(Request::Rejected { ordinal, name, kind }) => state.record(CallRecord {
                     ordinal,
                     name,
@@ -628,6 +631,7 @@ pub(crate) async fn run_host(
     // record them so every started call has a record.
     while let Ok(request) = requests.try_recv() {
         match request {
+            Request::Idle => {}
             Request::Rejected {
                 ordinal,
                 name,
@@ -696,7 +700,7 @@ pub(crate) async fn run_host(
     report
 }
 
-fn status_of(result: &ToolResult) -> (CallStatus, Option<ToolErrorKind>) {
+pub(crate) fn status_of(result: &ToolResult) -> (CallStatus, Option<ToolErrorKind>) {
     if result.is_success() {
         (CallStatus::Succeeded, None)
     } else if let Some(error) = result.refusal() {

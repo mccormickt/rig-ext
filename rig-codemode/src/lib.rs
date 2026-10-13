@@ -145,6 +145,8 @@ pub mod limits;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod policy;
+#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
+pub mod replay;
 pub mod report;
 #[cfg_attr(not(feature = "quickjs"), allow(dead_code))]
 mod runtime;

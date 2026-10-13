@@ -454,6 +454,17 @@ impl<'js> Session<'js, '_> {
 
         ctx.globals().set("__host", host)?;
         ctx.eval::<(), _>(PRELUDE)?;
+        ctx.eval::<(), _>(
+            r#"
+                delete globalThis.Date;
+                delete globalThis.WeakRef;
+                delete globalThis.FinalizationRegistry;
+                Object.defineProperty(Math, "random", {
+                    value: () => { throw new Error("Math.random is unavailable in code mode"); },
+                    writable: false, configurable: false
+                });
+            "#,
+        )?;
         Ok(())
     }
 
@@ -495,6 +506,9 @@ impl<'js> Session<'js, '_> {
             }
             if self.state.borrow().pending.is_empty() {
                 return Stop::Stalled;
+            }
+            if self.requests.try_send(Request::Idle).is_err() {
+                return Stop::Cancelled;
             }
             let remaining = self
                 .config

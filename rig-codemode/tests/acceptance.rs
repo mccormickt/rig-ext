@@ -910,18 +910,25 @@ async fn sessions_share_nothing() {
 }
 
 #[tokio::test]
-async fn guest_has_no_io_or_module_access() {
+async fn guest_has_no_io_modules_or_nondeterministic_apis() {
     let f = fixture();
     let report = run(
         &f.codemode,
         r#"
         const names = ["fetch", "require", "process", "setTimeout", "setInterval", "std", "os",
-                       "Deno", "XMLHttpRequest", "WebSocket", "Worker", "__host"];
+                       "Deno", "XMLHttpRequest", "WebSocket", "Worker", "__host",
+                       "Date", "WeakRef", "FinalizationRegistry"];
         const types = Object.fromEntries(names.map(n => [n, typeof globalThis[n]]));
         let dynamicImport;
         try { await import("os"); dynamicImport = "loaded"; } catch (e) { dynamicImport = e.constructor.name; }
+        let randomBlocked = false;
+        try { Math.random(); } catch (_) { randomBlocked = true; }
+        try { Math.random = () => 0.5; } catch (_) {}
+        let randomStillBlocked = false;
+        try { Math.random(); } catch (_) { randomStillBlocked = true; }
         const indirect = new Function("return this")();
-        return { types, dynamicImport, sameGlobal: indirect === globalThis, hostOnIndirect: typeof indirect.__host };
+        return { types, dynamicImport, randomBlocked, randomStillBlocked,
+                 sameGlobal: indirect === globalThis, hostOnIndirect: typeof indirect.__host };
         "#,
     )
     .await;
@@ -931,6 +938,8 @@ async fn guest_has_no_io_or_module_access() {
         assert_eq!(kind, "undefined", "{name} is reachable");
     }
     assert_ne!(r["dynamicImport"], "loaded");
+    assert_eq!(r["randomBlocked"], true);
+    assert_eq!(r["randomStillBlocked"], true);
     assert_eq!(r["sameGlobal"], true);
     assert_eq!(r["hostOnIndirect"], "undefined");
 }
@@ -1320,4 +1329,403 @@ async fn async_script_policy_can_await_an_approval() {
         .await
         .unwrap_err();
     assert!(matches!(error, rig_codemode::ExecutionError::Refused(_)));
+}
+
+#[tokio::test]
+async fn replay_fans_out_then_branches_on_recorded_answers() {
+    use rig_codemode::replay::{ScriptStep, SettledCall, step};
+    let catalog = Catalog::new([CatalogEntry::new("agent", "Delegate", schema())]).unwrap();
+    let code = r#"
+        const answers = await Promise.all([tools.agent({prompt: "facts"}), tools.agent({prompt: "risks"})]);
+        const review = answers[1] === "review"
+            ? await tools.agent({prompt: answers[0] + ":" + answers[1]}) : "skip";
+        text(review); return review;
+    "#;
+    let ScriptStep::Calls(calls) = step(code, &catalog, Limits::default(), &[], &[])
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        calls.iter().map(|c| &c.arguments).collect::<Vec<_>>(),
+        [&json!({"prompt":"facts"}), &json!({"prompt":"risks"})]
+    );
+    for risk in ["review", "safe"] {
+        let history: Vec<_> = calls
+            .iter()
+            .cloned()
+            .zip(["staged rollout", risk])
+            .map(|(call, answer)| SettledCall {
+                call,
+                result: ToolResult::success(ToolOutput::text(answer)),
+            })
+            .collect();
+        let mut history: Vec<SettledCall> =
+            serde_json::from_value(serde_json::to_value(history).unwrap()).unwrap();
+        let next = step(code, &catalog, Limits::default(), &calls, &history)
+            .await
+            .unwrap();
+        if risk == "review" {
+            let ScriptStep::Calls(next) = next else {
+                panic!()
+            };
+            assert_eq!(next.len(), 1);
+            assert_eq!(next[0].ordinal, 2);
+            assert_eq!(next[0].arguments, json!({"prompt":"staged rollout:review"}));
+            history.push(SettledCall {
+                call: next[0].clone(),
+                result: ToolResult::success(ToolOutput::text("approved")),
+            });
+        } else {
+            assert!(matches!(next, ScriptStep::Done(_)));
+        }
+        let admitted: Vec<_> = history.iter().map(|item| item.call.clone()).collect();
+        let ScriptStep::Done(report) = step(code, &catalog, Limits::default(), &admitted, &history)
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(report.is_completed());
+        assert_eq!(
+            report.returned,
+            Some(json!(if risk == "review" { "approved" } else { "skip" }))
+        );
+        assert_eq!(report.calls.len(), if risk == "review" { 3 } else { 2 });
+    }
+}
+
+#[tokio::test]
+async fn replay_refuses_divergence_before_admitting_new_calls() {
+    use rig_codemode::replay::{ReplayError, ScriptCall, SettledCall, step};
+    let catalog = Catalog::new([CatalogEntry::new("agent", "Delegate", schema())]).unwrap();
+    let history = [SettledCall {
+        call: ScriptCall {
+            ordinal: 0,
+            name: "agent".into(),
+            arguments: json!({"prompt":"original"}),
+            raw: false,
+        },
+        result: ToolResult::success(ToolOutput::text("answer")),
+    }];
+    for code in [
+        "await tools.agent({prompt:'changed'}); await tools.agent({prompt:'new'});",
+        "await tools.agent.raw({prompt:'original'});",
+        "return 1;",
+        "await tools.missing({});",
+    ] {
+        assert!(
+            matches!(
+                step(
+                    code,
+                    &catalog,
+                    Limits::default(),
+                    &[history[0].call.clone()],
+                    &history
+                )
+                .await,
+                Err(ReplayError::Diverged)
+            ),
+            "{code}"
+        );
+    }
+    assert!(matches!(
+        step(
+            "tools.agent({}); return 1;",
+            &catalog,
+            Limits::default(),
+            &[],
+            &[]
+        )
+        .await,
+        Err(ReplayError::UnawaitedCall)
+    ));
+}
+
+#[tokio::test]
+async fn replay_preserves_errors_and_validates_arguments_without_io() {
+    use rig_codemode::replay::{ScriptStep, SettledCall, step};
+    let catalog = Catalog::new([CatalogEntry::new(
+        "agent",
+        "Delegate",
+        json!({
+            "type":"object", "properties":{"prompt":{"type":"string"}}, "required":["prompt"]
+        }),
+    )])
+    .unwrap();
+    let code = r#"
+        const good = tools.agent({prompt: "valid"});
+        const bad = tools.agent({prompt: 12}).catch(e => e.kind);
+        return await Promise.all([good, bad]);
+    "#;
+    let ScriptStep::Calls(calls) = step(code, &catalog, Limits::default(), &[], &[])
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].arguments, json!({"prompt":"valid"}));
+    let history = [SettledCall {
+        call: calls[0].clone(),
+        result: ToolResult::success(ToolOutput::text("ok")),
+    }];
+    let ScriptStep::Done(report) = step(code, &catalog, Limits::default(), &calls, &history)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(report.returned, Some(json!(["ok", "invalid_args"])));
+    for code in ["return Date.now();", "return Math.random();"] {
+        let ScriptStep::Done(report) = step(code, &catalog, Limits::default(), &[], &[])
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(report.status, ExecutionStatus::ScriptError);
+    }
+    let code =
+        "try { await tools.agent({prompt:'valid'}); } catch(e) { return [e.kind, e.message]; }";
+    let ScriptStep::Calls(calls) = step(code, &catalog, Limits::default(), &[], &[])
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let history = [SettledCall {
+        call: calls[0].clone(),
+        result: ToolResult::failed(
+            ToolExecutionError::refused("private detail").with_model_feedback("denied"),
+        ),
+    }];
+    let ScriptStep::Done(report) = step(code, &catalog, Limits::default(), &calls, &history)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        report.returned,
+        Some(json!(["permission_denied", "denied"]))
+    );
+}
+
+#[tokio::test]
+async fn replay_race_delivers_fast_later_call_and_discards_loser() {
+    use rig_codemode::replay::{ScriptStep, SettledCall, step};
+    let catalog = Catalog::new([CatalogEntry::new("agent", "Delegate", schema())]).unwrap();
+    let code =
+        "return await Promise.race([tools.agent({prompt:'slow'}), tools.agent({prompt:'fast'})]);";
+    let ScriptStep::Calls(calls) = step(code, &catalog, Limits::default(), &[], &[])
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let mut history = vec![SettledCall {
+        call: calls[1].clone(),
+        result: ToolResult::success(ToolOutput::text("fast answer")),
+    }];
+    let ScriptStep::Done(report) = step(code, &catalog, Limits::default(), &calls, &history)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(report.returned, Some(json!("fast answer")));
+    assert_eq!(report.calls[0].status, CallStatus::NotStarted);
+    assert_eq!(report.calls[0].delivery, ScriptDelivery::None);
+    history.push(SettledCall {
+        call: calls[0].clone(),
+        result: ToolResult::success(ToolOutput::text("slow answer")),
+    });
+    let ScriptStep::Done(report) = step(code, &catalog, Limits::default(), &calls, &history)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(report.returned, Some(json!("fast answer")));
+    assert_eq!(report.calls[0].status, CallStatus::Succeeded);
+    assert_eq!(report.calls[0].delivery, ScriptDelivery::Discarded);
+    assert_eq!(report.calls[1].delivery, ScriptDelivery::Delivered);
+}
+
+#[tokio::test]
+async fn replay_sparse_history_starts_followup_and_preserves_all_input_order() {
+    use rig_codemode::replay::{ScriptStep, SettledCall, step};
+    let catalog = Catalog::new([CatalogEntry::new("agent", "Delegate", schema())]).unwrap();
+    let code = r#"
+        const slow = tools.agent({prompt:'slow'});
+        const fast = tools.agent({prompt:'fast'});
+        const follow = Promise.race([slow, fast]).then(answer => tools.agent({prompt:answer}));
+        return await Promise.all([slow, fast, follow]);
+    "#;
+    let ScriptStep::Calls(mut admitted) = step(code, &catalog, Limits::default(), &[], &[])
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let history = vec![SettledCall {
+        call: admitted[1].clone(),
+        result: ToolResult::success(ToolOutput::text("fast answer")),
+    }];
+    let mut history: Vec<SettledCall> =
+        serde_json::from_str(&serde_json::to_string(&history).unwrap()).unwrap();
+    let ScriptStep::Calls(pending) = step(code, &catalog, Limits::default(), &admitted, &history)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0], admitted[0]);
+    assert_eq!(pending[1].ordinal, 2);
+    assert_eq!(pending[1].arguments, json!({"prompt":"fast answer"}));
+    admitted.push(pending[1].clone());
+    history.push(SettledCall {
+        call: admitted[2].clone(),
+        result: ToolResult::success(ToolOutput::text("follow answer")),
+    });
+    let ScriptStep::Calls(pending) = step(code, &catalog, Limits::default(), &admitted, &history)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(pending, vec![admitted[0].clone()]);
+    history.push(SettledCall {
+        call: admitted[0].clone(),
+        result: ToolResult::success(ToolOutput::text("slow answer")),
+    });
+    let ScriptStep::Done(report) = step(code, &catalog, Limits::default(), &admitted, &history)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        report.returned,
+        Some(json!(["slow answer", "fast answer", "follow answer"]))
+    );
+    assert!(
+        report
+            .calls
+            .iter()
+            .all(|call| call.delivery == ScriptDelivery::Delivered)
+    );
+}
+
+#[tokio::test]
+async fn replay_rejects_lost_changed_duplicate_and_unissued_admissions() {
+    use rig_codemode::replay::{ReplayError, ScriptStep, SettledCall, step};
+    let catalog = Catalog::new([CatalogEntry::new("agent", "Delegate", schema())]).unwrap();
+    let code = "await Promise.all([tools.agent({prompt:'slow'}), tools.agent({prompt:'fast'})]); await tools.agent({prompt:'new'});";
+    let ScriptStep::Calls(calls) = step(code, &catalog, Limits::default(), &[], &[])
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let history = vec![SettledCall {
+        call: calls[1].clone(),
+        result: ToolResult::success(ToolOutput::text("fast answer")),
+    }];
+    let mut changed = calls.clone();
+    changed[0].arguments = json!({"prompt":"changed"});
+    for admitted in [
+        vec![],
+        vec![calls[1].clone()],
+        vec![calls[0].clone()],
+        changed,
+        vec![calls[0].clone(), calls[0].clone(), calls[1].clone()],
+    ] {
+        assert!(matches!(
+            step(code, &catalog, Limits::default(), &admitted, &history).await,
+            Err(ReplayError::Diverged)
+        ));
+    }
+    assert!(matches!(
+        step(
+            code,
+            &catalog,
+            Limits::default(),
+            &calls,
+            &[history[0].clone(), history[0].clone()]
+        )
+        .await,
+        Err(ReplayError::Diverged)
+    ));
+    for code in ["return 1;", "return await tools.agent({prompt:'slow'});"] {
+        assert!(matches!(
+            step(code, &catalog, Limits::default(), &calls, &history).await,
+            Err(ReplayError::Diverged)
+        ));
+    }
+    assert!(matches!(
+        step("return 1;", &catalog, Limits::default(), &calls, &[]).await,
+        Err(ReplayError::Diverged)
+    ));
+}
+
+#[tokio::test]
+async fn replay_local_schema_error_precedes_recorded_race_result() {
+    use rig_codemode::replay::{ScriptCall, ScriptStep, SettledCall, step};
+    let catalog = Catalog::new([CatalogEntry::new(
+        "agent",
+        "Delegate",
+        json!({"type":"object", "properties":{"prompt":{"type":"string"}}, "required":["prompt"]}),
+    )])
+    .unwrap();
+    let code = r#"
+        const good = tools.agent({prompt:'valid'});
+        const bad = tools.agent({prompt:12}).catch(error => error.kind);
+        return await Promise.race([good, bad]);
+    "#;
+    let admitted = [ScriptCall {
+        ordinal: 0,
+        name: "agent".into(),
+        arguments: json!({"prompt":"valid"}),
+        raw: false,
+    }];
+    let ScriptStep::Calls(calls) = step(code, &catalog, Limits::default(), &[], &[])
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(calls, admitted);
+    let history = [SettledCall {
+        call: admitted[0].clone(),
+        result: ToolResult::success(ToolOutput::text("recorded answer")),
+    }];
+    let ScriptStep::Done(report) = step(code, &catalog, Limits::default(), &admitted, &history)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(report.returned, Some(json!("invalid_args")));
+    assert_eq!(report.calls[0].delivery, ScriptDelivery::Discarded);
+    assert_eq!(report.calls[1].delivery, ScriptDelivery::Delivered);
+    assert_eq!(report.calls[1].status, CallStatus::Failed);
+    let code = r#"
+        return await Promise.race([
+            tools.agent({prompt:12}).catch(error => error.kind),
+            tools.agent({prompt:13}).catch(error => error.kind)
+        ]);
+    "#;
+    let ScriptStep::Done(report) = step(code, &catalog, Limits::default(), &[], &[])
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(report.returned, Some(json!("invalid_args")));
+    assert_eq!(report.calls.len(), 2);
+    assert_eq!(report.calls[1].delivery, ScriptDelivery::Discarded);
 }
