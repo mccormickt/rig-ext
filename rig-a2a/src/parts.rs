@@ -1,13 +1,45 @@
-//! Shared helpers for projecting A2A payloads into Rig text.
+//! Shared helpers for projecting A2A payloads into Rig text and images.
 //!
-//! [`A2AModel`](crate::model::A2AModel) collapses agent responses into a single
-//! string, so non-text parts (Data, Url) are stringified into the joined buffer
-//! with a separator. Binary `Raw` parts are skipped with a debug log because
-//! they are not routable to text-only Rig agents.
+//! Text, JSON data, and non-image URLs form the response text. Supported image
+//! parts become canonical Rig images. Other binary parts remain in raw replies.
 
 use a2a::{Artifact, Message, Part, PartContent, Task, TaskState};
 
 use crate::error::A2AError;
+
+/// Images that Rig can represent as canonical assistant content.
+pub(crate) fn image(part: &Part) -> Option<rig_core::message::Image> {
+    use base64::Engine;
+    use rig_core::message::{DocumentSourceKind, Image, ImageMediaType, MimeType};
+    let media_type = ImageMediaType::from_mime_type(part.media_type.as_deref()?)?;
+    let data = match &part.content {
+        PartContent::Url(url) => DocumentSourceKind::Url(url.clone()),
+        PartContent::Raw(bytes) => {
+            DocumentSourceKind::Base64(base64::engine::general_purpose::STANDARD.encode(bytes))
+        }
+        _ => return None,
+    };
+    Some(Image {
+        data,
+        media_type: Some(media_type),
+        ..Image::default()
+    })
+}
+
+pub(crate) fn task_images(task: &Task) -> Vec<rig_core::message::Image> {
+    task.artifacts
+        .iter()
+        .flatten()
+        .flat_map(|artifact| &artifact.parts)
+        .chain(
+            task.status
+                .message
+                .iter()
+                .flat_map(|message| &message.parts),
+        )
+        .filter_map(image)
+        .collect()
+}
 
 /// Default maximum size for text projected from A2A parts.
 pub(crate) const DEFAULT_TEXT_LIMIT: usize = 1024 * 1024;
@@ -17,8 +49,8 @@ pub(crate) const DEFAULT_TEXT_LIMIT: usize = 1024 * 1024;
 /// Each part contributes its content:
 /// - `Text` writes its content verbatim.
 /// - `Data` writes its JSON serialisation.
-/// - `Url` writes the URL.
-/// - `Raw` is skipped (binary payloads aren't routable to a text agent).
+/// - Non-image `Url` writes the URL.
+/// - Images and `Raw` are skipped here; images are emitted separately.
 ///
 /// A single `\n` is inserted between non-adjacent text chunks. Adjacent
 /// `Text` chunks concatenate without a separator (callers commonly split
@@ -56,6 +88,16 @@ fn parts_to_text_inner(
     let mut out = String::new();
     let mut prev_kind: Option<Kind> = None;
     for part in parts {
+        use rig_core::message::{ImageMediaType, MimeType};
+        if matches!(part.content, PartContent::Raw(_) | PartContent::Url(_))
+            && part
+                .media_type
+                .as_deref()
+                .and_then(ImageMediaType::from_mime_type)
+                .is_some()
+        {
+            continue;
+        }
         let (kind, chunk): (Kind, std::borrow::Cow<'_, str>) = match &part.content {
             PartContent::Text(text) => (Kind::Text, text.as_str().into()),
             PartContent::Data(value) => (Kind::Data, value.to_string().into()),

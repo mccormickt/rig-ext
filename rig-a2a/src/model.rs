@@ -34,6 +34,10 @@
 //! This adapter does not override that policy, and failed remote tasks still
 //! produce provider errors even when it is enabled.
 //!
+//! Streaming completions buffer replaceable artifacts and status snapshots until
+//! EOF. Use [`A2ARequest::stream`](crate::A2ARequest::stream) for live protocol
+//! events. An incomplete stream fails rather than reporting `Stop`.
+//!
 //! # Conversation threading
 //!
 //! Three ways to thread, in increasing precedence:
@@ -383,22 +387,6 @@ impl A2AModel {
             conversation,
         })
     }
-
-    /// Record the identifiers a response carried against the conversation this
-    /// request threaded into, if any.
-    fn record(&self, conversation: Option<&ConversationId>, info: &A2AThreadInfo) {
-        if let Some(conversation) = conversation {
-            self.threads.record(conversation, info);
-        }
-    }
-
-    /// Record the standing context a delivered request carried, so later turns
-    /// in the same conversation do not repeat it.
-    fn record_sent_context(&self, conversation: Option<&ConversationId>, fingerprints: &[u64]) {
-        if let Some(conversation) = conversation {
-            self.threads.record_sent_context(conversation, fingerprints);
-        }
-    }
 }
 
 /// An outbound request together with the standing context it carries.
@@ -525,8 +513,8 @@ pub struct A2APayload {
 
 #[doc(hidden)]
 pub enum A2AFrame {
-    Unary(SendMessageResponse, Option<ConversationId>, Vec<u64>),
-    Stream(a2a::StreamResponse, Option<ConversationId>),
+    Unary(SendMessageResponse),
+    Stream(a2a::StreamResponse),
 }
 
 /// The remote reply as received: a unary response or an ordered array of events.
@@ -572,11 +560,18 @@ impl rig_core::driver::Transport<A2AModel> for A2ATransport {
                         .send_message(&payload.outbound.request)
                         .await
                         .map_err(|e| ProviderError::from(A2AError::Protocol(e)))?;
-                    let frame = A2AFrame::Unary(
-                        response,
-                        conversation,
-                        payload.outbound.context_fingerprints,
-                    );
+                    // The remote state is authoritative even when its content
+                    // cannot be retained or projected as a completion.
+                    if let Some(conversation) = &conversation {
+                        payload
+                            .threads
+                            .record(conversation, &A2AThreadInfo::from_response(&response));
+                        payload.threads.record_sent_context(
+                            conversation,
+                            &payload.outbound.context_fingerprints,
+                        );
+                    }
+                    let frame = A2AFrame::Unary(response);
                     Ok(Opened::new(futures::stream::once(async { Ok(frame) })))
                 }
                 Mode::Streaming => {
@@ -585,18 +580,47 @@ impl rig_core::driver::Transport<A2AModel> for A2ATransport {
                         .send_streaming_message(&payload.outbound.request)
                         .await
                         .map_err(|e| ProviderError::from(A2AError::Protocol(e)))?;
-                    // The remote accepted the request, so it holds the
-                    // standing context this request carried.
-                    if let Some(conversation) = &conversation {
-                        payload.threads.record_sent_context(
-                            conversation,
-                            &payload.outbound.context_fingerprints,
-                        );
-                    }
+                    let mut last: Option<A2AThreadInfo> = None;
+                    let mut message_reply = false;
                     Ok(Opened::new(upstream.map(move |event| {
-                        event
-                            .map(|event| A2AFrame::Stream(event, conversation.clone()))
-                            .map_err(|e| ProviderError::from(A2AError::Protocol(e)))
+                        let event =
+                            event.map_err(|e| ProviderError::from(A2AError::Protocol(e)))?;
+                        if message_reply
+                            || (matches!(event, a2a::StreamResponse::Message(_)) && last.is_some())
+                        {
+                            return Err(ProviderError::Response(
+                                "A2A stream mixes a message reply with other events".into(),
+                            ));
+                        }
+                        let info = stream_info(&event, last.as_ref());
+                        if let Some(last) = &last {
+                            for (previous, current) in [
+                                (&last.task_id, &info.task_id),
+                                (&last.context_id, &info.context_id),
+                            ] {
+                                if let (Some(previous), Some(current)) = (previous, current)
+                                    && previous != current
+                                {
+                                    return Err(ProviderError::Response(
+                                        "A2A stream changed task or context identity".into(),
+                                    ));
+                                }
+                            }
+                        }
+                        // Validate identity before updating the conversation,
+                        // then commit state before enforcing content limits.
+                        if let Some(conversation) = &conversation {
+                            payload.threads.record(conversation, &info);
+                            if last.is_none() {
+                                payload.threads.record_sent_context(
+                                    conversation,
+                                    &payload.outbound.context_fingerprints,
+                                );
+                            }
+                        }
+                        message_reply = matches!(event, a2a::StreamResponse::Message(_));
+                        last = Some(info);
+                        Ok(A2AFrame::Stream(event))
                     })))
                 }
             }
@@ -630,6 +654,9 @@ impl Wire for A2AModel {
             model: self.clone(),
             last: None,
             unary: false,
+            artifacts: indexmap::IndexMap::new(),
+            status_message: None,
+            message: None,
             brand: std::marker::PhantomData,
         }
     }
@@ -743,13 +770,51 @@ pub struct A2ADecoder<'id> {
     model: A2AModel,
     last: Option<A2AThreadInfo>,
     unary: bool,
+    artifacts: indexmap::IndexMap<String, a2a::Artifact>,
+    status_message: Option<A2AMessage>,
+    message: Option<A2AMessage>,
     brand: std::marker::PhantomData<&'id ()>,
 }
 
 impl<'id> A2ADecoder<'id> {
-    fn emit(&mut self, text: String, out: &mut Out<'id, Completion>) -> Result<(), ProviderError> {
-        out.run(Block::Text, &text)?;
-        Ok(())
+    fn emit_response(
+        &mut self,
+        response: &SendMessageResponse,
+        mut out: Out<'id, Completion>,
+    ) -> Result<Flow, ProviderError> {
+        let (text, images, id) = match response {
+            SendMessageResponse::Task(task) => {
+                if let Some(error) = task_failure(response) {
+                    return Err(error);
+                }
+                let images = crate::parts::task_images(task);
+                let text = task_text(
+                    &task.status.state,
+                    task_body_limited(task, DEFAULT_TEXT_LIMIT)?,
+                    !images.is_empty(),
+                )?;
+                (text, images, None)
+            }
+            SendMessageResponse::Message(message) => {
+                let text = message_body_limited(message, DEFAULT_TEXT_LIMIT)?;
+                let images: Vec<_> = message
+                    .parts
+                    .iter()
+                    .filter_map(crate::parts::image)
+                    .collect();
+                if text.is_empty() && images.is_empty() {
+                    return Err(ProviderError::Response("remote A2A message carries no text or supported image; use the direct API for other binary output".into()));
+                }
+                (text, images, Some(message.message_id.clone()))
+            }
+        };
+        if !text.is_empty() || images.is_empty() {
+            out.run(Block::Text, &text)?;
+        }
+        for image in images {
+            out.run(Block::Image(image), "")?;
+        }
+        Ok(self.finish(out, id))
     }
     fn finish(&mut self, out: Out<'id, Completion>, message_id: Option<String>) -> Flow {
         out.end(Finish {
@@ -774,53 +839,17 @@ impl<'id> Decoder<'id, Completion, A2AFrame> for A2ADecoder<'id> {
     fn decode(
         &mut self,
         event: A2AFrame,
-        mut out: Out<'id, Completion>,
+        out: Out<'id, Completion>,
     ) -> Result<Flow, ProviderError> {
         match event {
-            A2AFrame::Unary(response, conversation, fingerprints) => {
+            A2AFrame::Unary(response) => {
                 self.unary = true;
-                let info = A2AThreadInfo::from_response(&response);
-                self.model.record(conversation.as_ref(), &info);
-                self.model
-                    .record_sent_context(conversation.as_ref(), &fingerprints);
-                self.last = Some(info);
-                let (text, id) = match &response {
-                    SendMessageResponse::Task(task) => {
-                        if let Some(error) = task_failure(&response) {
-                            return Err(error);
-                        }
-                        (
-                            task_text(
-                                &task.status.state,
-                                task_body_limited(task, DEFAULT_TEXT_LIMIT)?,
-                            )?,
-                            None,
-                        )
-                    }
-                    SendMessageResponse::Message(message) => {
-                        let body = message_body_limited(message, DEFAULT_TEXT_LIMIT)?;
-                        if body.is_empty() {
-                            return Err(ProviderError::Response(
-                                "remote A2A agent replied with a message carrying no text".into(),
-                            ));
-                        }
-                        (body, Some(message.message_id.clone()))
-                    }
-                };
-                self.emit(text, &mut out)?;
-                Ok(self.finish(out, id))
+                self.last = Some(A2AThreadInfo::from_response(&response));
+                self.emit_response(&response, out)
             }
-            A2AFrame::Stream(event, conversation) => {
-                // Record the remote's identifiers before the event can fail,
-                // so a failed or oversized event still updates the
-                // conversation.
-                let info = stream_info(&event, self.last.as_ref());
-                self.model.record(conversation.as_ref(), &info);
-                self.last = Some(info);
-                let text = stream_text(event)?;
-                if !text.is_empty() {
-                    self.emit(text, &mut out)?;
-                }
+            A2AFrame::Stream(event) => {
+                self.last = Some(stream_info(&event, self.last.as_ref()));
+                self.accumulate(event)?;
                 Ok(Flow::More)
             }
         }
@@ -829,7 +858,32 @@ impl<'id> Decoder<'id, Completion, A2AFrame> for A2ADecoder<'id> {
         if self.unary {
             return Err(ProviderError::Truncated);
         }
-        Ok(self.finish(out, None))
+        let response = if let Some(message) = self.message.take() {
+            SendMessageResponse::Message(message)
+        } else {
+            let Some(info) = &self.last else {
+                return Err(ProviderError::Truncated);
+            };
+            let Some(state @ (a2a::TaskState::Completed | a2a::TaskState::InputRequired)) =
+                &info.state
+            else {
+                return Err(ProviderError::Truncated);
+            };
+            let task = a2a::Task {
+                id: info.task_id.clone().unwrap_or_default(),
+                context_id: info.context_id.clone().unwrap_or_default(),
+                status: a2a::TaskStatus {
+                    state: state.clone(),
+                    message: self.status_message.take(),
+                    timestamp: None,
+                },
+                artifacts: Some(std::mem::take(&mut self.artifacts).into_values().collect()),
+                history: None,
+                metadata: None,
+            };
+            SendMessageResponse::Task(task)
+        };
+        self.emit_response(&response, out)
     }
 }
 
@@ -861,48 +915,58 @@ fn stream_info(event: &a2a::StreamResponse, last: Option<&A2AThreadInfo>) -> A2A
     }
 }
 
-/// The text an A2A stream event carries.
-///
-/// Text arrives as artifact deltas and status messages; the terminal record is
-/// emitted when the upstream stream ends, carrying the finish reason implied by
-/// the last observed task state. A failure state ends the stream with an error
-/// rather than a terminal record, matching the non-streaming surface.
-fn stream_text(event: a2a::StreamResponse) -> Result<String, ProviderError> {
-    match event {
-        a2a::StreamResponse::Task(task) => {
-            if let Some(error) = failure_for(&task.status.state, || {
-                status_text_limited(&task, DEFAULT_TEXT_LIMIT)
-            }) {
-                return Err(error);
+impl A2ADecoder<'_> {
+    /// A2A artifacts can be replaced, while Rig text deltas cannot. Buffer the
+    /// current task projection until EOF; raw events remain available separately.
+    fn accumulate(&mut self, event: a2a::StreamResponse) -> Result<(), ProviderError> {
+        match event {
+            a2a::StreamResponse::Task(task) => {
+                if let Some(error) = failure_for(&task.status.state, || {
+                    status_text_limited(&task, DEFAULT_TEXT_LIMIT)
+                }) {
+                    return Err(error);
+                }
+                self.status_message = task.status.message;
+                self.artifacts = task
+                    .artifacts
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|artifact| (artifact.artifact_id.clone(), artifact))
+                    .collect();
             }
-            Ok(task_body_limited(&task, DEFAULT_TEXT_LIMIT)?)
-        }
-        a2a::StreamResponse::Message(message) => {
-            Ok(message_body_limited(&message, DEFAULT_TEXT_LIMIT)?)
-        }
-        a2a::StreamResponse::StatusUpdate(update) => {
-            // A status update's message is where many A2A agents put their
-            // answer, so it both explains a failure and streams as text.
-            let text = update.status.message.as_ref().map_or_else(
-                || Ok(String::new()),
-                |m| {
-                    crate::parts::parts_to_text_limited(
-                        &m.parts,
-                        DEFAULT_TEXT_LIMIT,
-                        "stream status",
-                    )
-                },
-            )?;
-            if let Some(error) = failure_for(&update.status.state, || Ok(text.clone())) {
-                return Err(error);
+            a2a::StreamResponse::Message(message) => self.message = Some(message),
+            a2a::StreamResponse::StatusUpdate(update) => {
+                if let Some(error) = failure_for(&update.status.state, || {
+                    update
+                        .status
+                        .message
+                        .as_ref()
+                        .map(|message| message_body_limited(message, DEFAULT_TEXT_LIMIT))
+                        .transpose()
+                        .map(Option::unwrap_or_default)
+                }) {
+                    return Err(error);
+                }
+                self.status_message = update.status.message;
             }
-            Ok(text)
+            a2a::StreamResponse::ArtifactUpdate(update) => {
+                if update.append == Some(true) {
+                    let artifact = self
+                        .artifacts
+                        .get_mut(&update.artifact.artifact_id)
+                        .ok_or_else(|| {
+                            ProviderError::Response(
+                                "A2A append references an unknown artifact".into(),
+                            )
+                        })?;
+                    artifact.parts.extend(update.artifact.parts);
+                } else {
+                    self.artifacts
+                        .insert(update.artifact.artifact_id.clone(), update.artifact);
+                }
+            }
         }
-        a2a::StreamResponse::ArtifactUpdate(update) => Ok(crate::parts::parts_to_text_limited(
-            &update.artifact.parts,
-            DEFAULT_TEXT_LIMIT,
-            "stream artifact",
-        )?),
+        Ok(())
     }
 }
 
@@ -1078,8 +1142,21 @@ fn media_part(
 /// Any other state answering with nothing has neither produced a result nor
 /// finished, so the caller has nothing to act on and is told so.
 ///
-fn task_text(state: &a2a::TaskState, body: String) -> Result<String, ProviderError> {
-    if !body.is_empty() {
+fn task_text(
+    state: &a2a::TaskState,
+    body: String,
+    has_images: bool,
+) -> Result<String, ProviderError> {
+    if !matches!(
+        state,
+        a2a::TaskState::Completed | a2a::TaskState::InputRequired
+    ) {
+        return Err(ProviderError::Response(format!(
+            "remote A2A task is {}; use the direct client API to follow unfinished tasks",
+            state_label(state)
+        )));
+    }
+    if !body.is_empty() || has_images {
         return Ok(body);
     }
     if matches!(state, a2a::TaskState::Completed) {

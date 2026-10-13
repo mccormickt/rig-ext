@@ -1202,7 +1202,7 @@ async fn model_stream_yields_status_message_text() {
             text.push_str(&delta);
         }
     }
-    assert_eq!(text, "partial answer final answer");
+    assert_eq!(text, "final answer");
 
     // The unary surface already projected this text; the two must agree.
     let response = remote
@@ -1295,6 +1295,159 @@ async fn serve_wire_script(
         recorded,
         server,
     )
+}
+
+fn artifact_event(id: &str, text: &str, append: Option<bool>) -> StreamResponse {
+    StreamResponse::ArtifactUpdate(a2a::TaskArtifactUpdateEvent {
+        task_id: "task-1".into(),
+        context_id: "ctx-1".into(),
+        artifact: Artifact {
+            artifact_id: id.into(),
+            name: None,
+            description: None,
+            parts: vec![Part::text(text)],
+            metadata: None,
+            extensions: None,
+        },
+        append,
+        last_chunk: Some(true),
+        metadata: None,
+    })
+}
+
+#[tokio::test]
+async fn streaming_reduces_replacements_appends_and_snapshots_without_duplicate_text() {
+    for binding in [StubBinding::JsonRpc, StubBinding::Rest] {
+        for snapshot in [false, true] {
+            let mut events = vec![
+                StreamResponse::StatusUpdate(status_update(
+                    "task-1",
+                    "ctx-1",
+                    TaskState::Working,
+                    Some("progress is not the answer"),
+                )),
+                artifact_event("a", "obsolete", None),
+                artifact_event("b", "second", None),
+                artifact_event("a", "replaced", Some(false)),
+                artifact_event("a", " + appended", Some(true)),
+                StreamResponse::StatusUpdate(status_update(
+                    "task-1",
+                    "ctx-1",
+                    TaskState::Completed,
+                    Some("done"),
+                )),
+            ];
+            if snapshot {
+                events.push(StreamResponse::Task(Task {
+                    id: "task-1".into(),
+                    context_id: "ctx-1".into(),
+                    status: TaskStatus {
+                        state: TaskState::Completed,
+                        message: Some(Message::new(Role::Agent, vec![Part::text("done")])),
+                        timestamp: None,
+                    },
+                    artifacts: Some(
+                        [("a", "replaced + appended"), ("b", "second")]
+                            .into_iter()
+                            .map(|(id, text)| {
+                                let StreamResponse::ArtifactUpdate(event) =
+                                    artifact_event(id, text, None)
+                                else {
+                                    unreachable!()
+                                };
+                                event.artifact
+                            })
+                            .collect(),
+                    ),
+                    history: None,
+                    metadata: None,
+                }));
+            }
+            let (client, _, server) = serve_wire(binding, events.clone(), true).await;
+            let response = client
+                .model()
+                .stream(text_request("go"))
+                .unwrap()
+                .finish()
+                .await
+                .unwrap();
+            assert_eq!(response.text(), "replaced + appended\nsecond\ndone");
+            let rig_a2a::A2AReply::Events(raw) =
+                response.extras::<rig_a2a::A2A>().unwrap().unwrap()
+            else {
+                panic!("expected events")
+            };
+            assert_eq!(raw.len(), events.len());
+            assert_eq!(raw.first(), events.first());
+            assert_eq!(raw.last(), events.last());
+            let StreamResponse::ArtifactUpdate(replacement) = &raw[3] else {
+                panic!("expected replacement")
+            };
+            assert!(!replacement.append.unwrap_or(false));
+            assert_eq!(replacement.artifact.parts, vec![Part::text("replaced")]);
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn incomplete_and_invalid_streams_never_report_success() {
+    for binding in [StubBinding::JsonRpc, StubBinding::Rest] {
+        for events in [
+            vec![],
+            vec![StreamResponse::StatusUpdate(status_update(
+                "task-1",
+                "ctx-1",
+                TaskState::Working,
+                Some("not done"),
+            ))],
+            vec![artifact_event(
+                "a",
+                "lastChunk is not task completion",
+                None,
+            )],
+            vec![
+                artifact_event("missing", "orphan append", Some(true)),
+                StreamResponse::StatusUpdate(status_update(
+                    "task-1",
+                    "ctx-1",
+                    TaskState::Completed,
+                    None,
+                )),
+            ],
+            vec![
+                artifact_event("a", "wrong task", None),
+                StreamResponse::StatusUpdate(status_update(
+                    "task-2",
+                    "ctx-1",
+                    TaskState::Completed,
+                    None,
+                )),
+            ],
+            vec![
+                artifact_event("a", &"x".repeat(600_000), None),
+                artifact_event("a", &"y".repeat(600_000), Some(true)),
+                StreamResponse::StatusUpdate(status_update(
+                    "task-1",
+                    "ctx-1",
+                    TaskState::Completed,
+                    None,
+                )),
+            ],
+        ] {
+            let (client, _, server) = serve_wire(binding, events, true).await;
+            assert!(
+                client
+                    .model()
+                    .stream(text_request("go"))
+                    .unwrap()
+                    .finish()
+                    .await
+                    .is_err()
+            );
+            server.abort();
+        }
+    }
 }
 
 #[tokio::test]
@@ -1464,6 +1617,124 @@ async fn a_registered_remote_route_keeps_the_original_message_boundary() {
     }
     assert_eq!(recorded_texts(&recorded, 0), ["only this prompt"]);
     assert_eq!(recorded_texts(&recorded, 1), ["only this prompt"]);
+    server.abort();
+}
+
+#[tokio::test]
+async fn image_replies_are_canonical_rig_content_on_both_completion_surfaces() {
+    use rig_core::message::{AssistantContent, DocumentSourceKind};
+    for binding in [StubBinding::JsonRpc, StubBinding::Rest] {
+        for streaming in [false, true] {
+            let message = Message::new(
+                Role::Agent,
+                vec![
+                    Part {
+                        content: a2a::PartContent::Raw(vec![1, 2, 3]),
+                        media_type: Some("image/png".into()),
+                        filename: None,
+                        metadata: None,
+                    },
+                    Part {
+                        content: a2a::PartContent::Url("https://example.com/image.webp".into()),
+                        media_type: Some("image/webp".into()),
+                        filename: None,
+                        metadata: None,
+                    },
+                ],
+            );
+            let (client, _, server) =
+                serve_wire(binding, vec![StreamResponse::Message(message)], streaming).await;
+            let response = if streaming {
+                client
+                    .model()
+                    .stream(text_request("draw"))
+                    .unwrap()
+                    .finish()
+                    .await
+                    .unwrap()
+            } else {
+                client
+                    .model()
+                    .completion(text_request("draw"))
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(response.choice.len(), 2);
+            let AssistantContent::Image(first) = &response.choice[0] else {
+                panic!("expected image")
+            };
+            let AssistantContent::Image(second) = &response.choice[1] else {
+                panic!("expected image")
+            };
+            assert_eq!(first.data, DocumentSourceKind::Base64("AQID".into()));
+            assert_eq!(
+                second.data,
+                DocumentSourceKind::Url("https://example.com/image.webp".into())
+            );
+            assert_eq!(
+                first.media_type,
+                Some(rig_core::message::ImageMediaType::PNG)
+            );
+            assert_eq!(
+                second.media_type,
+                Some(rig_core::message::ImageMediaType::WEBP)
+            );
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn completion_refuses_background_work_but_direct_requests_preserve_it() {
+    let task = Task {
+        id: "task-1".into(),
+        context_id: "ctx-1".into(),
+        status: TaskStatus {
+            state: TaskState::Working,
+            message: Some(Message::new(Role::Agent, vec![Part::text("still working")])),
+            timestamp: None,
+        },
+        artifacts: None,
+        history: None,
+        metadata: None,
+    };
+    let (client, recorded, server) = serve_wire(
+        StubBinding::JsonRpc,
+        vec![StreamResponse::Task(task)],
+        false,
+    )
+    .await;
+    let options = rig_a2a::A2AOptions::default().configuration(a2a::SendMessageConfiguration {
+        accepted_output_modes: None,
+        history_length: None,
+        task_push_notification_config: None,
+        return_immediately: Some(true),
+    });
+    assert!(
+        client
+            .model()
+            .completion(text_request("go").provider_option(options.clone()))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("return_immediately")
+    );
+    assert!(recorded.lock().unwrap().is_empty());
+    assert!(
+        client
+            .model()
+            .completion(text_request("go"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("working")
+    );
+    let SendMessageResponse::Task(task) =
+        client.message("go").options(options).send().await.unwrap()
+    else {
+        panic!("expected task")
+    };
+    assert_eq!(task.status.state, TaskState::Working);
     server.abort();
 }
 
@@ -2358,6 +2629,227 @@ async fn oracle_later_hooks_control_the_sent_multipart_prompt() {
         let _ = server.await;
     }
 }
+
+#[tokio::test]
+async fn oracle_unary_and_stream_accept_the_same_media_and_escaped_text() {
+    for binding in [StubBinding::JsonRpc, StubBinding::Rest] {
+        for (mime, bytes, text) in [
+            ("image/png", 800_000, "image".to_owned()),
+            ("application/octet-stream", 800_000, "attachment".to_owned()),
+            ("application/octet-stream", 0, "\\".repeat(600_000)),
+        ] {
+            let parts = vec![
+                Part::text(&text),
+                Part {
+                    content: a2a::PartContent::Raw(vec![42; bytes]),
+                    media_type: Some(mime.into()),
+                    filename: None,
+                    metadata: None,
+                },
+            ];
+            for streaming in [false, true] {
+                let (client, _, server) = serve_wire(
+                    binding,
+                    vec![StreamResponse::Message(Message::new(
+                        Role::Agent,
+                        parts.clone(),
+                    ))],
+                    streaming,
+                )
+                .await;
+                let response = if streaming {
+                    client
+                        .model()
+                        .stream(text_request("go"))
+                        .unwrap()
+                        .finish()
+                        .await
+                        .unwrap()
+                } else {
+                    client.model().completion(text_request("go")).await.unwrap()
+                };
+                assert_eq!(response.text().len(), text.len());
+                assert!(response.text() == text);
+                assert_eq!(
+                    response.choice.len(),
+                    if mime == "image/png" { 2 } else { 1 }
+                );
+                println!(
+                    "payload accepted: stream={streaming}, mime={mime}, binary={bytes}, text={}",
+                    text.len()
+                );
+                server.abort();
+                let _ = server.await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn stream_identity_errors_do_not_replace_valid_conversation() {
+    for binding in [StubBinding::JsonRpc, StubBinding::Rest] {
+        for (invalid, expected) in [
+            (
+                StreamResponse::StatusUpdate(status_update(
+                    "wrong-task",
+                    "ctx-1",
+                    TaskState::Completed,
+                    None,
+                )),
+                "changed task or context identity",
+            ),
+            (
+                StreamResponse::StatusUpdate(status_update(
+                    "task-1",
+                    "wrong-context",
+                    TaskState::Completed,
+                    None,
+                )),
+                "changed task or context identity",
+            ),
+            (
+                StreamResponse::Message(Message::new(
+                    Role::Agent,
+                    vec![Part::text("wrong reply kind")],
+                )),
+                "mixes a message reply",
+            ),
+        ] {
+            let (client, recorded, server) = serve_wire_script(
+                binding,
+                vec![
+                    vec![
+                        StreamResponse::StatusUpdate(status_update(
+                            "task-1",
+                            "ctx-1",
+                            TaskState::InputRequired,
+                            Some("which file?"),
+                        )),
+                        invalid,
+                    ],
+                    vec![StreamResponse::StatusUpdate(status_update(
+                        "task-1",
+                        "ctx-1",
+                        TaskState::Completed,
+                        Some("done"),
+                    ))],
+                ],
+                true,
+            )
+            .await;
+            let model = client.model_for_conversation("identity");
+            let error = model
+                .stream(text_request("start"))
+                .unwrap()
+                .finish()
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(
+                model
+                    .stream(text_request("README.md"))
+                    .unwrap()
+                    .finish()
+                    .await
+                    .unwrap()
+                    .text(),
+                "done"
+            );
+            {
+                let requests = recorded.lock().unwrap();
+                let body = match binding {
+                    StubBinding::JsonRpc => &requests[1]["params"],
+                    StubBinding::Rest => &requests[1],
+                };
+                assert_eq!(body["message"]["contextId"], "ctx-1");
+                assert_eq!(body["message"]["taskId"], "task-1");
+            }
+            server.abort();
+            let _ = server.await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn oracle_failed_stream_does_not_consume_context_before_retry() {
+    use axum::response::IntoResponse;
+    for binding in [StubBinding::JsonRpc, StubBinding::Rest] {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let saved = recorded.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |axum::Json(request): axum::Json<serde_json::Value>| {
+                let saved = saved.clone();
+                async move {
+                    let count = {
+                        let mut requests = saved.lock().unwrap();
+                        requests.push(request.clone());
+                        requests.len()
+                    };
+                    if count == 2 {
+                        return (
+                            [("content-type", "text/event-stream")],
+                            "data: not-json\n\n",
+                        )
+                            .into_response();
+                    }
+                    let mut message = Message::new(Role::Agent, vec![Part::text("ok")]);
+                    message.context_id = Some("ctx-retry".into());
+                    let reply =
+                        serde_json::to_value(SendMessageResponse::Message(message)).unwrap();
+                    axum::Json(match binding {
+                        StubBinding::JsonRpc => {
+                            serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":reply})
+                        }
+                        StubBinding::Rest => reply,
+                    })
+                    .into_response()
+                }
+            },
+        ));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut card = card_with_skills(&base, "retry", &[]);
+        card.supported_interfaces = vec![AgentInterface::new(
+            &base,
+            match binding {
+                StubBinding::JsonRpc => TRANSPORT_PROTOCOL_JSONRPC,
+                StubBinding::Rest => TRANSPORT_PROTOCOL_HTTP_JSON,
+            },
+        )];
+        let client = A2AClient::from_agent_card(card).await.unwrap();
+        let model = client.model_for_conversation("retry");
+        model.completion(text_request("start")).await.unwrap();
+        let mut request = text_request("continue");
+        request.documents = vec![document("new", "must survive retry")];
+        assert!(
+            model
+                .stream(request.clone())
+                .unwrap()
+                .finish()
+                .await
+                .is_err()
+        );
+        model.completion(request).await.unwrap();
+        let requests = recorded.lock().unwrap().clone();
+        for (index, request) in requests.iter().enumerate().skip(1) {
+            let body = match binding {
+                StubBinding::JsonRpc => &request["params"],
+                StubBinding::Rest => request,
+            };
+            assert!(
+                body["message"]["parts"]
+                    .to_string()
+                    .contains("must survive retry"),
+                "attempt {index} lost context"
+            );
+        }
+        println!("retry: server received fresh document on failed attempt and retry");
+        server.abort();
+        let _ = server.await;
+    }
+}
+
 #[tokio::test]
 async fn card_fetch_failure_surfaces_status_and_body_snippet() {
     let _ = tracing_subscriber::fmt::try_init();
