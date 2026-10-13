@@ -28,7 +28,7 @@
 //! accounting.
 //!
 //! A paused task reports `FinishReason::Other("input_required")` and retains
-//! the IDs needed to resume it. Rig 0.44 fails closed on unknown finish reasons;
+//! the IDs needed to resume it. Rig fails closed on unknown finish reasons;
 //! callers expecting clarification turns must explicitly set
 //! `accept_unknown_finish_reasons(true)` on their A2A request, run or builder.
 //! This adapter does not override that policy, and failed remote tasks still
@@ -192,6 +192,16 @@ impl A2AModel {
         request: &CompletionRequest,
     ) -> Result<(Option<ConversationId>, Thread), A2AError> {
         let params = thread_params(request.additional_params.as_ref())?;
+        if let Some(context_id) = params.context_id {
+            return Ok((
+                None,
+                Thread {
+                    context_id: Some(context_id),
+                    task_id: params.task_id,
+                    ..Thread::default()
+                },
+            ));
+        }
         // A conversation named on the run outranks the model's own binding, so
         // one agent serves many conversations instead of one agent per
         // conversation. `A2AConversationExt` puts the run's id here.
@@ -200,17 +210,10 @@ impl A2AModel {
             .map(ConversationId::new)
             .or_else(|| self.conversation.clone());
 
-        let mut thread = conversation
+        let thread = conversation
             .as_ref()
             .map(|id| self.threads.get(id))
             .unwrap_or_default();
-        // Ids the caller threaded onto this request outrank the store: an
-        // explicit caller owns the conversation and may be resuming one this
-        // process never saw.
-        if let Some(context_id) = params.context_id {
-            thread.context_id = Some(context_id);
-            thread.task_id = params.task_id;
-        }
         Ok((conversation, thread))
     }
 

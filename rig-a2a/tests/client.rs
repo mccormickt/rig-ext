@@ -746,6 +746,55 @@ async fn unthreaded_requests_always_carry_their_context() {
     server.abort();
 }
 
+#[tokio::test]
+async fn explicit_context_does_not_read_or_replace_a_bound_conversation() {
+    let (addr, recorded, server) = serve_stub(
+        "explicit-bound",
+        &["chat"],
+        StubReply::CompletedText("ok".into()),
+    )
+    .await;
+    let remote = A2AClient::from_url(format!("http://{addr}"))
+        .await
+        .expect("client should fetch card");
+    let model = remote.model_for_conversation("bound");
+    for (index, context) in [None, Some("ctx-restored"), None].into_iter().enumerate() {
+        let mut request = text_request(&format!("turn {index}"));
+        request
+            .chat_history
+            .insert(0, RigMessage::system("You are terse."));
+        request.documents = vec![document("handbook", "the standing handbook")];
+        if let Some(context) = context {
+            request.additional_params = Some(serde_json::json!({
+                "a2a": { "context_id": context }
+            }));
+        }
+        model
+            .completion(request)
+            .await
+            .expect("completion should succeed");
+    }
+    let explicit = recorded_texts(&recorded, 1);
+    assert!(explicit.iter().any(|text| text.contains("You are terse.")));
+    assert!(
+        explicit
+            .iter()
+            .any(|text| text.contains("standing handbook"))
+    );
+    assert_eq!(recorded_texts(&recorded, 2), ["turn 2"]);
+    let messages = recorded.lock().unwrap();
+    assert_eq!(
+        messages[1].message.context_id.as_deref(),
+        Some("ctx-restored")
+    );
+    assert!(messages[2].message.context_id.is_some());
+    assert_ne!(
+        messages[2].message.context_id.as_deref(),
+        Some("ctx-restored")
+    );
+    server.abort();
+}
+
 /// A caller who owns the ids threads them per request, with no conversation
 /// binding and nothing tracked on the client.
 #[tokio::test]
