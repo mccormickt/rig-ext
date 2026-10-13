@@ -8,21 +8,19 @@ The crate owns script execution, tool discovery, and bounded results. The host o
 
 | Cargo features | Contents | Build requirement |
 | --- | --- | --- |
-| none | `Catalog`, `Limits`, `ExecutionReport`, `HostDispatcher`, `DynamicToolDispatcher`, `ScriptPolicy`, `analyze`. `CodeMode::builder().build()` returns `BuildError::NoBackend`. | Rust 1.95+ (the `rig-core` 0.44 MSRV) |
-| `quickjs` | Native QuickJS backend through `rquickjs` 0.14, one worker thread per script | A C compiler for QuickJS; native targets only |
-| `mcp` | `CatalogEntry::from_mcp_definition` and `mcp::OutputSchemaValidator` for `rig-rmcp` tools | `rig-rmcp` 0.44, `jsonschema` 0.58 |
+| none | `Catalog`, `Limits`, `ExecutionReport`, `HostDispatcher`, `DynamicToolDispatcher`, `ScriptPolicy`, `analyze`. `CodeMode::builder().build()` returns `BuildError::NoBackend`. | Stable Rust |
+| `quickjs` | Native QuickJS backend through `rquickjs`, one worker thread per script | A C compiler for QuickJS; native targets only |
+| `mcp` | `CatalogEntry::from_mcp_definition` and `mcp::OutputSchemaValidator` for `rig-rmcp` tools | Native targets only; MCP tools with declared output schemas |
 
 Enabling `mcp` does not change dispatch or permissions for non-MCP tools. The builder never selects a backend by feature precedence: with several backends compiled, call `CodeModeBuilder::backend`.
 
 ## Rust Workers and external executors
 
-Use `rig-codemode` with `default-features = false` for contracts and direct host dispatch on `wasm32-unknown-unknown`. Use matching `rig`/`rig-core` 0.44 dependencies; no Rig fork or `worker` feature is needed. `HostDispatcher`, `ScriptPolicy`, and their callbacks use Rig's portable bounds: local state and non-`Send` futures are allowed on this target, while native targets retain `Send`/`Sync`. Threaded Wasm is not supported by Rig.
+Use `rig-codemode` with `default-features = false` for contracts and direct host dispatch on `wasm32-unknown-unknown`. `HostDispatcher`, `ScriptPolicy`, and their callbacks use Rig's portable bounds: local state and non-`Send` futures are allowed on this target, while native targets retain `Send`/`Sync`. Threaded Wasm is not supported by Rig.
 
 This is not a Workers script backend. The `quickjs` feature requires a native target. `CodeModeBuilder::backend` selects a compiled engine; it does not accept an external executor. On Wasm, `build()` returns `BuildError::NoBackend`. The native bridge uses a worker thread, Tokio task scheduling, timers, and a join handle; it is not compiled on Wasm.
 
 An application-owned executor can use `ExecutionRequest`, `Limits::restrict`, `ExecutionReport::new(status)`, `ScriptDiagnostic::new(message)`, and `ExecutionReport::into_tool_result`. Use `CallRecord::new(ordinal, name, status, delivery)` for child calls and set its public `error_kind` when needed; it defaults to `None`. Delivery is explicit and independent of tool success. Fill the report's public fields with trusted execution results; `ScriptOutput::default()` provides an empty output. The constructors do not sanitize guest data or enforce limits. The application must enforce the limits it supports and keep host details out of diagnostics. QuickJS heap and cancellation guarantees do not apply to celld or other external executors.
-
-A future external backend API must preserve host authorization, schema validation, result projection, and call accounting without requiring native scheduling. It must also define the engine's limit and cancellation guarantees. This crate does not provide that API yet.
 
 ## Threat model of the `quickjs` backend
 
@@ -30,24 +28,13 @@ The script runs in a fresh QuickJS runtime on a dedicated thread inside the host
 
 This is **not** a fault boundary. A QuickJS memory-safety bug would run with the host's privileges. Use this backend when scripts come from a model you run for a single trust domain, or put the host process behind an OS sandbox. Do not describe it as equivalent to a WASM or process sandbox. The confinement tests in `tests/acceptance.rs` establish the tested boundary; they do not prove absence of engine vulnerabilities. Keep `rquickjs` updated.
 
-## Backend selection
-
-Four shortlisted engines were measured with one shared fixture set (fresh runtime per script, trivial eval, infinite CPU loop, allocation loop, deep recursion, confinement probes) on x86_64 Linux, release profile, rustc 1.99. Measurements are from this workspace, not published rankings.
-
-| Option | Versions | Binary | Cold init + trivial eval | Repeat | CPU loop stop | Heap bound | Result |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| B. Native QuickJS (`rquickjs`) | rquickjs 0.14 (QuickJS-NG) | 2.0 MB | 0.6 ms | 0.26 ms | interrupt handler, within 1 ms of the deadline | `set_memory_limit`: `out of memory` on alloc loop, 3e6 sort, 100 MB `JSON.parse` | **Selected** |
-| A. QuickJS WASM in Wasmtime | wasmtime 49, `quickjs-wasi` 3.6.2 artifact (637 KB, 12 imports, 450 exports) | 19.6 MB | 1.5 s cold Cranelift compile; 1.7 ms precompiled deserialize; 0.5–0.7 ms per fresh instance | 0.5 ms | fuel trap | WASM linear memory | Viable follow-on; needs a JSValue-handle ABI adapter for `host_call`/promise glue |
-| C. Boa | boa_engine 0.22 | 16.5 MB | 1.1 ms | 0.44 ms | iteration limit | none: `s = s + s` ×40 requested 34 GB and aborted the process | Rejected |
-| D. V8 (`deno_core`) | — | — | — | — | — | — | Not measured; V8 is not already in these applications |
-
-B satisfies the limits the design requires (heap, stack, CPU, confinement) with the smallest integration surface and no artifact pinning. Its weaker fault boundary is documented above rather than hidden. A is the path to a stronger boundary and shares the bridge protocol; nothing in the public API names an engine type.
-
-Two `rquickjs` facts shaped the implementation. `set_memory_limit` is only effective with the default allocator, so the `rust-alloc` feature is not enabled. `rquickjs-sys` compiles QuickJS with assertions on, and `JS_FreeRuntime` asserts that no JS values are alive, so the worker drops every guest value before the runtime.
+`set_memory_limit` requires QuickJS's default allocator, so the `rust-alloc`
+feature is disabled. The worker drops every guest value before destroying the
+runtime, as required by QuickJS.
 
 ## Use
 
-The crate's rustdocs contain checked examples for direct execution, Rig 0.44 agent registration, typed context, policies, limits, reports, discovery, and MCP integration. Build them with:
+The crate's rustdocs contain checked examples for direct execution, Rig agent registration, typed context, policies, limits, reports, discovery, and MCP integration. Build them with:
 
 ```sh
 cargo doc -p rig-codemode --no-deps --features quickjs,mcp --open
@@ -170,9 +157,7 @@ the script later fails. A terminal step may leave admitted race losers pending;
 the host must complete them and replay with their results for the final report.
 Late results are marked `Discarded`, not cancelled.
 
-This follows Pi's [durable codemode integration](https://github.com/earendil-works/pi/blob/main/packages/durable/src/codemode/codemode.ts),
-including its journal-before-delivery separation. Rig disables clock/random
-APIs rather than seeding them. See the [`rig-durable` example](../rig-durable/examples/dynamic_workflow.rs)
+See the [`rig-durable` example](../rig-durable/examples/dynamic_workflow.rs)
 and its shared Duroxide/Temporal scheduler for separate durable nested calls.
 
 ## Limits
@@ -234,8 +219,8 @@ CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
   cargo test --locked -p rig-codemode --target wasm32-unknown-unknown --test wasm_dispatch
 ```
 
-## Not in this release
+## Boundaries
 
-- **Agent-hook adapter (design stage 3).** `rig-agent` 0.44 keeps `dispatch_tool_call` crate-private, so nested calls cannot reuse an agent runner's hooks. `codemode.tool()` works as an ordinary agent tool, but nested calls pass only through the `HostDispatcher` you supply. Keep per-call policy in the dispatcher and script-level policy in a `ScriptPolicy`.
-- Small-value store, image helpers, and raw provider source grammar.
-- A WASM-hosted guest (option A) or a process sandbox (option E).
+- Nested calls pass through the supplied `HostDispatcher`, not an agent runner's hooks. Keep per-call policy in the dispatcher and script-level policy in a `ScriptPolicy`.
+- Scripts have no small-value store, image helpers, or raw provider source grammar.
+- QuickJS is the only script backend. It is native-only and runs in the host process.
