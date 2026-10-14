@@ -136,8 +136,7 @@
 compile_error!("the `quickjs` backend requires a native target; disable it for Wasm contracts");
 
 pub mod analysis;
-// Bridge and runtime code is only reachable through a compiled backend.
-#[cfg(not(target_family = "wasm"))]
+// Data contracts are portable; channel drivers are native-only.
 #[cfg_attr(not(feature = "quickjs"), allow(dead_code))]
 mod bridge;
 pub mod catalog;
@@ -146,10 +145,8 @@ pub mod limits;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod policy;
-#[cfg(not(target_family = "wasm"))]
 #[cfg_attr(not(feature = "quickjs"), allow(dead_code))]
 mod projection;
-#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
 pub mod replay;
 pub mod report;
 #[cfg_attr(not(feature = "quickjs"), allow(dead_code))]

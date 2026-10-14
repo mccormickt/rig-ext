@@ -7,15 +7,75 @@
 //! the host owns tool deadlines, authorization, retries, and cancellation.
 
 use std::collections::BTreeMap;
+#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
 use std::sync::Arc;
+#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
 use std::time::Instant;
 
 use rig_core::tool::{ToolExecutionError, ToolResult};
+use rig_core::wasm_compat::{WasmBoxedFuture, WasmCompatSend, WasmCompatSync};
 use serde::{Deserialize, Serialize};
 
-use crate::bridge::{self, HostChannels, Reply, Request, WorkerConfig, WorkerOutcome};
+use crate::bridge::{self, Reply, Request, WorkerOutcome};
+#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
+use crate::bridge::{HostChannels, WorkerConfig};
 use crate::projection::{bound_payload, project};
 use crate::{CallRecord, CallStatus, Catalog, ExecutionReport, Limits, ScriptDelivery};
+
+#[allow(dead_code)]
+pub(crate) mod protocol;
+
+/// Immutable inputs for one replay planning operation. No host tools execute.
+#[derive(Clone, Copy)]
+pub struct ReplayInput<'a> {
+    /// JavaScript async function body.
+    pub code: &'a str,
+    /// Approved catalog snapshot.
+    pub catalog: &'a Catalog,
+    /// Script resource ceilings.
+    pub limits: Limits,
+    /// All previously admitted calls, including pending race losers.
+    pub admitted: &'a [ScriptCall],
+    /// Policy-filtered results in delivery order, possibly sparse.
+    pub history: &'a [SettledCall],
+}
+
+/// A replay future, local on WASM and Send on native targets.
+pub type ReplayFuture<'a> = WasmBoxedFuture<'a, Result<ScriptStep, ReplayError>>;
+
+/// Replay-only runtime boundary. A planner never dispatches a host tool.
+pub trait ReplayPlanner: WasmCompatSend + WasmCompatSync {
+    /// Immutable engine and artifact identity. Persist and compare it with
+    /// source, catalog, and limits before replay or new effects. Engines with
+    /// different identities must not silently share durable histories.
+    fn runtime_identity(&self) -> &str;
+
+    /// Reproduce recorded deliveries and stop before new host I/O.
+    fn plan<'a>(&'a self, input: ReplayInput<'a>) -> ReplayFuture<'a>;
+}
+
+/// Native QuickJS replay planner. The existing [`step`] API does not require
+/// a persisted runtime identity; hosts using this boundary must pin one.
+#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NativeReplayPlanner;
+
+#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
+impl ReplayPlanner for NativeReplayPlanner {
+    fn runtime_identity(&self) -> &str {
+        "rig-codemode/quickjs-ng-0.16.2/rquickjs-0.14.0/replay-v1"
+    }
+
+    fn plan<'a>(&'a self, input: ReplayInput<'a>) -> ReplayFuture<'a> {
+        Box::pin(step(
+            input.code,
+            input.catalog,
+            input.limits,
+            input.admitted,
+            input.history,
+        ))
+    }
+}
 
 /// One script call. The ordinal is stable when the script is replayed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -67,6 +127,15 @@ pub enum ReplayError {
     /// The worker stopped without a terminal outcome.
     #[error("script worker stopped without an outcome")]
     WorkerStopped,
+    /// A fresh runner did not reproduce its checked transport prefix.
+    #[error("invalid checked replay protocol")]
+    Protocol,
+    /// Aggregate exchange bytes, work, or host elapsed time exceeded its ceiling.
+    #[error("checked replay exchange budget exceeded")]
+    BudgetExceeded,
+    /// The replay runner could not complete an exchange.
+    #[error("replay runner failed: {0}")]
+    Runner(String),
 }
 
 /// Run from the beginning, replay recorded results, and stop before new I/O.
@@ -76,6 +145,7 @@ pub enum ReplayError {
 /// Terminal reports for admitted calls without results are provisional: drain
 /// retained futures and replay with their results to record discarded replies.
 /// This function has no dispatcher and cannot invoke a host tool.
+#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
 pub async fn step(
     code: &str,
     catalog: &Catalog,
@@ -83,14 +153,7 @@ pub async fn step(
     admitted: &[ScriptCall],
     history: &[SettledCall],
 ) -> Result<ScriptStep, ReplayError> {
-    limits.validate().map_err(crate::ExecutionError::from)?;
-    if code.len() > limits.source_bytes {
-        return Err(crate::ExecutionError::SourceTooLarge {
-            size: code.len(),
-            limit: limits.source_bytes,
-        }
-        .into());
-    }
+    validate_source(code, limits)?;
     let mut state = ReplayState::new(catalog, limits, admitted, history)?;
     let (worker, mut host) = bridge::channels(&limits);
     let handle = crate::runtime::quickjs::spawn(
@@ -109,6 +172,18 @@ pub async fn step(
     drop(host.replies);
     let _ = handle.join();
     result
+}
+
+fn validate_source(code: &str, limits: Limits) -> Result<(), ReplayError> {
+    limits.validate().map_err(crate::ExecutionError::from)?;
+    if code.len() > limits.source_bytes {
+        return Err(crate::ExecutionError::SourceTooLarge {
+            size: code.len(),
+            limit: limits.source_bytes,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 struct RecordedCall<'a> {
@@ -219,6 +294,7 @@ impl<'a> ReplayState<'a> {
         })
     }
 
+    #[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
     async fn drive(&mut self, host: &mut HostChannels) -> Result<ScriptStep, ReplayError> {
         let mut requests_open = true;
         loop {
@@ -226,31 +302,71 @@ impl<'a> ReplayState<'a> {
                 biased;
                 request = host.requests.recv(), if requests_open => match request {
                     None => requests_open = false,
-                    Some(Request::Call { ordinal, name, arguments, raw }) => {
-                        let call = ScriptCall {
-                            ordinal, name, raw,
-                            arguments: serde_json::from_str(&arguments)
-                                .map_err(|_| ReplayError::Diverged)?,
-                        };
-                        self.accept(call)?;
-                    }
-                    Some(Request::Rejected { ordinal, name, kind }) => {
-                        if self.journal.calls.contains_key(&ordinal) { return Err(ReplayError::Diverged); }
-                        let mut record = CallRecord::new(ordinal, name, CallStatus::Rejected, ScriptDelivery::Delivered);
-                        record.error_kind = Some(kind);
-                        self.records.insert(ordinal, record);
-                    }
                     Some(Request::Idle) => {
-                        if let Some(step) = self.idle(&host.replies)? {
-                            return Ok(step);
+                        match self.idle()? {
+                            Decision::Step(step) => return Ok(step),
+                            Decision::Reply(reply) => host.replies.send(reply)
+                                .map_err(|_| ReplayError::WorkerStopped)?,
                         }
                     }
+                    Some(event) => self.observe(event)?,
                 },
                 outcome = &mut host.done => {
                     let outcome = outcome.map_err(|_| ReplayError::WorkerStopped)?;
                     return self.finish(outcome);
                 }
             }
+        }
+    }
+
+    fn observe(&mut self, event: Request) -> Result<(), ReplayError> {
+        let ordinal = match &event {
+            Request::Call { ordinal, .. } | Request::Rejected { ordinal, .. } => *ordinal,
+            Request::Idle => return Err(ReplayError::Protocol),
+        };
+        if ordinal >= self.limits.max_calls
+            || self.pending.contains_key(&ordinal)
+            || self.records.contains_key(&ordinal)
+        {
+            return Err(ReplayError::Diverged);
+        }
+        match event {
+            Request::Call {
+                ordinal,
+                name,
+                arguments,
+                raw,
+            } => {
+                if arguments.len() > self.limits.message_bytes {
+                    return Err(ReplayError::Diverged);
+                }
+                self.accept(ScriptCall {
+                    ordinal,
+                    name,
+                    raw,
+                    arguments: serde_json::from_str(&arguments)
+                        .map_err(|_| ReplayError::Diverged)?,
+                })
+            }
+            Request::Rejected {
+                ordinal,
+                name,
+                kind,
+            } => {
+                if self.journal.calls.contains_key(&ordinal) {
+                    return Err(ReplayError::Diverged);
+                }
+                let mut record = CallRecord::new(
+                    ordinal,
+                    name,
+                    CallStatus::Rejected,
+                    ScriptDelivery::Delivered,
+                );
+                record.error_kind = Some(kind);
+                self.records.insert(ordinal, record);
+                Ok(())
+            }
+            Request::Idle => Err(ReplayError::Protocol),
         }
     }
 
@@ -291,12 +407,9 @@ impl<'a> ReplayState<'a> {
         Ok(ScriptStep::Calls(calls))
     }
 
-    fn idle(
-        &mut self,
-        replies: &std::sync::mpsc::Sender<Reply>,
-    ) -> Result<Option<ScriptStep>, ReplayError> {
+    fn idle(&mut self) -> Result<Decision, ReplayError> {
         if self.journal.remaining.is_empty() && self.has_new_calls() {
-            return self.unresolved().map(Some);
+            return self.unresolved().map(Decision::Step);
         }
         let next = if let Some((&ordinal, result)) = self.local.first_key_value() {
             Some((ordinal, result, false))
@@ -311,7 +424,7 @@ impl<'a> ReplayState<'a> {
             if self.pending.is_empty() {
                 return Err(ReplayError::WorkerStopped);
             }
-            return self.unresolved().map(Some);
+            return self.unresolved().map(Decision::Step);
         };
         let call = self.pending.get(&ordinal).ok_or(ReplayError::Diverged)?;
         let payload = project(&call.name, result, call.raw, self.limits.message_bytes);
@@ -320,15 +433,12 @@ impl<'a> ReplayState<'a> {
         let mut record = CallRecord::new(ordinal, &call.name, status, delivery);
         record.error_kind = error_kind;
         self.records.insert(ordinal, record);
-        replies
-            .send(Reply { ordinal, payload })
-            .map_err(|_| ReplayError::WorkerStopped)?;
         self.pending.remove(&ordinal);
         self.local.remove(&ordinal);
         if journal {
             self.journal.remaining = &self.journal.remaining[1..];
         }
-        Ok(None)
+        Ok(Decision::Reply(Reply { ordinal, payload }))
     }
 
     fn finish(&mut self, outcome: WorkerOutcome) -> Result<ScriptStep, ReplayError> {
@@ -367,4 +477,9 @@ impl<'a> ReplayState<'a> {
         report.calls = std::mem::take(&mut self.records).into_values().collect();
         Ok(ScriptStep::Done(report))
     }
+}
+
+enum Decision {
+    Reply(Reply),
+    Step(ScriptStep),
 }

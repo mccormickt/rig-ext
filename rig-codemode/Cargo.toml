@@ -33,11 +33,11 @@ rig-rmcp = { version = "0.44.0", default-features = false, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tracing = "0.1"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-rquickjs = { version = "0.14", default-features = false, features = ["std"], optional = true }
+rquickjs = { version = "=0.14.0", default-features = false, features = ["std"], optional = true }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 rig = { workspace = true, features = ["test-utils"] }
@@ -47,6 +47,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
 wasm-bindgen-test = "0.3"
+tokio = { version = "1", features = ["rt", "macros"] }
 
 [features]
 default = []

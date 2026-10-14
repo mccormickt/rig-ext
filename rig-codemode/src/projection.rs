@@ -31,10 +31,19 @@ pub(crate) fn bounded_json(
     value: &(impl Serialize + ?Sized),
     limit: usize,
 ) -> Result<String, serde_json::Error> {
+    bounded_json_with_depth(value, limit, 64)
+}
+
+pub(crate) fn bounded_json_with_depth(
+    value: &(impl Serialize + ?Sized),
+    limit: usize,
+    max_depth: usize,
+) -> Result<String, serde_json::Error> {
     struct Writer {
         bytes: Vec<u8>,
         limit: usize,
         depth: usize,
+        max_depth: usize,
         quoted: bool,
         escaped: bool,
     }
@@ -57,7 +66,7 @@ pub(crate) fn bounded_json(
                         b'"' => self.quoted = true,
                         b'[' | b'{' => {
                             self.depth += 1;
-                            if self.depth > 64 {
+                            if self.depth > self.max_depth {
                                 return Err(std::io::Error::other("JSON nesting limit exceeded"));
                             }
                         }
@@ -77,6 +86,7 @@ pub(crate) fn bounded_json(
         bytes: Vec::new(),
         limit,
         depth: 0,
+        max_depth,
         quoted: false,
         escaped: false,
     };
