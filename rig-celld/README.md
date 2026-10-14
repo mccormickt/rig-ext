@@ -7,8 +7,60 @@
 | Cargo features | Contents | Native | WASM runtime requirement |
 | --- | --- | --- | --- |
 | none | Memory models, logical cursors, backend contract, and capability types | Supported | No Workers binding |
+| `dynamic-workers` | Fresh Worker Loader, JS/WASM modules, entrypoint Fetcher, bounded response reads | Compile only | Worker Loader binding on celld or Cloudflare/workerd |
 | `storage` | `CellStorage`, SQL access, and synchronous transactions | Compiles for tests | Cloudflare or celld SQLite Durable Objects |
 | `sqlite-vec` | Includes `storage`; `SqliteVecIndex<M>`, Rig `VectorStoreIndex`, and Rig `InsertDocuments` | Compiles for tests | celld 0.6.0 or later with the Wrangler `sqlite_vec` compatibility flag |
+
+## Dynamic Workers
+
+`dynamic-workers` enables only workers-rs, not `storage` or `sqlite-vec`. It does not depend on codemode or durable workflows. workers-rs stays pinned to `=0.8.3`; the adapter uses its JS/WASM reexports and reflection because that version has no typed Loader API.
+
+Configure a Loader binding in Wrangler:
+
+```json
+{"worker_loaders": [{"binding": "LOADER"}]}
+```
+
+Use an explicit network policy and per-invocation limits:
+
+```rust,ignore
+use rig_celld::{OutboundPolicy, WorkerCode, WorkerLimits, WorkerLoader, WorkerModule};
+
+let loader = WorkerLoader::from_env(&env, "LOADER")?;
+let mut loaded = loader.load(WorkerCode {
+    main_module: "guest.js".into(),
+    modules: [(
+        "guest.js".into(),
+        WorkerModule::JavaScript(
+            "export default {fetch() {return new Response('hello')}}".into(),
+        ),
+    )].into(),
+    compatibility_date: "2026-07-01".into(),
+    compatibility_flags: vec![],
+    outbound: OutboundPolicy::Deny,
+    limits: WorkerLimits { cpu_ms: 100, subrequests: 0 },
+})?;
+let result = loaded.fetch_bounded(None, request, 4096).await;
+loaded.dispose();
+let response = result?;
+```
+
+Each `load()` creates a fresh anonymous Worker. Compilation can be lazy, so load errors can reach the caller on its first fetch. `WorkerModule::Wasm(bytes)` supplies a compiled WASM module, which guest JS can import by its module path. Compatibility settings are passed to the runtime. The guest environment is explicitly empty: the adapter passes no credentials or storage bindings.
+
+`OutboundPolicy::Deny` sets `globalOutbound: null`. `Inherit` explicitly selects the parent's outbound access; `Service(fetcher)` routes global fetch through a service binding. celld 0.6.2 does not support service-routed `connect()` or WebSockets: its service protocol cannot carry bidirectional tunnels. Select `Deny` for isolated replay. This adapter does not transfer Rust callbacks or provide typed guest RPC APIs. On celld 0.6.2, a service binding has a different JS constructor name from workers-rs' `Fetcher`; obtain that binding through reflection when `Env::service()` rejects it.
+
+`LoadedWorker::entrypoint(None)` returns the default `worker::Fetcher`; `Some(name)` selects a named entrypoint. If you use the Fetcher directly, keep the loaded owner alive until all response bodies finish or are abandoned. `fetch_bounded()` does this for you and returns status, headers, and body bytes. Non-2xx status is not a transport error. It checks each JS chunk before copying it into Rust and rejects a body over the requested bound. On overflow, body error, or a dropped read future, it requests stream cancellation and releases the reader lock on a best-effort basis. Cancellation failures do not replace the primary error, and cancellation completion is not awaited.
+
+The byte bound limits the collected body, not JS/runtime buffers, request bytes, or elapsed time. Bound request generation and supply an application deadline separately. Runtime CPU/subrequest settings apply per invocation; they do not provide an aggregate budget or wall-time deadline.
+
+| Runtime tested | CPU setting | Subrequest setting | Loaded-worker cleanup |
+| --- | --- | --- | --- |
+| celld 0.6.2 | Finite CPU probe rejected at 1 ms and completed at 1000 ms | Global fetch rejected at zero; second fetch rejected at one and allowed at two | Stub `dispose()` requests asynchronous release; no shutdown acknowledgment |
+| local workerd 1.20260730.1 via Miniflare 4.20260730.0 | Probe completes despite 1 ms setting | Zero/one settings do not reject the tested global fetch calls | No stub disposer; application references are dropped for runtime GC |
+
+`dispose()` is idempotent and nonthrowing, with a `Drop` fallback. It catches property access and invocation failures on the **Loader stub**, never calls `dispose` on an entrypoint, and never claims cancellation or deterministic release. celld entrypoint properties can become RPC methods. On workerd, GC timing is a runtime concern. Explicit cleanup while the request context is live is preferred; a WASM trap does not run Rust destructors.
+
+The [Loader conformance fixture](examples/loader-conformance/README.md) runs a real bundled Rust Worker on both local runtimes. Local tests do not prove Cloudflare production limit enforcement. Cached `get()`, facets, bindings in guest `env`, and tail APIs are outside this adapter's scope.
 
 ## Configure celld
 

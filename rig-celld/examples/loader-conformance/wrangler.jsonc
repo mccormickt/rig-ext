@@ -1,0 +1,7 @@
+{
+  "name": "loader-conformance",
+  "main": "entry.mjs",
+  "compatibility_date": "2026-07-01",
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "services": [{ "binding": "GATEWAY", "service": "loader-conformance", "entrypoint": "Gateway" }]
+}

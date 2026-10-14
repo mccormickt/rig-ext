@@ -4,11 +4,14 @@
 //! for `CellStorage` on Cloudflare or celld SQLite Durable Objects. Enable
 //! `sqlite-vec` together with celld's `sqlite_vec` Wrangler compatibility flag
 //! to use `SqliteVecIndex`.
+//! Enable independent `dynamic-workers` for fresh Worker Loader invocations.
 
 mod capabilities;
 mod memory;
 mod vector;
 
+#[cfg(feature = "dynamic-workers")]
+mod dynamic_workers;
 #[cfg(feature = "storage")]
 mod storage;
 #[cfg(feature = "sqlite-vec")]
@@ -23,6 +26,11 @@ pub use memory::{
 };
 pub use vector::VectorError;
 
+#[cfg(feature = "dynamic-workers")]
+pub use dynamic_workers::{
+    BoundedResponse, LoadedWorker, OutboundPolicy, WorkerCode, WorkerLimits, WorkerLoader,
+    WorkerModule,
+};
 #[cfg(feature = "storage")]
 pub use storage::CellStorage;
 #[cfg(feature = "sqlite-vec")]

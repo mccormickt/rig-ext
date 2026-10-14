@@ -14,6 +14,7 @@ worker = { workspace = true, optional = true }
 
 [features]
 default = []
+dynamic-workers = ["dep:worker"]
 storage = ["dep:worker"]
 sqlite-vec = ["storage"]
 
