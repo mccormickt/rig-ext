@@ -64,6 +64,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 [features]
 default = ["duroxide", "sqlite"]
 codemode = ["dep:rig-codemode"]
+codemode-worker-replay = ["codemode", "durable-object", "rig-codemode/worker-replay"]
 durable-object = ["dep:worker", "dep:rig-celld"]
 duroxide = ["dep:duroxide", "dep:tokio"]
 sqlite = ["duroxide", "duroxide/sqlite"]

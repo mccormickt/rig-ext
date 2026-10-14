@@ -1,0 +1,17 @@
+{
+  "protocol": 1,
+  "harness": 1,
+  "engine": "quickjs-ng-0.12.1",
+  "package": "0.32.0",
+  "wrapper_patch": "refresh-typed-array-after-memory-growth-v1",
+  "files": {
+    "worker.js": {
+      "bytes": 110605,
+      "sha256": "bbaed1273bfbb0f379382ac92edd0ac559b2d4349c7ba0cff4aa06ac000462f9"
+    },
+    "quickjs.wasm": {
+      "bytes": 528551,
+      "sha256": "b56fe5094b8751c47b8c32fb5ed4d75afe2dbb43412d3d983ac5d1156af456da"
+    }
+  }
+}

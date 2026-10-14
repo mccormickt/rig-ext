@@ -39,6 +39,11 @@ tracing = "0.1"
 rquickjs = { version = "=0.14.0", default-features = false, features = ["std"], optional = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+rig-celld = { path = "../rig-celld", default-features = false, features = ["dynamic-workers"], optional = true }
+worker = { workspace = true, optional = true }
+futures-util = { version = "0.3", optional = true }
+
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 rig = { workspace = true, features = ["test-utils"] }
 rmcp = { version = "2", features = ["server", "client"] }
@@ -54,6 +59,8 @@ default = []
 # Native QuickJS backend. Runs the script on a dedicated worker thread inside
 # the host process; see the README for its threat model.
 quickjs = ["dep:rquickjs"]
+# Replay-only QuickJS-WASM in fresh Dynamic Workers. Independent of native QuickJS.
+worker-replay = ["dep:rig-celld", "dep:worker", "dep:futures-util"]
 # Catalog entries with output schemas from `rig-rmcp` tools, plus output-schema
 # validation at the dispatch boundary.
 mcp = ["dep:rig-rmcp"]

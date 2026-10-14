@@ -1,0 +1,6 @@
+{
+  "name": "worker-replay-conformance",
+  "main": "entry.mjs",
+  "compatibility_date": "2026-07-01",
+  "worker_loaders": [{ "binding": "LOADER" }]
+}

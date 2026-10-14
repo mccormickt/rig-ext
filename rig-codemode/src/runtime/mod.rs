@@ -13,29 +13,7 @@ pub struct SpawnError(#[from] pub(crate) std::io::Error);
 /// Prelude shared by every backend: builds the frozen null-prototype `tools`
 /// table and the script-facing helpers from the private `__host` object, then
 /// removes `__host` from the global scope.
-pub(crate) const PRELUDE: &str = r#"
-(function (host) {
-  "use strict";
-  const define = (target, key, value) =>
-    Object.defineProperty(target, key, { value, enumerable: true, writable: false, configurable: false });
-  const tools = Object.create(null);
-  for (const name of host.names()) {
-    const call = (args) => host.invoke(name, args === undefined ? {} : args, false);
-    const raw = (args) => host.invoke(name, args === undefined ? {} : args, true);
-    define(call, "raw", Object.freeze(raw));
-    define(call, "toolName", name);
-    define(tools, name, Object.freeze(call));
-  }
-  Object.freeze(tools);
-  define(globalThis, "tools", tools);
-  define(globalThis, "text", (value) => host.text(value));
-  define(globalThis, "searchTools", (query, options) =>
-    host.searchTools(query === undefined || query === null ? "" : String(query),
-      options && options.limit !== undefined && options.limit !== null ? Number(options.limit) : undefined));
-  define(globalThis, "describeTool", (name) => host.describeTool(String(name)));
-})(globalThis.__host);
-delete globalThis.__host;
-"#;
+pub(crate) const PRELUDE: &str = include_str!("../../runtime/prelude.js");
 
 /// Wrap the model's code as an async function body. The wrapper occupies one
 /// line, so guest line numbers are one greater than source line numbers.

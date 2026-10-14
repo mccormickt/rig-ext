@@ -121,6 +121,8 @@
 //!   fails with [`BuildError::NoBackend`]. A native C compiler is required.
 //! - `mcp`: native-only catalog entries and output-schema validation for `rig-rmcp`
 //!   tools. Enable both `quickjs` and `mcp` to execute MCP-backed scripts.
+//! - `worker-replay`: replay-only QuickJS-WASM through a Worker Loader binding.
+//!   Independent of `quickjs`; it does not enable ordinary script execution.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -151,6 +153,8 @@ pub mod replay;
 pub mod report;
 #[cfg_attr(not(feature = "quickjs"), allow(dead_code))]
 mod runtime;
+#[cfg(feature = "worker-replay")]
+pub mod worker_replay;
 
 use std::sync::Arc;
 #[cfg(not(target_family = "wasm"))]

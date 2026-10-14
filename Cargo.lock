@@ -6560,8 +6560,10 @@ dependencies = [
 name = "rig-codemode"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "jsonschema",
  "rig",
+ "rig-celld",
  "rig-core",
  "rig-rmcp",
  "rmcp",
@@ -6573,6 +6575,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wasm-bindgen-test",
+ "worker",
 ]
 
 [[package]]

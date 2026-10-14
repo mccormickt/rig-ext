@@ -1,0 +1,21 @@
+{
+  "name": "rig-codemode-worker-replay-assets",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node conformance.mjs"
+  },
+  "dependencies": {
+    "@jitl/quickjs-ng-wasmfile-release-sync": "0.32.0",
+    "quickjs-emscripten-core": "0.32.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "miniflare": "4.20260730.0"
+  },
+  "overrides": {
+    "sharp": "0.35.5",
+    "undici": "7.30.0"
+  }
+}
