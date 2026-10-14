@@ -1,0 +1,47 @@
+[package]
+name = "rig-acp"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.88"
+license.workspace = true
+description = "ACP session delegation for Rig"
+repository = "https://github.com/mccormickt/rig-ext"
+readme = "README.md"
+
+[features]
+default = ["process"]
+process = ["agent-client-protocol/process"]
+http = ["dep:agent-client-protocol-http"]
+rivet = ["dep:reqwest", "dep:eventsource-stream"]
+
+[dependencies]
+agent-client-protocol = "=3.3.0"
+agent-client-protocol-http = { version = "=3.3.0", features = ["client"], optional = true }
+async-stream = "0.3"
+eventsource-stream = { version = "0.2", optional = true }
+futures = "0.3"
+parking_lot = "0.12"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"], optional = true }
+rig-agent.workspace = true
+rig-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
+
+[dev-dependencies]
+anyhow = "1"
+axum = "0.8"
+rig-agent = { workspace = true, features = ["test-utils"] }
+tokio = { version = "1", features = ["full"] }
+
+[[example]]
+name = "acp_demo"
+required-features = ["process"]
+
+[[example]]
+name = "acp_peer"
+required-features = ["process"]
+
+[lints]
+workspace = true

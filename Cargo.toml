@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
   "rig-a2a",
+  "rig-acp",
   "rig-celld",
   "rig-celld/examples/celld-agent",
   "rig-celld/examples/celld-conformance",

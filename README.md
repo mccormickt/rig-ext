@@ -8,6 +8,7 @@ Extensions and integrations for the [Rig](https://github.com/0xPlaygrounds/rig) 
 |---|---|
 | [`rig-durable`](rig-durable/README.md) | Durable Rig agents on Duroxide, Temporal, or SQLite Durable Objects (Cloudflare and celld). |
 | [`rig-a2a`](rig-a2a/README.md) | Uses remote Agent2Agent (A2A) services as Rig completion models and agents. |
+| [`rig-acp`](rig-acp/README.md) | Delegates ACP v1 sessions through direct events, permissions, cancellation, and session-bound Rig agents. Native prototype. |
 | [`rig-celld`](rig-celld/README.md) | Durable Object SQL storage and a celld `sqlite-vec` vector-store adapter. |
 | [`rig-codemode`](rig-codemode/README.md) | Runs model-written JavaScript that composes approved Rig tools in a bounded QuickJS sandbox. Optional `mcp` feature for `rig-rmcp` tools. |
 | [`rig-typesafeai-tools`](rig-typesafeai-tools/README.md) | Exposes host-configured Jev evaluations as Rig tools for direct or code-mode calls. |
