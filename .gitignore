@@ -3,3 +3,7 @@
 build/
 .dev.vars
 /.amp/portals/
+node_modules/
+.workerd/
+.wrangler/
+__pycache__/

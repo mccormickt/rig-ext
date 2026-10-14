@@ -22,3 +22,4 @@ if ! command -v temporal >/dev/null; then
   rm "$archive"
 fi
 cargo fetch --locked
+./scripts/workers/install.sh

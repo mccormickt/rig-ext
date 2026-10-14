@@ -1,0 +1,11 @@
+services:
+  durable-celld:
+    command: >-
+      env PATH="$HOME/.local/bin:$PWD/scripts/workers/node_modules/.bin:$PATH"
+      celld dev rig-durable/examples/durable-object --no-watch --port "$PORT"
+    port: 9876
+    health: /health/status
+  durable-workerd:
+    command: node scripts/workers/miniflare.mjs rig-durable/examples/durable-object "$PORT"
+    port: 9877
+    health: /health/status

@@ -1,9 +1,17 @@
 {
   "name": "rig-durable-object",
   "main": "build/worker/shim.mjs",
-  "compatibility_date": "2026-01-01",
+  "compatibility_date": "2026-07-01",
+  "worker_loaders": [{ "binding": "LOADER" }],
   "durable_objects": {
-    "bindings": [{ "name": "AGENTS", "class_name": "AgentSession" }]
+    "bindings": [
+      { "name": "AGENTS", "class_name": "AgentSession" },
+      { "name": "SCRIPTS", "class_name": "ScriptSession" },
+      { "name": "CHILDREN", "class_name": "ChildSession" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AgentSession"] }]
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["AgentSession"] },
+    { "tag": "v2", "new_sqlite_classes": ["ScriptSession", "ChildSession"] }
+  ]
 }

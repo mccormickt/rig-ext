@@ -7,11 +7,22 @@ use rig::{
 use rig_celld::CellStorage;
 use rig_core::test_utils::{MockFrame, MockScript, MockStreamEvent};
 use rig_durable::{
-    ApprovalDecision, SubmitInput, ToolOptions, ToolPolicy,
+    ApprovalDecision, SubmitInput, ToolInvocation, ToolOptions, ToolPolicy,
     durable_object::{Builder, Engine},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use worker::*;
+
+#[cfg(all(feature = "conformance", target_family = "wasm"))]
+mod conformance;
+#[cfg(all(feature = "conformance", target_family = "wasm"))]
+pub use conformance::{ChildSession, ScriptSession};
+
+#[cfg(all(feature = "conformance", target_family = "wasm"))]
+fn worker_planner(env: &Env) -> Result<rig_codemode::worker_replay::WorkerReplayPlanner> {
+    use rig_codemode::worker_replay::{ReplayBudget, WorkerReplayPlanner};
+    WorkerReplayPlanner::from_env(env, "LOADER", ReplayBudget::default())
+}
 
 /// Deterministic model: ask for an addition, then answer after its result.
 /// It has no process-local script cursor, so recovery can reissue any request.
@@ -40,7 +51,19 @@ impl Transport<MockScript> for Calculator {
     }
 }
 
-struct Add;
+struct Add {
+    #[cfg(target_family = "wasm")]
+    storage: CellStorage,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ObservedEffect {
+    logical_id: String,
+    left_value: i64,
+    right_value: i64,
+    result: String,
+}
+
 #[derive(Deserialize)]
 struct AddArgs {
     left: i64,
@@ -51,7 +74,7 @@ impl Tool for Add {
     const NAME: &'static str = "add";
     type Args = AddArgs;
     type Output = i128;
-    type Error = std::convert::Infallible;
+    type Error = worker::Error;
     fn description(&self) -> String {
         "Add two integers".into()
     }
@@ -60,10 +83,22 @@ impl Tool for Add {
     }
     async fn call(
         &self,
-        _: &mut ToolContext,
+        context: &mut ToolContext,
         args: AddArgs,
     ) -> std::result::Result<i128, Self::Error> {
-        Ok(i128::from(args.left) + i128::from(args.right))
+        let invocation = context.require::<ToolInvocation>().map_err(worker_error)?;
+        let key = invocation
+            .logical_key
+            .ok_or_else(|| Error::RustError("logical tool identity is required".into()))?;
+        let result = i128::from(args.left) + i128::from(args.right);
+        #[cfg(target_family = "wasm")]
+        self.storage.sql().exec(
+            "INSERT INTO example_effects (logical_id, left_value, right_value, result) VALUES (?, ?, ?, ?)",
+            vec![key.canonical().into(), args.left.into(), args.right.into(), result.to_string().into()],
+        )?;
+        #[cfg(not(target_family = "wasm"))]
+        let _ = key;
+        Ok(result)
     }
 }
 
@@ -76,9 +111,16 @@ pub struct AgentSession {
 impl AgentSession {
     fn engine(&self) -> Result<&Engine<CellStorage, CellStorage>> {
         if self.engine.get().is_none() {
+            self.storage.sql().exec(
+                "CREATE TABLE IF NOT EXISTS example_effects (sequence INTEGER PRIMARY KEY, logical_id TEXT NOT NULL, left_value INTEGER NOT NULL, right_value INTEGER NOT NULL, result TEXT NOT NULL)",
+                None,
+            )?;
             let engine = Builder::new(Model::new(MockScript::default(), Calculator))
                 .tool_with(
-                    Add,
+                    Add {
+                        #[cfg(target_family = "wasm")]
+                        storage: self.storage.clone(),
+                    },
                     ToolOptions::default()
                         .policy(ToolPolicy::read_only())
                         .require_approval(),
@@ -131,6 +173,12 @@ impl DurableObject for AgentSession {
                 Response::ok("decision committed")
             }
             (Method::Get, "status") => Response::from_json(&engine.status().map_err(worker_error)?),
+            (Method::Get, "effects") => Response::from_json(
+                &self.storage.sql().exec(
+                    "SELECT logical_id, left_value, right_value, result FROM example_effects ORDER BY sequence",
+                    None,
+                )?.to_array::<ObservedEffect>()?,
+            ),
             (Method::Get, "transcript") => {
                 Response::from_json(&engine.transcript().map_err(worker_error)?)
             }
@@ -164,6 +212,20 @@ fn worker_error(error: impl std::fmt::Display) -> Error {
 #[event(fetch)]
 pub async fn fetch(request: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = request.path();
+    #[cfg(all(feature = "conformance", target_family = "wasm"))]
+    if path.starts_with("/fixture/") {
+        let session = path
+            .split('/')
+            .nth(2)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| worker_error("use /fixture/<session>/<operation>"))?;
+        return env
+            .durable_object("SCRIPTS")?
+            .id_from_name(session)?
+            .get_stub()?
+            .fetch_with_request(request)
+            .await;
+    }
     let session = path
         .split('/')
         .nth(1)

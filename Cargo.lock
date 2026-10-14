@@ -2314,6 +2314,7 @@ dependencies = [
  "futures",
  "rig",
  "rig-celld",
+ "rig-codemode",
  "rig-core",
  "rig-durable",
  "serde",

@@ -18,5 +18,12 @@ serde.workspace = true
 serde_json.workspace = true
 worker.workspace = true
 
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+rig-codemode = { path = "../../../rig-codemode", default-features = false, features = ["worker-replay"], optional = true }
+
+[features]
+default = ["conformance"]
+conformance = ["dep:rig-codemode", "rig-durable/codemode"]
+
 [lints]
 workspace = true

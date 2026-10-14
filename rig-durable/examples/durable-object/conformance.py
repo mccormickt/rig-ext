@@ -25,7 +25,7 @@ def request(session, path, body=None, error=None):
             text = response.read().decode()
     except urllib.error.HTTPError as response:
         text = response.read().decode()
-        assert error and error in text, (response.status, text)
+        assert response.status == 409 and error and error in text, (response.status, text)
         return
     assert error is None, f"expected rejection: {error}"
     try:
@@ -63,10 +63,21 @@ def decision(session, approve):
 
 def result(session, request_id, disposition):
     response = request(session, f"result?request_id={request_id}")
-    assert response["response"]["output"] == "The tool round is complete.", response
+    assert response["response"]["content"] == [
+        {"type": "text", "text": "The tool round is complete."}
+    ], response
     assert len(response["tool_outcomes"]) == 1, response
     assert response["tool_outcomes"][0]["disposition"] == disposition, response
     return response
+
+
+def effects(session, count):
+    rows = request(session, "effects")
+    assert len(rows) == count, rows
+    for row in rows:
+        assert row["logical_id"].endswith(";8:prompt-0;1;0"), row
+        assert (row["left_value"], row["right_value"], row["result"]) == (20, 22, "42"), row
+    return rows
 
 
 session = f"{args.session_prefix}-conformance"
@@ -77,30 +88,38 @@ if args.verify_reopen:
     result(session, "two", "refused")
     assert len(request(session, "transcript")) == 8
     assert submit(session, "one")["state"] == "answered"
+    effects(session, 1)
     assert request(pending, "status")["approvals"]
+    effects(pending, 0)
     decision(pending, True)
     result(pending, "pending", "success")
     assert len(request(pending, "transcript")) == 4
-    print("PASS: results, receipts, transcript, and pending approval survive restart")
+    effects(pending, 1)
+    print("PASS: results, receipts, transcript, SQL effect identities/counts, and pending approval survive restart")
 else:
     receipt = submit(session, "one")
     assert receipt["prompt_index"] == 0, receipt
     until(session, lambda s: bool(s["approvals"]))
+    effects(session, 0)
     assert submit(session, "one")["prompt_index"] == 0
     submit(session, "one", "different", error="different message or mode")
     submit(session, "busy", mode="reject_if_busy", error="processing another prompt")
     decision(session, True)
     result(session, "one", "success")
+    effects(session, 1)
     transcript = request(session, "transcript")
     assert len(transcript) == 4, transcript
     assert "42" in json.dumps(transcript[2]), transcript
     submit(session, "two")
     decision(session, False)
     result(session, "two", "refused")
+    effects(session, 1)
     request(session, "close", {})
     submit(session, "closed", error="session is closed")
     assert submit(session, "one")["state"] == "answered"
+    effects(session, 1)
     submit(pending, "pending")
     until(pending, lambda s: bool(s["approvals"]))
+    effects(pending, 0)
     print("PASS: alarm-driven tools, dedupe, conflict, busy, approval, denial, close")
     print("Restart the server without deleting storage, then use --verify-reopen")
