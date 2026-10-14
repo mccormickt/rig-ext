@@ -37,7 +37,7 @@ duroxide = { workspace = true, optional = true }
 futures = "0.3"
 rig.workspace = true
 rig-memory.workspace = true
-rig-codemode = { path = "../rig-codemode", features = ["quickjs"], optional = true }
+rig-codemode = { path = "../rig-codemode", optional = true }
 rig-celld = { path = "../rig-celld", features = ["storage"], optional = true }
 worker = { workspace = true, optional = true }
 semver = "1"
@@ -50,6 +50,9 @@ temporalio-workflow = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { version = "1", features = ["time"], optional = true }
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+rig-codemode = { path = "../rig-codemode", features = ["quickjs"], optional = true }
 
 [dev-dependencies]
 duroxide = { workspace = true, features = ["sqlite"] }

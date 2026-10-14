@@ -63,6 +63,19 @@ The submission ledger retains receipts within its 48 KiB limit. Results remain
 available for the life of the object. Start another object when a limit is
 reached; compaction does not delete the audit transcript.
 
+Script and child intents reserve space for a bounded failure in the full 1 MiB
+tool record before batch admission. A completed result that does not fit becomes
+a nonretryable failure; admitted siblings still drain. A retained intent without
+this space remains open and returns `Error::Storage` from `drive()`.
+
+DO persistence limits JSON depth to 96 containers. Script arguments, settled
+result envelopes, and terminal reports have a 64-container limit to reserve
+space for persistence wrappers. Admission or terminal-report rejection produces
+an outer tool error after draining. A rejected nested result becomes a bounded
+tool failure; a resulting `script_error` report still has outer tool success.
+Unsafe retained checkpoints need migration; increasing the byte cap does not
+increase depth limits. These limits do not change native backend wire formats.
+
 Build the core, backend, and API-key-free example:
 
 ```sh

@@ -378,6 +378,10 @@ impl Engine<'_> {
             serde_json::to_string(&call.function.arguments).map_err(|e| e.to_string())?;
         entry.check_route_policy()?;
         let (content, outcome) = match &entry.route {
+            #[cfg(feature = "durable-object")]
+            ToolRoute::DurableObject { .. } => {
+                return Err("Duroxide does not support Durable Object tool routes".into());
+            }
             ToolRoute::RigTool => {
                 let name = call.function.name.to_string();
                 let execution_id = format!("{}:{}", ctx.instance_id(), ctx.execution_id());

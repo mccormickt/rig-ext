@@ -7,10 +7,23 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod child;
+#[cfg(feature = "codemode")]
+mod script;
 mod storage;
+pub use child::{
+    CHILD_PROTOCOL_MAX_BYTES, ChildDefinition, ChildHandle, ChildReply, ChildRequest,
+    ChildTransport, NamespaceTransport, child_id,
+};
 pub use storage::SqlDatabase;
 
-use std::{cell::Cell, collections::VecDeque, sync::Arc};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+};
+
+use child::ChildInvocation;
 
 use futures::{StreamExt, stream::FuturesUnordered};
 use rig::{
@@ -40,10 +53,16 @@ use crate::{
 pub enum Error {
     #[error("Durable Object storage failed: {0}")]
     Storage(String),
+    #[error("durable registration is incompatible with retained state: {0}")]
+    Incompatible(String),
+    #[error("uncertain child protocol reply: {0}")]
+    Protocol(String),
     #[error("invalid durable session: {0}")]
     Invalid(String),
     #[error("session payload has {bytes} bytes; configured limit is {max_bytes} bytes")]
     Limit { bytes: usize, max_bytes: usize },
+    #[error("durable JSON exceeds the safe persistence depth of {max_depth}")]
+    Depth { max_depth: usize },
     #[error(transparent)]
     Submission(#[from] crate::SubmissionError),
     #[error(transparent)]
@@ -106,12 +125,20 @@ pub struct Status {
 struct Session {
     id: String,
     config: ConfigSnapshot,
+    #[serde(default = "default_implementation_version")]
+    implementation_version: String,
+    #[serde(default)]
+    child_id: Option<String>,
     closed: bool,
     queued: VecDeque<SubmitInput>,
     active: Option<Run>,
     compaction: Option<CompactionRecord>,
     compact_due: bool,
     compaction_error: Option<String>,
+}
+
+fn default_implementation_version() -> String {
+    "1".into()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -144,6 +171,8 @@ struct Call {
     pending: PendingToolCall,
     input: ToolActivityInput,
     digest: String,
+    #[serde(default)]
+    child: Option<ChildInvocation>,
     approval: Option<ApprovalRequest>,
     decision: Option<ApprovalDecision>,
     started: bool,
@@ -159,6 +188,10 @@ pub struct Builder {
     model: DynModel<Completion>,
     tools: ToolSet,
     config: DurableAgentConfig,
+    implementation_version: String,
+    children: BTreeMap<String, ChildHandle>,
+    #[cfg(feature = "codemode")]
+    code_mode: Option<script::Registration>,
     compaction: Option<Compaction>,
     max_bytes: usize,
 }
@@ -172,6 +205,10 @@ impl Builder {
                 contract: InvocationContract::Logical,
                 ..Default::default()
             },
+            implementation_version: "1".into(),
+            children: BTreeMap::new(),
+            #[cfg(feature = "codemode")]
+            code_mode: None,
             compaction: None,
             max_bytes: 8 * 1024 * 1024,
         }
@@ -195,6 +232,51 @@ impl Builder {
     pub fn completion_retry(mut self, value: RetryPolicy) -> Self {
         self.config.completion_retry = value;
         self
+    }
+    pub fn implementation_version(mut self, version: impl Into<String>) -> Self {
+        self.implementation_version = version.into();
+        self
+    }
+    /// Capture the child contract without the model, credentials, or transport.
+    pub fn child_definition(&self) -> Result<ChildDefinition, Error> {
+        #[cfg(feature = "codemode")]
+        let (config, _) = self.prepare_script()?;
+        #[cfg(not(feature = "codemode"))]
+        let config = &self.config;
+        let definition = ChildDefinition {
+            implementation_version: self.implementation_version.clone(),
+            config: config.snapshot(),
+        };
+        definition.validate()?;
+        Ok(definition)
+    }
+    /// Expose a child agent as a tool. It receives the complete argument JSON
+    /// as its prompt, owns retries, and does not accept approvals or steering.
+    pub fn sub_agent(
+        mut self,
+        definition: rig::completion::ToolDefinition,
+        child: ChildHandle,
+    ) -> Result<Self, Error> {
+        child.definition.validate()?;
+        let name = definition.name.to_string();
+        if self.config.tools.get(&name).is_some() {
+            return Err(Error::Invalid(format!(
+                "tool `{name}` is already registered"
+            )));
+        }
+        self.config.tools.insert(ToolEntry {
+            definition,
+            route: ToolRoute::DurableObject {
+                definition_digest: child.definition.digest()?,
+            },
+            retry: RetryPolicy::new(1),
+            tag: None,
+            requires_approval: false,
+            policy: crate::ToolPolicy::idempotent()
+                .implementation_version(&child.definition.implementation_version),
+        });
+        self.children.insert(name, child);
+        Ok(self)
     }
     /// Cap each checkpoint and the full transcript. Individual SQL records
     /// also have a 1 MiB cap, below the platform's 2 MB row limit.
@@ -231,6 +313,23 @@ impl Builder {
         wake: W,
         session_id: impl Into<String>,
     ) -> Result<Engine<D, W>, Error> {
+        for (name, child) in &self.children {
+            let registered = self
+                .config
+                .tools
+                .get(name)
+                .ok_or_else(|| Error::Invalid("child registration is missing".into()))?;
+            if registered.route
+                != (ToolRoute::DurableObject {
+                    definition_digest: child.definition.digest()?,
+                })
+                || self.tools.contains(name)
+            {
+                return Err(Error::Invalid(format!(
+                    "child tool `{name}` has conflicting registrations"
+                )));
+            }
+        }
         for entry in self.config.tools.0.values() {
             if entry.tag.is_some() || entry.retry.timeout.is_some() {
                 return Err(Error::Invalid(
@@ -243,6 +342,10 @@ impl Builder {
                 "Durable Objects do not support completion timeouts".into(),
             ));
         }
+        #[cfg(feature = "codemode")]
+        let (config, script) = self.prepare_script()?;
+        #[cfg(not(feature = "codemode"))]
+        let config = self.config;
         storage::initialize(&db)?;
         let id = session_id.into();
         db.transaction(|| {
@@ -255,7 +358,9 @@ impl Builder {
             } else {
                 let session = Session {
                     id: id.clone(),
-                    config: self.config.snapshot(),
+                    config: config.snapshot(),
+                    implementation_version: self.implementation_version.clone(),
+                    child_id: None,
                     closed: false,
                     queued: VecDeque::new(),
                     active: None,
@@ -279,14 +384,36 @@ impl Builder {
                 reason = "ToolExecutor uses Arc across targets; Workers execute local tools without threads"
             )
         )]
-        let executor = ToolExecutor::new(Arc::new(self.tools))
-            .with_registered_policies(self.config.tools.policies());
+        let executor = ToolExecutor::new(Arc::new(self.tools)).with_registered_policies({
+            #[cfg(feature = "codemode")]
+            {
+                script
+                    .as_ref()
+                    .map(|runtime| {
+                        runtime
+                            .definition
+                            .tools
+                            .iter()
+                            .map(|entry| (entry.definition.name.to_string(), entry.policy.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_else(|| config.tools.policies())
+            }
+            #[cfg(not(feature = "codemode"))]
+            {
+                config.tools.policies()
+            }
+        });
         Ok(Engine {
             executor,
             db,
             wake,
             model: self.model,
-            config: self.config,
+            config,
+            implementation_version: self.implementation_version,
+            children: self.children,
+            #[cfg(feature = "codemode")]
+            script,
             compaction: self.compaction,
             max_bytes: self.max_bytes,
             driving: Cell::new(false),
@@ -303,12 +430,75 @@ pub struct Engine<D, W> {
     model: DynModel<Completion>,
     executor: ToolExecutor,
     config: DurableAgentConfig,
+    implementation_version: String,
+    children: BTreeMap<String, ChildHandle>,
+    #[cfg(feature = "codemode")]
+    script: Option<script::Runtime>,
     compaction: Option<Compaction>,
     max_bytes: usize,
     driving: Cell<bool>,
 }
 
 struct DriveLock<'a>(&'a Cell<bool>);
+
+const STORAGE_FAILURE: &str = "tool result exceeds the durable storage limit; its effect may have happened and must not be repeated";
+
+fn call_capacity_error(error: Error) -> Error {
+    match error {
+        error @ (Error::Limit { .. } | Error::Depth { .. }) => Error::Storage(format!(
+            "tool intent cannot retain a bounded terminal output within the fixed {}-byte tool-call row limit: {error}; reduce or migrate the retained intent; increasing the session-history limit does not change this cap",
+            storage::ROW_BYTES
+        )),
+        error => error,
+    }
+}
+
+fn storage_failure_output(
+    name: &str,
+    interruption: Option<InterruptionReason>,
+) -> ToolActivityOutput {
+    use rig::tool::{ToolExecutionError, ToolResult, portable::ToolResultContext};
+    let result = match interruption {
+        Some(reason) => DurableToolResult::interrupted(reason, STORAGE_FAILURE),
+        None => {
+            DurableToolResult::from_rig(
+                ToolResult::failed(
+                    ToolExecutionError::other(STORAGE_FAILURE).with_retryable(false),
+                ),
+                &ToolResultContext::default(),
+                &crate::policy::MetadataRetention::none(),
+            )
+            .0
+        }
+    };
+    ToolActivityOutput::from_result(name, result)
+}
+
+fn bounded_call_output(
+    call: &Call,
+    output: ToolActivityOutput,
+) -> Result<ToolActivityOutput, Error> {
+    let mut finished = call.clone();
+    finished.output = Some(output.clone());
+    match storage::encode(&finished, storage::ROW_BYTES) {
+        Err(Error::Limit { .. } | Error::Depth { .. }) => {
+            let interruption = output
+                .result
+                .as_ref()
+                .and_then(|result| result.interruption.as_ref())
+                .map(|i| i.reason);
+            let output = storage_failure_output(&call.input.name, interruption);
+            finished.output = Some(output.clone());
+            storage::encode(&finished, storage::ROW_BYTES).map_err(call_capacity_error)?;
+            Ok(output)
+        }
+        result => {
+            result?;
+            Ok(output)
+        }
+    }
+}
+
 impl Drop for DriveLock<'_> {
     fn drop(&mut self) {
         self.0.set(false);
@@ -316,6 +506,28 @@ impl Drop for DriveLock<'_> {
 }
 
 impl<D: SqlDatabase, W: Wake> Engine<D, W> {
+    fn check_call_capacity(&self, call: &Call) -> Result<(), Error> {
+        let needs_reserve = call.child.is_some();
+        #[cfg(feature = "codemode")]
+        let needs_reserve =
+            needs_reserve || (self.script.is_some() && call.input.name == "codemode");
+        if !needs_reserve || call.output.is_some() {
+            return Ok(());
+        }
+        let mut finished = call.clone();
+        finished.started = false;
+        finished.attempt = u32::MAX;
+        finished.deadline_ms = Some(u64::MAX);
+        if let Some(attempt) = &mut finished.input.invocation.attempt {
+            attempt.activity_attempt = Some(u32::MAX);
+        }
+        for interruption in [None, Some(InterruptionReason::ToolUnavailable)] {
+            finished.output = Some(storage_failure_output(&call.input.name, interruption));
+            storage::encode(&finished, storage::ROW_BYTES).map_err(call_capacity_error)?;
+        }
+        Ok(())
+    }
+
     fn load(&self) -> Result<Session, Error> {
         storage::read(&self.db, "session")?
             .ok_or_else(|| Error::Storage("session checkpoint is missing".into()))
@@ -392,6 +604,164 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
         self.db.exec("INSERT INTO rig_tool_calls (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data",
             &[key.into(), storage::encode(call, storage::ROW_BYTES)?])?;
         Ok(())
+    }
+    /// Invoke only after the application authenticates and routes the request.
+    /// This reads committed state; child alarms drive the actual model/tools.
+    pub async fn handle_child_request(&self, request: ChildRequest) -> Result<ChildReply, Error> {
+        let expected = request.expected();
+        let live = ChildDefinition {
+            implementation_version: self.implementation_version.clone(),
+            config: self.config.snapshot(),
+        };
+        if let Err(error) = expected.validate() {
+            return Ok(ChildReply::Rejected(error.to_string()));
+        }
+        let session = self.load()?;
+        let retained = ChildDefinition {
+            config: session.config.clone(),
+            implementation_version: session.implementation_version.clone(),
+        };
+        if expected.digest()? != retained.digest()? {
+            return Ok(ChildReply::Rejected(
+                "child configuration or implementation version mismatch".into(),
+            ));
+        }
+        if session
+            .child_id
+            .as_deref()
+            .is_some_and(|id| id != request.child_id())
+            || (session.child_id.is_none() && !self.ledger()?.receipts.is_empty())
+        {
+            return Ok(ChildReply::Rejected("child identity mismatch".into()));
+        }
+        // Validate retained request conflicts before checking live registration.
+        let request_id = match &request {
+            ChildRequest::Submit {
+                child_id, input, ..
+            } => {
+                if input.request_id != *child_id {
+                    return Ok(ChildReply::Rejected(
+                        "child request ID must equal child identity".into(),
+                    ));
+                }
+                let mut ledger = self.ledger()?;
+                if ledger.receipt(&input.request_id).is_some()
+                    && let Err(error) = ledger.admit(
+                        input,
+                        SessionAvailability {
+                            busy: true,
+                            closed: session.closed,
+                        },
+                    )
+                {
+                    return Ok(ChildReply::Rejected(error.to_string()));
+                }
+                &input.request_id
+            }
+            ChildRequest::Poll {
+                child_id,
+                request_id,
+                ..
+            } => {
+                if request_id != child_id || session.child_id.as_deref() != Some(child_id) {
+                    return Ok(ChildReply::Rejected("child identity mismatch".into()));
+                }
+                request_id
+            }
+        };
+        if let Some(result) = self.result(request_id)? {
+            return ChildReply::completed(result);
+        }
+        if let Some(receipt) = self.ledger()?.receipt(request_id) {
+            match &receipt.state {
+                SubmissionState::Failed { error } => return Ok(ChildReply::Failed(error.clone())),
+                SubmissionState::Cancelled => {
+                    return Ok(ChildReply::Failed("child submission was cancelled".into()));
+                }
+                SubmissionState::Answered => {
+                    return Ok(ChildReply::Failed(
+                        "committed child result is missing".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if expected.digest()? != live.digest()? {
+            return Err(Error::Incompatible(
+                "child configuration or implementation version mismatch".into(),
+            ));
+        }
+        let request_id = match request {
+            ChildRequest::Submit {
+                child_id, input, ..
+            } => {
+                let request_id = input.request_id.clone();
+                // Admission and identity binding share one transaction. Alarm
+                // acknowledgement can be lost without losing the durable intent.
+                self.wake
+                    .arm(self.wake.now_ms().saturating_add(1000))
+                    .await?;
+                let admission = self.update(|session| {
+                    let mut ledger = self.ledger()?;
+                    if session.child_id.as_deref().is_some_and(|id| id != child_id)
+                        || (session.child_id.is_none() && !ledger.receipts.is_empty())
+                    {
+                        return Err(Error::Invalid("child identity mismatch".into()));
+                    }
+                    let admission = ledger.admit(
+                        &input,
+                        SessionAvailability {
+                            busy: session.active.is_some()
+                                || !session.queued.is_empty()
+                                || session.compact_due,
+                            closed: session.closed,
+                        },
+                    )?;
+                    if matches!(admission, Admission::Admitted(_)) {
+                        storage::encode(&input.message, storage::ROW_BYTES)?;
+                        session.queued.push_back(input);
+                        session.child_id = Some(child_id);
+                        self.save_ledger(&ledger)?;
+                    }
+                    Ok(())
+                });
+                self.wake
+                    .arm(self.wake.now_ms().saturating_add(1000))
+                    .await?;
+                match admission {
+                    Err(Error::Submission(error)) => {
+                        return Ok(ChildReply::Rejected(error.to_string()));
+                    }
+                    Err(Error::Invalid(error)) => return Ok(ChildReply::Rejected(error)),
+                    Err(error @ Error::Limit { .. }) => {
+                        return Ok(ChildReply::Rejected(error.to_string()));
+                    }
+                    result => result?,
+                }
+                request_id
+            }
+            ChildRequest::Poll { request_id, .. } => request_id,
+        };
+        if let Some(result) = self.result(&request_id)? {
+            return ChildReply::completed(result);
+        }
+        Ok(
+            match self
+                .ledger()?
+                .receipt(&request_id)
+                .map(|receipt| &receipt.state)
+            {
+                Some(SubmissionState::Failed { error }) => ChildReply::Failed(error.clone()),
+                Some(SubmissionState::Cancelled) => {
+                    ChildReply::Failed("child submission was cancelled".into())
+                }
+                Some(SubmissionState::Answered) => {
+                    ChildReply::Failed("committed child result is missing".into())
+                }
+                Some(_) => ChildReply::Pending,
+                None => ChildReply::Rejected("child submission is not admitted".into()),
+            },
+        )
     }
     /// Admit and arm recovery before returning. Drive immediately with `wait`
     /// or let the alarm process the queue. Duplicate IDs return their receipt.
@@ -500,6 +870,12 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
             Some(Phase::Tools { keys }) => {
                 for key in keys {
                     let call = self.call(key)?;
+                    #[cfg(feature = "codemode")]
+                    if call.input.name == "codemode"
+                        && let Some(value) = self.script_deadline(&call)?
+                    {
+                        deadline = Some(deadline.map_or(value, |d| d.min(value)));
+                    }
                     if call.decision.is_none() {
                         approvals.extend(call.approval);
                     }
@@ -547,7 +923,8 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
         }
     }
     /// Catch driver errors and explicitly arm recovery. Platform alarm retry
-    /// counts are not the retry policy. A failed alarm write is returned.
+    /// counts are not the retry policy. Alarm writes and registration
+    /// incompatibilities are returned without terminating admitted work.
     pub async fn alarm(&self) -> Result<(), Error> {
         if self.driving.get() {
             return self
@@ -555,10 +932,13 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                 .arm(self.wake.now_ms().saturating_add(30_000))
                 .await;
         }
-        if self.drive().await.is_err() {
+        if let Err(error) = self.drive().await {
             self.wake
                 .arm(self.wake.now_ms().saturating_add(2000))
                 .await?;
+            if matches!(error, Error::Incompatible(_)) {
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -587,10 +967,15 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                 break;
             }
             let session = self.load()?;
+            if session.implementation_version != self.implementation_version {
+                return Err(Error::Incompatible(
+                    "agent implementation version mismatch".into(),
+                ));
+            }
             let config = self
                 .config
                 .resolve(&session.config)
-                .map_err(|e| Error::Invalid(e.to_string()))?;
+                .map_err(|e| Error::Incompatible(e.to_string()))?;
             if session.active.is_none() {
                 if session.compact_due {
                     let context = self.context(&session)?;
@@ -774,21 +1159,33 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                         let digest = crate::identity::arguments_digest(
                             &serde_json::Value::Object(call.function.arguments.clone()),
                         )?;
-                        self.save_call(
-                            &key.canonical(),
-                            &Call {
-                                pending,
-                                input,
-                                digest,
-                                approval,
-                                decision: None,
-                                started: false,
-                                output: None,
-                                failure: None,
-                                attempt: 1,
-                                deadline_ms: None,
-                            },
-                        )?;
+                        let child =
+                            self.children
+                                .get(&entry.definition.name.to_string())
+                                .map(|child| {
+                                    ChildInvocation::new(
+                                        &key,
+                                        None,
+                                        child.definition.clone(),
+                                        serde_json::Value::Object(call.function.arguments.clone())
+                                            .to_string(),
+                                    )
+                                });
+                        let call = Call {
+                            pending,
+                            input,
+                            digest,
+                            child,
+                            approval,
+                            decision: None,
+                            started: false,
+                            output: None,
+                            failure: None,
+                            attempt: 1,
+                            deadline_ms: None,
+                        };
+                        self.check_call_capacity(&call)?;
+                        self.save_call(&key.canonical(), &call)?;
                         keys.push(key.canonical());
                     }
                     run.phase = Phase::Tools { keys };
@@ -880,6 +1277,11 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
             .iter()
             .map(|key| self.call(key))
             .collect::<Result<Vec<_>, _>>()?;
+        for call in &calls {
+            #[cfg(feature = "codemode")]
+            self.check_script_registration(call)?;
+            self.check_call_capacity(call)?;
+        }
         if let Some(error) = calls.iter().find_map(|call| call.failure.clone()) {
             self.fail(error)?;
             return Ok(true);
@@ -891,6 +1293,29 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
             return Ok(false);
         }
         let mut pending = FuturesUnordered::new();
+        let mut deferred = Vec::new();
+        let execute = |key, mut call: Call| async move {
+            call.started = true;
+            call.deadline_ms = None;
+            if let Some(attempt) = &mut call.input.invocation.attempt {
+                attempt.activity_attempt = Some(call.attempt);
+            }
+            self.db.transaction(|| self.save_call(key, &call))?;
+            #[cfg(feature = "codemode")]
+            if self.script.is_some() && call.input.name == "codemode" {
+                let result = self.script(&call).await?;
+                return Ok((key, Ok(result), call));
+            }
+            let result = if let Some(child) = &mut call.child {
+                self.poll_child(&call.input.name, child).await
+            } else {
+                self.executor
+                    .execute_committed(call.input.clone())
+                    .await
+                    .map(Some)
+            };
+            Ok::<_, Error>((key, result, call))
+        };
         for (key, mut call) in keys.iter().zip(calls) {
             if call.output.is_some() || call.pending.preresolved_result.is_some() {
                 continue;
@@ -898,12 +1323,6 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
             if let Some(ApprovalDecision::Deny { reason, .. }) = &call.decision {
                 call.pending = driver::deny_tool(call.pending, reason.clone());
                 self.db.transaction(|| self.save_call(key, &call))?;
-                continue;
-            }
-            if call
-                .deadline_ms
-                .is_some_and(|deadline| deadline > self.wake.now_ms())
-            {
                 continue;
             }
             let policy = call
@@ -915,11 +1334,11 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                 .config
                 .tools
                 .get(&call.input.name)
-                .ok_or_else(|| Error::Invalid("tool registration is missing".into()))?;
+                .ok_or_else(|| Error::Incompatible("tool registration is missing".into()))?;
             if policy.version() != registered.policy.version() {
-                return self
-                    .fail("tool implementation version mismatch".into())
-                    .map(|()| true);
+                return Err(Error::Incompatible(
+                    "tool implementation version mismatch".into(),
+                ));
             }
             let digest =
                 crate::identity::arguments_digest(&serde_json::from_str(&call.input.arguments)?)?;
@@ -943,24 +1362,71 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                 self.db.transaction(|| self.save_call(key, &call))?;
                 continue;
             }
-            call.started = true;
-            call.deadline_ms = None;
-            if let Some(attempt) = &mut call.input.invocation.attempt {
-                attempt.activity_attempt = Some(call.attempt);
+            if call
+                .deadline_ms
+                .is_some_and(|deadline| deadline > self.wake.now_ms())
+            {
+                deferred.push((key.as_str(), call));
+                continue;
             }
-            self.db.transaction(|| self.save_call(key, &call))?;
-            pending.push(async move {
-                (
-                    key,
-                    self.executor.execute_committed(call.input.clone()).await,
-                    call,
-                )
-            });
+            pending.push(execute(key.as_str(), call));
         }
         let mut failure = None;
-        while let Some((key, result, mut call)) = pending.next().await {
+        while !pending.is_empty() {
+            let deadline = deferred
+                .iter()
+                .filter_map(|(_, call)| call.deadline_ms)
+                .min();
+            let observation = if let Some(deadline) = deadline {
+                match futures::future::select(
+                    pending.next(),
+                    Box::pin(self.wake.delay(deadline.saturating_sub(self.wake.now_ms()))),
+                )
+                .await
+                {
+                    futures::future::Either::Left((observation, _)) => observation,
+                    futures::future::Either::Right(((), _)) => {
+                        let mut index = 0;
+                        while index < deferred.len() {
+                            if deferred[index]
+                                .1
+                                .deadline_ms
+                                .is_some_and(|d| d <= self.wake.now_ms())
+                            {
+                                let (key, call) = deferred.remove(index);
+                                pending.push(execute(key, call));
+                            } else {
+                                index += 1;
+                            }
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                pending.next().await
+            };
+            let Some(observation) = observation else {
+                break;
+            };
+            let (key, result, mut call) = observation?;
             match result {
-                Ok(output) => call.output = Some(output),
+                Ok(Some(output)) => {
+                    call.output = Some(if call.child.is_some() {
+                        bounded_call_output(&call, output)?
+                    } else {
+                        output
+                    });
+                }
+                Ok(None) => {
+                    let deadline = self.wake.now_ms().saturating_add(2000);
+                    #[cfg(feature = "codemode")]
+                    let deadline = if self.script.is_some() && call.input.name == "codemode" {
+                        self.script_deadline(&call)?.unwrap_or(deadline)
+                    } else {
+                        deadline
+                    };
+                    call.deadline_ms = Some(deadline);
+                }
                 Err(error) => {
                     let entry = config
                         .tools
@@ -978,6 +1444,9 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                 }
             }
             self.db.transaction(|| self.save_call(key, &call))?;
+            if call.output.is_none() && call.failure.is_none() && call.deadline_ms.is_some() {
+                deferred.push((key, call));
+            }
         }
         if let Some(error) = failure {
             self.fail(error)?;
@@ -1031,6 +1500,46 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
             self.record(run)
         })?;
         Ok(true)
+    }
+    async fn poll_child(
+        &self,
+        name: &str,
+        child: &mut ChildInvocation,
+    ) -> Result<Option<ToolActivityOutput>, String> {
+        let handle = self
+            .children
+            .get(name)
+            .ok_or("child registration is missing")?;
+        if child
+            .request
+            .expected()
+            .digest()
+            .map_err(|e| e.to_string())?
+            != handle.definition.digest().map_err(|e| e.to_string())?
+        {
+            return Err("child definition mismatch".into());
+        }
+        let reply = match handle.transport.request(&child.outbound()).await {
+            Ok(reply) => reply,
+            Err(_) => return Ok(None),
+        };
+        child.acknowledged = true;
+        use rig::tool::{ToolExecutionError, ToolOutput, ToolResult, portable::ToolResultContext};
+        let result = match reply {
+            ChildReply::Pending => return Ok(None),
+            ChildReply::Completed(response) => {
+                ToolResult::success(ToolOutput::text(response.output()))
+            }
+            ChildReply::Failed(error) | ChildReply::Rejected(error) => {
+                ToolResult::failed(ToolExecutionError::other(error).with_retryable(false))
+            }
+        };
+        let (result, _) = DurableToolResult::from_rig(
+            result,
+            &ToolResultContext::default(),
+            &crate::policy::MetadataRetention::none(),
+        );
+        Ok(Some(ToolActivityOutput::from_result(name, result)))
     }
 }
 

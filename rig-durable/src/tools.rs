@@ -78,6 +78,10 @@ pub enum ToolRoute {
     Activity {
         activity_name: String,
     },
+    #[cfg(feature = "durable-object")]
+    DurableObject {
+        definition_digest: String,
+    },
     #[cfg(feature = "duroxide")]
     SubOrchestration {
         orchestration_name: String,

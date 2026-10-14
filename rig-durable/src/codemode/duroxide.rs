@@ -118,6 +118,10 @@ async fn execute(
         .ok_or("script called an unregistered tool")?;
     let args = serde_json::to_string(&call.arguments).map_err(|error| error.to_string())?;
     let result = match &entry.route {
+        #[cfg(feature = "durable-object")]
+        ToolRoute::DurableObject { .. } => {
+            return Err("Duroxide does not support Durable Object tool routes".into());
+        }
         ToolRoute::RigTool => {
             let raw = schedule_with_retry(
                 ctx,

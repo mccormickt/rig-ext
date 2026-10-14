@@ -40,26 +40,29 @@ pub(super) fn initialize(db: &impl SqlDatabase) -> Result<(), Error> {
         db.exec("CREATE TABLE IF NOT EXISTS rig_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)", &[])?;
         let version = db.exec("SELECT value FROM rig_meta WHERE key = 'schema'", &[])?;
         if let Some(row) = version.first() {
-            if row.get("value").and_then(Value::as_str) != Some("2") {
+            if !matches!(row.get("value").and_then(Value::as_str), Some("2" | "3")) {
                 return Err(Error::Invalid("unsupported Durable Object schema version".into()));
             }
         } else {
-            db.exec("INSERT INTO rig_meta VALUES ('schema', '2')", &[])?;
+            db.exec("INSERT INTO rig_meta VALUES ('schema', '3')", &[])?;
         }
         for statement in [
             "CREATE TABLE IF NOT EXISTS rig_entries (id INTEGER PRIMARY KEY, data TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS rig_runs (key TEXT NOT NULL, chunk INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (key, chunk))",
             "CREATE TABLE IF NOT EXISTS rig_tool_calls (key TEXT PRIMARY KEY, data TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS rig_submissions (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS rig_script_effects (key TEXT PRIMARY KEY, data TEXT NOT NULL)",
         ] {
             db.exec(statement, &[])?;
         }
+        db.exec("UPDATE rig_meta SET value = '3' WHERE key = 'schema'", &[])?;
         Ok(())
     })
 }
 
 pub(super) fn encode(value: &impl Serialize, cap: usize) -> Result<String, Error> {
     let data = serde_json::to_string(value)?;
+    check_depth(&data, 96)?;
     if data.len() > cap {
         return Err(Error::Limit {
             bytes: data.len(),
@@ -67,6 +70,36 @@ pub(super) fn encode(value: &impl Serialize, cap: usize) -> Result<String, Error
         });
     }
     Ok(data)
+}
+
+/// Count containers without recursively decoding attacker-controlled JSON.
+/// Strings (including escaped quotes and JSON stored inside strings) are opaque.
+pub(super) fn check_depth(data: &str, max_depth: usize) -> Result<(), Error> {
+    let (mut depth, mut string, mut escape) = (0usize, false, false);
+    for byte in data.bytes() {
+        if string {
+            if escape {
+                escape = false;
+            } else if byte == b'\\' {
+                escape = true;
+            } else if byte == b'"' {
+                string = false;
+            }
+        } else {
+            match byte {
+                b'"' => string = true,
+                b'[' | b'{' => {
+                    depth += 1;
+                    if depth > max_depth {
+                        return Err(Error::Depth { max_depth });
+                    }
+                }
+                b']' | b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn read<T: DeserializeOwned>(
