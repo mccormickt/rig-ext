@@ -2,6 +2,28 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[cfg(all(feature = "temporal", feature = "codemode"))]
+#[tokio::test]
+async fn temporal_replays_baseline_codemode_history() {
+    use rig_durable::temporal::TemporalAgentWorkflow;
+    use temporalio_client::WorkflowHistory;
+    use temporalio_sdk::workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions};
+    let mut options = WorkflowReplayerOptions::new().namespace("default").build();
+    options
+        .register_workflow::<TemporalAgentWorkflow>()
+        .unwrap();
+    WorkflowReplayer::new(options)
+        .unwrap()
+        .replay_workflow(
+            WorkflowHistory::from_json(include_bytes!(
+                "fixtures/codemode-baseline/temporal-codemode-race.json"
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
 #[cfg(feature = "temporal")]
 #[tokio::test]
 async fn temporal_replays_recorded_retries_approval_and_steering() {

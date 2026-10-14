@@ -218,3 +218,160 @@ fn json_or_text(raw: String) -> ToolOutput {
         .map(ToolOutput::json)
         .unwrap_or_else(|_| ToolOutput::text(raw))
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use duroxide::{
+        Action, Event, EventKind,
+        runtime::replay_engine::{ReplayEngine, TurnResult},
+    };
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct Recording {
+        instance: String,
+        history: Vec<Event>,
+    }
+
+    #[test]
+    fn replays_baseline_codemode_histories_and_new_schedule_prefixes() {
+        for (bytes, agent, contract, max_in_flight) in [
+            (
+                include_bytes!(
+                    "../../tests/fixtures/codemode-baseline/duroxide-codemode-children.json"
+                )
+                .as_slice(),
+                "workflow",
+                InvocationContract::Logical,
+                Limits::default().max_in_flight,
+            ),
+            (
+                include_bytes!(
+                    "../../tests/fixtures/codemode-baseline/duroxide-codemode-race.json"
+                )
+                .as_slice(),
+                "race",
+                InvocationContract::Legacy,
+                2,
+            ),
+        ] {
+            let recording: Recording = serde_json::from_slice(bytes).unwrap();
+            let mut tools = ToolCatalog::default();
+            // Planner activities are replayed, not executed. Only routing and
+            // policy settings affect the workflow's emitted schedule payloads.
+            for (name, child) in [
+                ("research", Some("researcher")),
+                ("assess", Some("assessor")),
+                ("review", Some("reviewer")),
+                ("interruptible", None),
+                ("probe", None),
+            ] {
+                tools.insert(ToolEntry {
+                    definition: rig::completion::ToolDefinition {
+                        name: rig::message::ToolName::new(name).unwrap(),
+                        description: "Recorded nested tool".into(),
+                        parameters: serde_json::json!({"type":"object"}),
+                    },
+                    route: child.map_or(ToolRoute::RigTool, |child| ToolRoute::DurableAgent {
+                        orchestration_name: RuntimeNames::for_agent(child, "1.0.0").orchestration,
+                        version: "1.0.0".into(),
+                    }),
+                    retry: crate::RetryPolicy::new(1),
+                    tag: None,
+                    requires_approval: false,
+                    policy: if name == "interruptible" {
+                        crate::ToolPolicy::read_only()
+                    } else {
+                        Default::default()
+                    },
+                });
+            }
+            let (_, _, registry) = registries(
+                RuntimeNames::for_agent(agent, "1.0.0"),
+                "1.0.0",
+                tools,
+                contract,
+                Limits {
+                    max_in_flight,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let EventKind::OrchestrationStarted {
+                name,
+                version,
+                input,
+                ..
+            } = recording.history[0].kind.clone()
+            else {
+                panic!("missing start")
+            };
+            let handler = registry
+                .resolve_handler_exact(&name, &semver::Version::parse(&version).unwrap())
+                .unwrap();
+            // Stop before each recorded schedule so the adapter must emit it
+            // anew. This checks child identity, which historical replay binds
+            // from history instead of comparing with the emitted identity.
+            for (index, expected) in recording.history.iter().enumerate().filter(|(_, event)| {
+                matches!(
+                    event.kind,
+                    EventKind::ActivityScheduled { .. }
+                        | EventKind::SubOrchestrationScheduled { .. }
+                )
+            }) {
+                let mut replay = ReplayEngine::new(
+                    recording.instance.clone(),
+                    1,
+                    recording.history[..index].to_vec(),
+                );
+                let result = replay.execute_orchestration(
+                    handler.clone(),
+                    input.clone(),
+                    name.clone(),
+                    version.clone(),
+                    "prefix-replay",
+                );
+                assert!(
+                    matches!(result, TurnResult::Continue),
+                    "{agent} prefix {index}: {result:?}"
+                );
+                let actual = replay
+                    .history_delta()
+                    .iter()
+                    .find(|event| event.event_id == expected.event_id)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&actual.kind).unwrap(),
+                    serde_json::to_value(&expected.kind).unwrap(),
+                    "{agent} schedule {}",
+                    expected.event_id
+                );
+                for action in replay.pending_actions() {
+                    if let Action::StartSubOrchestration { version, .. } = action {
+                        assert_eq!(version.as_deref(), Some("1.0.0"));
+                    }
+                }
+            }
+            let mut history = recording.history;
+            let terminal = history.pop().unwrap();
+            let EventKind::OrchestrationCompleted { output: expected } = terminal.kind else {
+                panic!("missing completion")
+            };
+            let mut replay = ReplayEngine::new(recording.instance, terminal.execution_id, history);
+            let result = replay.execute_orchestration(handler, input, name, version, "full-replay");
+            let TurnResult::Completed(actual) = result else {
+                panic!("{agent}: {result:?}")
+            };
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&actual).unwrap(),
+                serde_json::from_str::<serde_json::Value>(&expected).unwrap()
+            );
+            assert!(
+                replay.pending_actions().is_empty(),
+                "replay must not schedule effects"
+            );
+        }
+    }
+}

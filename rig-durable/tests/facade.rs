@@ -680,62 +680,72 @@ impl Tool for InterruptedTool {
 async fn reconnects_to_a_run_after_runtime_restart_without_recalling_the_model_turn() {
     let first_calls = Arc::new(AtomicUsize::new(0));
     let entered = Arc::new(tokio::sync::Notify::new());
-    let first = DurableAgent::builder(
-        "restartable",
-        MockCompletionModel::from_turns([MockTurn::tool_call(
-            "call",
-            "interruptible",
-            serde_json::json!({}),
-        )]),
-    )
-    .tool_with(
-        InterruptedTool {
-            calls: first_calls.clone(),
-            block: true,
-            entered: entered.clone(),
-        },
-        ToolOptions::default().retry(RetryPolicy::new(1)),
-    )
-    .build()
-    .unwrap();
+    let first_model = MockCompletionModel::from_turns([MockTurn::tool_call(
+        "call",
+        "interruptible",
+        serde_json::json!({}),
+    )]);
+    let first = DurableAgent::builder("restartable", first_model.clone())
+        .tool_with(
+            InterruptedTool {
+                calls: first_calls.clone(),
+                block: true,
+                entered: entered.clone(),
+            },
+            ToolOptions::default().retry(RetryPolicy::new(1)),
+        )
+        .build()
+        .unwrap();
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
-    let first_orchestrator = AgentOrchestrator::builder(store.clone())
-        .register(first)
-        .unwrap()
-        .runtime_options(RuntimeOptions {
-            worker_lock_timeout: Duration::from_secs(1),
-            ..Default::default()
+    let worker_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let worker_store = store.clone();
+    let first_orchestrator = worker_runtime
+        .spawn(async move {
+            AgentOrchestrator::builder(worker_store)
+                .register(first)
+                .unwrap()
+                .runtime_options(RuntimeOptions {
+                    worker_lock_timeout: Duration::from_secs(1),
+                    ..Default::default()
+                })
+                .start()
+                .await
+                .unwrap()
         })
-        .start()
         .await
         .unwrap();
+    let started = entered.notified();
     first_orchestrator
         .agent("restartable")
         .unwrap()
         .start_with_id("restart-facade", "run")
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+    tokio::time::timeout(Duration::from_secs(5), started)
         .await
         .unwrap();
     assert_eq!(first_calls.load(Ordering::SeqCst), 1);
-    first_orchestrator.shutdown(Some(0)).await;
+    worker_runtime.shutdown_background();
+    drop(first_orchestrator);
 
     let recovered_calls = Arc::new(AtomicUsize::new(0));
-    let recovered = DurableAgent::builder(
-        "restartable",
-        MockCompletionModel::from_turns([MockTurn::text("finished after restart")]),
-    )
-    .tool_with(
-        InterruptedTool {
-            calls: recovered_calls.clone(),
-            block: false,
-            entered: Arc::new(tokio::sync::Notify::new()),
-        },
-        ToolOptions::default().retry(RetryPolicy::new(1)),
-    )
-    .build()
-    .unwrap();
+    let recovered_model =
+        MockCompletionModel::from_turns([MockTurn::text("finished after restart")]);
+    let recovered = DurableAgent::builder("restartable", recovered_model.clone())
+        .tool_with(
+            InterruptedTool {
+                calls: recovered_calls.clone(),
+                block: false,
+                entered: Arc::new(tokio::sync::Notify::new()),
+            },
+            ToolOptions::default().retry(RetryPolicy::new(1)),
+        )
+        .build()
+        .unwrap();
     let second_orchestrator = AgentOrchestrator::builder(store)
         .register(recovered)
         .unwrap()
@@ -755,6 +765,8 @@ async fn reconnects_to_a_run_after_runtime_restart_without_recalling_the_model_t
         .unwrap();
 
     assert_eq!(response.output(), "finished after restart");
+    assert_eq!(first_model.requests().len(), 1);
+    assert_eq!(recovered_model.requests().len(), 1);
     assert_eq!(recovered_calls.load(Ordering::SeqCst), 1);
     second_orchestrator.shutdown(None).await;
 }
@@ -887,7 +899,7 @@ async fn code_mode_recovers_after_parallel_children_without_repeating_completed_
     assert_eq!(assess_model.requests().len(), 2);
     assert_eq!(review_model.requests().len(), 0);
     first.shutdown(Some(0)).await;
-    let second = AgentOrchestrator::builder(store)
+    let second = AgentOrchestrator::builder(store.clone())
         .register(build(false))
         .unwrap()
         .runtime_options(options)
@@ -930,6 +942,7 @@ async fn code_mode_recovers_after_parallel_children_without_repeating_completed_
     let report = serde_json::to_string(&requests[1]).unwrap();
     assert!(report.contains("approved"));
     assert!(report.contains("completed"));
+    record_code_mode_history(&store, "children").await;
     second.shutdown(None).await;
 }
 
@@ -1005,13 +1018,13 @@ async fn code_mode_fast_result_advances_script_and_drains_race_loser() {
         })
         .build()
         .unwrap();
-    let runtime =
-        AgentOrchestrator::builder(Arc::new(SqliteProvider::new_in_memory().await.unwrap()))
-            .register(definition)
-            .unwrap()
-            .start()
-            .await
-            .unwrap();
+    let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
+    let runtime = AgentOrchestrator::builder(store.clone())
+        .register(definition)
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
     let run = runtime.agent("race").unwrap().start("run").await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         started.notified().await;
@@ -1057,5 +1070,26 @@ async fn code_mode_fast_result_advances_script_and_drains_race_loser() {
     );
     assert_eq!(report.calls[0].delivery, ScriptDelivery::Discarded);
     assert_eq!(report.calls[3].delivery, ScriptDelivery::Delivered);
+    record_code_mode_history(&store, "race").await;
     runtime.shutdown(None).await;
+}
+
+#[cfg(feature = "codemode")]
+async fn record_code_mode_history(store: &SqliteProvider, scenario: &str) {
+    use duroxide::{EventKind, providers::ProviderAdmin};
+    let Ok(directory) = std::env::var("RIG_DURABLE_RECORD_DIR") else {
+        return;
+    };
+    for instance in store.list_instances().await.unwrap() {
+        let history = store.read_history(&instance).await.unwrap();
+        if matches!(&history[0].kind, EventKind::OrchestrationStarted { name, .. } if name.ends_with("::codemode::v1"))
+        {
+            std::fs::write(
+                format!("{directory}/duroxide-codemode-{scenario}.json"),
+                serde_json::to_vec(&serde_json::json!({"instance":instance,"history":history}))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+    }
 }

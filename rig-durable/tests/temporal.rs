@@ -419,19 +419,24 @@ async fn temporal_code_mode_out_of_order_child_race_restart_and_replay() {
                 use temporalio_common::protos::temporal::api::history::v1::history_event::Attributes;
                 loop {
                     let events = handle.fetch_history(Default::default()).into_events().await.unwrap();
-                    let recorded_winner = events.iter().any(|event| {
-                        let Some(Attributes::ActivityTaskScheduledEventAttributes(activity)) = &event.attributes else { return false; };
-                        if activity.activity_type.as_ref().is_none_or(|kind| kind.name != "RigTemporalCodeModeStepG2V1") { return false; }
-                        activity.input.as_ref().is_some_and(|input| input.payloads.iter().any(|payload| {
+                    let provisional_done = events.iter().any(|event| {
+                        let Some(Attributes::ActivityTaskCompletedEventAttributes(activity)) = &event.attributes else { return false; };
+                        let is_plan = events.iter().any(|scheduled| {
+                            scheduled.event_id == activity.scheduled_event_id
+                                && matches!(&scheduled.attributes, Some(Attributes::ActivityTaskScheduledEventAttributes(plan)) if plan.activity_type.as_ref().is_some_and(|kind| kind.name == "RigTemporalCodeModeStepG2V1"))
+                        });
+                        is_plan && activity.result.as_ref().is_some_and(|result| result.payloads.iter().any(|payload| {
                             serde_json::from_slice::<serde_json::Value>(&payload.data).is_ok_and(|value| {
-                                value["input"]["history"].as_array().is_some_and(|history| history.iter().any(|entry| entry["call"]["arguments"]["key"] == "last-fast"))
+                                value["Done"]["returned"]["lastWinner"] == "last-fast"
+                                    && value["Done"]["calls"].as_array().is_some_and(|calls| calls.iter().any(|call| call["ordinal"] == 3 && call["delivery"] == "none"))
                             })
                         }))
                     });
-                    if recorded_winner { break; }
+                    if provisional_done { break; }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-            }).await.expect("race winner must be durably delivered before releasing loser");
+            }).await.expect("provisional report must be recorded while race loser remains blocked");
+            assert_eq!(loser_finished.load(Ordering::SeqCst), 0);
             loser_release.notify_one();
             let response = tokio::time::timeout(
                 Duration::from_secs(30),
@@ -479,9 +484,18 @@ async fn temporal_code_mode_out_of_order_child_race_restart_and_replay() {
         fn find_order(value: &serde_json::Value) -> bool {
             match value {
                 serde_json::Value::Object(map) => {
-                    map.get("ordered") == Some(&serde_json::json!(["slow", "fast"]))
-                        && map.get("winner") == Some(&serde_json::json!("fast"))
-                        && map.get("refusal") == Some(&serde_json::json!("permission_denied"))
+                    map.get("returned").is_some_and(|returned| {
+                        returned["ordered"] == serde_json::json!(["slow", "fast"])
+                            && returned["winner"] == "fast"
+                            && returned["refusal"] == "permission_denied"
+                    }) && map
+                        .get("calls")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|calls| {
+                            calls
+                                .iter()
+                                .any(|call| call["ordinal"] == 3 && call["delivery"] == "discarded")
+                        })
                         || map.values().any(find_order)
                 }
                 serde_json::Value::Array(items) => items.iter().any(find_order),
@@ -497,6 +511,17 @@ async fn temporal_code_mode_out_of_order_child_race_restart_and_replay() {
                 .contains("last-fast"),
             "{transcript}"
         );
+        if let Ok(directory) = std::env::var("RIG_DURABLE_RECORD_DIR") {
+            std::fs::write(
+                format!("{directory}/temporal-codemode-race.json"),
+                handle
+                    .fetch_history(Default::default())
+                    .to_json()
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+        }
         let mut replay_options = WorkflowReplayerOptions::new().namespace(namespace).build();
         replay_options
             .register_workflow::<TemporalAgentWorkflow>()
