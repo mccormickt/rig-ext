@@ -31,6 +31,16 @@ permitted HTTP control fails first. No Envoy, core patch or gateway replacement
 was substituted. The installer selects ingress and egress together; a mixed
 topology needs a separate test decision.
 
+The v0.5 actor image was built from clean
+[f8e680a](https://github.com/mccormickt/rig-ext/commit/f8e680a624e4bd3589b9361d734fbba1804f0617),
+digest `sha256:eac522aa78990b5cb522f904ab355ce2b9d1d442c2d7524e1113bf326d33d6eb`.
+Final harness checks ran at clean
+[a189da3](https://github.com/mccormickt/rig-ext/commit/a189da31b165744ff37e334038e453bfb174ab83)
+with that same image. The same-image unavailable-provider check passed with no
+fallback or effects. Unit, integration, documentation, feature-isolation and
+clippy checks passed. Direct worker TLS without a client certificate failed with
+`CERTIFICATE_REQUIRED`; the authenticated gateway still reached the unchanged actor.
+
 ## The v0.4 proof remains separate
 
 **Zeus passed real Ollama cross-worker restore on v0.4 on 2026-10-15.** Linux
@@ -254,6 +264,26 @@ before another cross-node run. This is explicitly not live inference.
 `cache.py --cache default` and `cache.py --cache 0s` require the matching
 `gateway-config.py --cache ...` setting and a restarted owned port-forward.
 Only run worker replacement when the other actor is suspended.
+
+Parking tests require `--parking-max 1` and one worker. Before protocol or race
+tests, restore `gateway-config.py --parking-max 1024`, restart the owned gateway
+port-forward, and restore two workers. Leaving capacity1 in place correctly
+rejects the concurrent protocol turn with503; that failed run is retained.
+
+For the direct-worker negative, read `status.workerAssignment.workerPod` and
+`metadata.uid` from the running actor. Forward only that owned Pod and send a
+valid CONNECT through TLS without a client certificate:
+
+```bash
+kubectl --context kind-rig-ollama-e2e -n rig-local port-forward \
+  "pod/$WORKER_POD" 15029:8443 --address=127.0.0.1
+# Separate terminal; expect a TLS certificate-required alert, not HTTP success.
+curl --max-time 10 --proxy-insecure --proxy https://127.0.0.1:15029 \
+  --proxytunnel "http://$ACTOR_UID:80/inspect"
+```
+
+Pair the denial with an authenticated edge inspection before and after, verify
+unchanged actor counters/file state, and stop only this port-forward process.
 
 ## v0.4 executed controls and limits
 
