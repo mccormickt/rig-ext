@@ -50,6 +50,9 @@ pub mod model;
 pub mod options;
 pub mod thread;
 
+#[cfg(feature = "server")]
+pub mod server;
+
 /// The protocol types used by this crate's public APIs.
 pub use a2a as protocol;
 

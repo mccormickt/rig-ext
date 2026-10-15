@@ -27,6 +27,25 @@ rig-a2a = { path = "../rig-a2a", default-features = false, features = ["native-t
 
 `rig-a2a` currently supports native targets only.
 
+## Experimental server adapter
+
+The optional `server` feature exposes `server::RigExecutor::new(agent)` for
+`a2a-server-lf` 0.5.2. It runs an ordinary Rig `Agent`, retains canonical Rig
+history per tenant/context, and serializes turns in each context. The host must
+supply authentication, task ownership checks, admission control, and an A2A
+task store. Only text inputs are supported. A run has an eight-model-call limit.
+
+Cancellation is cooperative at Rig effect boundaries. An in-flight tool can
+finish and commit its effect before cancellation returns. Tools must await
+their cleanup and must not leave detached work. Neither task state `Canceled`
+nor a disconnected stream means execution has stopped. History and task state
+are process-local; this is not a durable scheduler or an exactly-once service.
+
+See the [Substrate prototype and test instructions](../scripts/substrate/README.md).
+The example uses deterministic inference with real Rig tool dispatch and file
+I/O. Its cluster proof is blocked on the tested orb's Linux 6.1 kernel; it is
+not a verified Substrate snapshot/restore integration.
+
 ## Use a remote agent as a Rig model
 
 ```rust,no_run
