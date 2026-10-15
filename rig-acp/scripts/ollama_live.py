@@ -365,16 +365,23 @@ def run():
             with (evidence / "client.jsonl").open("w") as stdout, (evidence / "stderr.log").open("w") as stderr:
                 client = subprocess.Popen(command, cwd=disposable, env=env, stdout=stdout, stderr=stderr, start_new_session=True)
                 record(events, event="client_start", pid=client.pid, command=command)
+                deadline = time.monotonic() + (180 if mode == "interrupt" else 620)
+                while client.poll() is None:
+                    for pid, (parent, _) in owned_processes().items():
+                        if parent == os.getpid() and pid not in (client.pid, service.pid if service else None):
+                            reaped, status = os.waitpid(pid, os.WNOHANG)
+                            if reaped:
+                                record(events, event="adopted_child_exit", pid=pid, code=os.waitstatus_to_exitcode(status))
+                    if mode == "interrupt" and (home / "natural-started").exists():
+                        record(events, event="injected_sigterm", owned=owned_processes(),
+                               command_pid=(home / "natural-started").read_text())
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    if time.monotonic() >= deadline:
+                        raise subprocess.TimeoutExpired(command, deadline)
+                    time.sleep(.02)
                 if mode == "interrupt":
-                    deadline = time.monotonic() + 180
-                    while client.poll() is None and time.monotonic() < deadline:
-                        if (home / "natural-started").exists():
-                            record(events, event="injected_sigterm", owned=owned_processes(),
-                                   command_pid=(home / "natural-started").read_text())
-                            os.kill(os.getpid(), signal.SIGTERM)
-                        time.sleep(.02)
                     raise AssertionError("interruption control did not reach a running command")
-                code = client.wait(timeout=620)
+                code = client.returncode
             record(events, event="client_exit", code=code,
                    effects={p.name: p.read_text() for p in home.iterdir() if p.is_file()})
             assert code == 0, f"client exit {code}; see {evidence}"
