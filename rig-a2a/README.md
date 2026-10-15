@@ -42,9 +42,13 @@ nor a disconnected stream means execution has stopped. History and task state
 are process-local; this is not a durable scheduler or an exactly-once service.
 
 See the [Substrate prototype and test instructions](../scripts/substrate/README.md).
-The example uses deterministic inference with real Rig tool dispatch and file
-I/O. Its cluster proof is blocked on the tested orb's Linux 6.1 kernel; it is
-not a verified Substrate snapshot/restore integration.
+The example supports deterministic controls and real local Ollama inference,
+both with real Rig tool dispatch and file I/O. The prior orb's Linux 6.1 kernel
+blocked sandbox startup. The separate Zeus run passed a bounded cross-worker
+snapshot/restore proof with Ollama. Its initial `inspect` request started the
+actor; the second A2A turn proved request-triggered wake after explicit suspension,
+with retained heap state, file and conversation. This is not a general durability
+or exactly-once guarantee.
 
 ## Use a remote agent as a Rig model
 

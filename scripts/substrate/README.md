@@ -1,11 +1,17 @@
 # Rig actor on Agent Substrate: bounded prototype
 
 **Zeus passed real Ollama cross-worker restore on 2026-10-15.** Linux
-7.0.0-38-generic passed the pinned overlay mount tests. A public A2A request
-through the authenticated edge and deployed agentgateway woke a SUSPENDED
-gVisor actor. After explicit drain/suspend and deletion of its worker Pod, a
-second request restored the same heap nonce, counters, file and conversation on
-a different worker Pod UID. No manual resume preceded that waking request.
+7.0.0-38-generic passed the pinned overlay mount tests. The live test's initial
+`inspect` request started the actor before the first live message. After explicit
+drain/suspend and deletion of its worker Pod, the **second A2A turn** through the
+authenticated edge and deployed agentgateway woke the verified SUSPENDED gVisor
+actor. It restored the same heap nonce, counters, file and conversation on a
+different worker Pod UID. No manual resume preceded that waking request. The first
+live message is not initial-wake evidence.
+
+The tested runtime commit is
+[4da3aea](https://github.com/mccormickt/rig-ext/commit/4da3aea23ce6bdced76e2a86a8dcb944dc0d6864).
+Later documentation changes do not change the tested image, build or evidence.
 
 The installed model was `qwen3.5:9b`, digest
 `56671c2ab9385f9cfcb404638e32cd62d88e3501d44822208363c010179a3c90`.
