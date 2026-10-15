@@ -13,5 +13,5 @@ test "$(docker inspect rig-ollama-e2e-worker --format '{{.Id}}')" = "$WORKER_NOD
 test "$(docker inspect "$WORKER_NODE_ID" --format '{{index .Config.Labels "io.x-k8s.kind.cluster"}}')" = rig-ollama-e2e
 test "$(docker inspect rig-ollama-registry --format '{{.Id}}')" = "$REGISTRY_ID"
 test "$(docker inspect "$REGISTRY_ID" --format '{{index .Config.Labels "rig-proof"}}')" = rig-ollama-e2e
-docker rm -f "$NODE_ID" "$WORKER_NODE_ID" "$REGISTRY_ID"
+docker rm -fv "$NODE_ID" "$WORKER_NODE_ID" "$REGISTRY_ID"
 rm -f "$RUN_DIR/kubeconfig"
