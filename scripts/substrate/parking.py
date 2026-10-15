@@ -84,6 +84,7 @@ if __name__ == "__main__":
             )
         )
         p.check("no Kubernetes autoscaler", hpa["items"], [])
+        p.check("no parked requests initially", parked(), False)
         for actor in ("rig-1", "rig-2"):
             p.check(
                 "fresh suspended actor",
@@ -114,6 +115,7 @@ if __name__ == "__main__":
                 response["result"]["task"]["status"]["state"],
                 "TASK_STATE_COMPLETED",
             )
+        p.wait("parking gauge returns to zero", lambda: not parked())
         state = p.inspect("rig-2")
         p.check(
             "one effect, no overflow effect",
@@ -129,6 +131,7 @@ if __name__ == "__main__":
         status, response = p.http("/actors/rig-1/jsonrpc", timed_request)
         p.check("parking wait budget", status, 504)
         p.check("budget error specific", "request timed out" in response, True)
+        p.wait("timeout releases parking gauge", lambda: not parked())
         p.check(
             "budget target stays suspended",
             p.actor()["status"]["state"],

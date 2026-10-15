@@ -84,7 +84,9 @@ for item in d["items"]:
     for c in item["spec"]["template"]["spec"]["containers"]:
         if c["name"] == "atelet":
             c["args"] = ["--localhost-registry-replacement="+ip+":5000" if a.startswith("--localhost-registry-replacement=") else a for a in c["args"]]
+            item["spec"]["template"]["spec"].setdefault("tolerations", []).append({"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"})
             print(json.dumps(item))' "$REGISTRY_IP" | kubectl --context "$KUBECTL_CONTEXT" replace -f -
+kubectl --context "$KUBECTL_CONTEXT" -n ate-system rollout status daemonset/atelet --timeout=120s
 python3 "$ROOT/scripts/substrate/gateway-config.py"
 WORKER_IMAGE=$(tail -1 "$RUN_DIR/worker-image.txt")
 export PATH="$SUBSTRATE/bin:$PATH"

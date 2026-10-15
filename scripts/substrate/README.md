@@ -1,6 +1,39 @@
 # Rig actor on Agent Substrate: bounded prototype
 
-**Zeus passed real Ollama cross-worker restore on 2026-10-15.** Linux
+**Substrate v0.5.0 with the released native agentgateway pin fails live egress.**
+On Zeus, the gateway's `GetActorEgressPolicy` request omits the new required
+`name: default` field. The API rejects it with `name: Required value`, and the
+gateway returns403 even for the permitted private destination. The matching
+v0.5 CLI and atelet send the name and succeed. DNS permission is not HTTP egress
+permission: raw UDP/TCP DNS REFUSED negatives and the allowed full-name DNS
+positive passed. The actual live A2A task failed with zero provider calls, tool
+invocations, effects or fixture fallback. **No v0.5 Ollama restore pass.**
+
+The fresh v0.5 install uses new golden snapshots and two private kind nodes on
+one physical host. Deterministic A2A requests restored MEMORY across worker Pods
+and across those nodes, with the same heap nonce, file and canonical history.
+The cross-node control verified no destination local checkpoint before wake,
+completed durable copy, executed fidelity3, matching runtime assets, and
+object-store download receipts joined through the restore trace. It is not
+physical-host failover. Initial `inspect` starts the actor; only the second
+message proves request-triggered wake after suspension.
+
+The warmed default gateway cache still produced503 after worker replacement;
+the attempt began within its5s TTL. With `cacheTtl: 0s`, it succeeded. Keep the
+workaround. A2A mechanics, drain races and readiness controls remain separate
+from live inference. Readiness2s passed; readiness7s timed out on both gateway
+attempts and required a separate long operator retry. Permanent failure reached
+CRASHED only after that retry's30s worker deadline. Native duplicate HTTP and
+CONNECT selectors remain failed security expectations. VOLUMES cold restore
+preserved the file but lost heap/history; automatic runtime-mismatch fallback
+is not tested. Link-local egress enforcement is not proved because the native
+permitted HTTP control fails first. No Envoy, core patch or gateway replacement
+was substituted. The installer selects ingress and egress together; a mixed
+topology needs a separate test decision.
+
+## The v0.4 proof remains separate
+
+**Zeus passed real Ollama cross-worker restore on v0.4 on 2026-10-15.** Linux
 7.0.0-38-generic passed the pinned overlay mount tests. The live test's initial
 `inspect` request started the actor before the first live message. After explicit
 drain/suspend and deletion of its worker Pod, the **second A2A turn** through the
@@ -58,9 +91,9 @@ was not copied into this checkout or tested through this cluster.
 
 | Component | Pin |
 |---|---|
-| Substrate source, CLI, manifests and workers | v0.4.0, `756c2a53741121e728f4cc3066c8a19e575b4919` |
+| Substrate source, CLI, manifests and workers | v0.5.0, `e8d40c33f96f4b7a4984bfea7334a36ab5b45b7b` |
 | agentgateway | `cr.agentgateway.dev/agentgateway:v0.0.0-alpha.168b05d6@sha256:5e8384d1fcfdc443a3ad5155ea6a64dc7953bde162df7f5f8e131a5c19ae08a3` |
-| gVisor systrap assets | release manifest nightly; amd64 SHA256 `d547d81401461fd1c679c5c4fa0a6c2b8ef7dc3c22ce23c9e25dcc4c69cfd06f` |
+| gVisor systrap assets | nightly2026-10-10, defaultVersionv3; amd64 SHA256 `4ae7fab988c3647d2a835d6c3c70c6a99021c562db97827592562b6c51c3e88c` |
 | kind / Kubernetes | release tool module0.33.0 /1.37.0 |
 | Zeus toolchain | Go1.27.1, Rust1.98.1, Docker29.8.2 |
 | Rig / A2A | Rig0.44.0; a2a-lf0.4.1, a2a-server-lf0.5.2, a2a-client-lf0.2.8; Cargo.lock |
@@ -79,19 +112,22 @@ Run from the repository root. Setup uses only cluster `rig-ollama-e2e`, registry
 `rig-ollama-registry` on loopback15010 and Kubernetes API on loopback15011. It
 refuses existing resources or kubeconfig. It does not use upstream's destructive
 creation script, sudo, or host permission changes. Network sysctls apply only
-inside the disposable node container. Do not run against a shared cluster.
+inside the two disposable node containers. Do not run against a shared cluster.
+Minor versions before1.0 require reinstall; do not reuse v0.4 snapshots.
 
 ```bash
 bash scripts/substrate/setup.sh
-export PATH="/tmp/rig-substrate-v0.4.0/bin:$PATH"
-export KUBECONFIG="$PWD/.amp/in/substrate-run/kubeconfig"
+export PATH="/tmp/rig-substrate-v0.5.0/bin:$PATH"
+export KUBECONFIG="$PWD/.amp/in/substrate-v05-run/kubeconfig"
 kubectl ate --context kind-rig-ollama-e2e get actor-template rig-poc -a rig-local -o json
 ```
 
-Wait for a completed `status.goldenSnapshotStatus.goldenTag` with no errorMessage.
+Wait for `status.goldenSnapshotStatus.goldenTag` with no errorMessage, then fetch
+that Tag in its referenced atespace and verify its durable snapshot is COMPLETED.
 Stop on failure. ActorTemplate is a Substrate API object; WorkerPool is Kubernetes.
-Templates use v0.4.0 `onCommit: FULL`, not current-main snapshot APIs. RustFS stores
-external snapshots. Ordinary gateway HTTP targets actor port80.
+Templates use v0.5 `preferredFidelity: MEMORY`; a captured snapshot alone is not
+proof of the executed restore fidelity. RustFS stores external snapshots through
+the released objectstore-plugin. Ordinary gateway HTTP targets actor port80.
 
 ```bash
 kubectl ate --context kind-rig-ollama-e2e create actor rig-1 -a rig-local --template rig-poc
@@ -148,7 +184,7 @@ BUILD="$(git rev-parse HEAD)-$SOURCE_HASH"
 python3 scripts/substrate/cluster_probe.py --tokens /tmp/rig-poc-tokens.json --evidence .amp/in/artifacts/probe-new
 python3 scripts/substrate/demo.py --tokens /tmp/rig-poc-tokens.json --evidence .amp/in/artifacts/restore-new
 python3 scripts/substrate/cluster.py --tokens /tmp/rig-poc-tokens.json --evidence .amp/in/artifacts/protocol-new \
-  --substrate /tmp/rig-substrate-v0.4.0 --build "$BUILD"
+  --substrate /tmp/rig-substrate-v0.5.0 --build "$BUILD"
 python3 scripts/substrate/races.py --tokens /tmp/rig-poc-tokens.json --evidence .amp/in/artifacts/races-new
 python3 scripts/substrate/readiness.py --tokens /tmp/rig-poc-tokens.json --evidence .amp/in/artifacts/readiness-new
 ```
@@ -171,7 +207,7 @@ and `/api/version`; use the installed pinned model. Do not download models or
 change the shared listener. Determine the Docker `kind` bridge gateway, then run:
 
 ```bash
-export OLLAMA_BRIDGE_IP=$(docker network inspect kind --format '{{(index .IPAM.Config 0).Gateway}}')
+export OLLAMA_BRIDGE_IP=$(docker network inspect kind | python3 -c 'import json,sys; print(next(c["Gateway"] for c in json.load(sys.stdin)[0]["IPAM"]["Config"] if ":" not in c["Gateway"]))')
 (set -o noclobber; python3 scripts/substrate/receipt_proxy.py --bind "$OLLAMA_BRIDGE_IP" --port 15024 \
   > .amp/in/artifacts/ollama-receipts.jsonl)
 # Separate terminal:
@@ -185,9 +221,11 @@ stable name; no shared Ollama listener change is required.
 
 Wait for rig-ollama's golden snapshot. Delete disposable fixture actors and create
 rig-1/rig-2 from rig-ollama. `egress.py --sink http://$OLLAMA_BRIDGE_IP:15024` plus
-token/evidence arguments checks both actors' default403, live sink counters and
-then grants only rig-1 HTTP hostname `ollama.rig-local.svc`, port15024. It suspends
-rig-1 afterward. DNS port53 is outside this egress contract.
+token/evidence arguments checks both actors' no-policy DNS REFUSED, live sink
+counters and a grant for only rig-1 HTTP hostname
+`ollama.rig-local.svc.cluster.local`, port15024. The full Service name must match
+the DNS policy. **The v0.5 native HTTP positive currently fails403; stop there.**
+Do not interpret the remaining unexecuted exclusions as passing controls.
 
 ```bash
 # Use the source-derived BUILD above and the same image for positive/negative tests.
@@ -207,7 +245,17 @@ Use `package-check.py --image "$IMAGE" --build "$BUILD" --evidence ...` for the
 unavailable-provider negative control, exact running image and empty-state check.
 It explicitly removes its owned container.
 
-## Executed controls and limits
+For deterministic restore controls, use fresh rig-poc actors and run `ollama.py`
+with `--fixture --replace-worker` (no `--receipts`), then a separate fresh run with
+`--fixture --replace-worker --cross-node`. The cross-node run moves the owned
+WorkerPool to the control-plane node; restore its selector to the worker node
+before another cross-node run. This is explicitly not live inference.
+`volumes.py` checks the cold-restore negative on fresh fixture actors.
+`cache.py --cache default` and `cache.py --cache 0s` require the matching
+`gateway-config.py --cache ...` setting and a restarted owned port-forward.
+Only run worker replacement when the other actor is suspended.
+
+## v0.4 executed controls and limits
 
 | Case | Zeus result |
 |---|---|
@@ -251,7 +299,9 @@ selectors remain a failure, not a passing security claim.
 
 ## Sources
 
-- [Substrate overlay contract](https://github.com/agent-substrate/substrate/blob/v0.4.0/internal/imagecache/README.md)
+- [Substrate v0.5 release](https://github.com/agent-substrate/substrate/releases/tag/v0.5.0)
+- [Tagged upgrade contract](https://github.com/agent-substrate/substrate/blob/v0.5.0/docs/upgrade.md)
+- [Substrate overlay contract](https://github.com/agent-substrate/substrate/blob/v0.5.0/internal/imagecache/README.md)
 - [Hermes ACP source](https://github.com/NousResearch/hermes-agent/tree/952322ca3cf23435af4f95c2b91216d9e3658b84): real stdio peer, not a deployed bridge here.
 - [Hermes actor reference](https://github.com/agent-substrate/substrate/pull/487#issuecomment-5097213171): not a reproducible ACP image contract.
 - [OpenClaw example](https://github.com/agent-substrate/always-on-agent/tree/c380889b73ee78b4bb71fc17079227ab886d9e82): application gateway and older Substrate baseline.

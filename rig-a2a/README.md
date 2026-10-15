@@ -45,10 +45,16 @@ See the [Substrate prototype and test instructions](../scripts/substrate/README.
 The example supports deterministic controls and real local Ollama inference,
 both with real Rig tool dispatch and file I/O. The prior orb's Linux 6.1 kernel
 blocked sandbox startup. The separate Zeus run passed a bounded cross-worker
-snapshot/restore proof with Ollama. Its initial `inspect` request started the
+snapshot/restore proof with Ollama on Substrate v0.4. Its initial `inspect` request started the
 actor; the second A2A turn proved request-triggered wake after explicit suspension,
 with retained heap state, file and conversation. This is not a general durability
 or exactly-once guarantee.
+
+The fresh v0.5 run passed deterministic MEMORY restore across worker Pods and
+two kind nodes on one host. Live Ollama inference is blocked: the released native
+agentgateway omits the new required egress-policy name, so the API rejects even
+permitted HTTP egress. The live task failed with zero provider calls or effects.
+This is not a v0.5 live-inference pass; the v0.4 evidence remains separate.
 
 ## Use a remote agent as a Rig model
 

@@ -33,7 +33,7 @@ class Live(Proof):
         worker_logs = {}
         self.record(
             "scope",
-            inference="real Ollama",
+            inference="deterministic fixture" if self.args.fixture else "real Ollama",
             transport="direct A2A component"
             if self.args.direct_port
             else "authenticated edge and deployed gateway",
@@ -99,9 +99,12 @@ class Live(Proof):
         secret = "violet-" + uuid.uuid4().hex[:12]
         first = f"Call record with operation {operation1} and value {secret}."
         second = f"Call record with operation {operation2}. Use the exact value from my preceding request as value. Do not invent a new value."
+        if self.args.fixture:
+            first = json.dumps({"operation": operation1, "value": secret})
+            second = json.dumps({"operation": operation2, "value": secret})
         task1 = self.send(first)
         self.check(
-            "first live task completed",
+            "first task completed",
             task1["status"]["state"],
             "TASK_STATE_COMPLETED",
         )
@@ -112,7 +115,11 @@ class Live(Proof):
             "first effect counts", (before["invocations"], before["commits"]), (1, 1)
         )
         self.check("heap nonce created", bool(before["nonce"]), True)
-        self.check("no fixture inference", before["completions"], 0)
+        self.check(
+            "expected inference mode counter",
+            before["completions"],
+            2 if self.args.fixture else 0,
+        )
         rows = [json.loads(line) for line in before["journal"].splitlines()]
         self.check(
             "first actual effect",
@@ -220,7 +227,7 @@ class Live(Proof):
         # No discovery, inspect, or manual resume precedes the waking message.
         task2 = self.send(second, self.context)
         self.check(
-            "second live task completed",
+            "second task completed",
             task2["status"]["state"],
             "TASK_STATE_COMPLETED",
         )
@@ -262,7 +269,17 @@ class Live(Proof):
         after = self.inspect()
         self.check("heap nonce continuity", after["nonce"], before["nonce"])
         self.check("effect counts", (after["invocations"], after["commits"]), (2, 2))
-        self.check("no fixture inference after second turn", after["completions"], 0)
+        self.check(
+            "expected inference mode counter after second turn",
+            after["completions"],
+            4 if self.args.fixture else 0,
+        )
+        if self.args.fixture:
+            self.check(
+                "fixture received both canonical prompts",
+                self.settled(task2)["prompts"],
+                [first, second],
+            )
         rows = [json.loads(line) for line in after["journal"].splitlines()]
         self.check(
             "actual recalled value",
@@ -276,15 +293,22 @@ class Live(Proof):
         for prompt in (first, second):
             self.check(
                 "actual user prompt in canonical history",
-                prompt in json.dumps(history2),
+                json.dumps(prompt)[1:-1] in json.dumps(history2),
                 True,
             )
         receipts = [
-            json.loads(line) for line in self.args.receipts.read_text().splitlines()
+            json.loads(line)
+            for line in (
+                [] if self.args.fixture else self.args.receipts.read_text().splitlines()
+            )
         ]
         for prompt, operation, task in (
-            (first, operation1, task1),
-            (second, operation2, task2),
+            ()
+            if self.args.fixture
+            else (
+                (first, operation1, task1),
+                (second, operation2, task2),
+            )
         ):
             calls = [
                 r
@@ -389,7 +413,7 @@ class Live(Proof):
                 "--tail=-1",
                 "--prefix",
             )
-            self.command(
+            objectstore = self.command(
                 "kubectl",
                 "--context",
                 self.kube_context,
@@ -504,6 +528,38 @@ class Live(Proof):
                 and e["req"]["snapshot"]["object"]["snapshot_uri"] == snapshot_uri
             ]
             self.check("atelet restored exact durable snapshot", len(transfers), 1)
+            asset_hash = (
+                "4ae7fab988c3647d2a835d6c3c70c6a99021c562db97827592562b6c51c3e88c"
+            )
+            self.check(
+                "released runtime asset hash",
+                transfers[0]["req"]["sandbox_assets"]["assets"]["amd64"]["files"][
+                    "gvisor"
+                ]["sha256"],
+                asset_hash,
+            )
+            self.check(
+                "executed released runtime path",
+                restores[0]["req"]["runtime_asset_paths"]["gvisor"],
+                f"/var/lib/ate/static-files/gvisor-{asset_hash}/runsc",
+            )
+            if self.args.cross_node:
+                downloads = []
+                for line in objectstore.splitlines():
+                    try:
+                        event = json.loads(line[line.index("{") :])
+                    except ValueError:
+                        continue
+                    if (
+                        event.get("trace_id") == transfers[0]["trace_id"]
+                        and event.get("msg") == "Decompressed zstd download"
+                        and event.get("logical_bytes", 0) > 0
+                    ):
+                        downloads.append(event)
+                self.check(
+                    "object store download on restore trace", bool(downloads), True
+                )
+                self.record("objectstore_restore_join", downloads=downloads)
             self.check(
                 "restore local-copy choice",
                 restores[0]["req"].get("preserve_restore_dir", False),
@@ -551,7 +607,8 @@ class Live(Proof):
         self.record(
             "result",
             status="PASS",
-            scope="real model and tool receipts; cluster mode includes gateway, actor, worker and snapshot joins",
+            scope=("deterministic model" if self.args.fixture else "real model")
+            + " and tool receipts; cluster mode includes gateway, actor, worker and snapshot joins",
         )
 
 
@@ -560,7 +617,12 @@ if __name__ == "__main__":
     parser.add_argument("--tokens", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--build", required=True)
-    parser.add_argument("--receipts", type=Path, required=True)
+    parser.add_argument("--receipts", type=Path)
+    parser.add_argument(
+        "--fixture",
+        action="store_true",
+        help="deterministic mechanics only; no live inference claim",
+    )
     parser.add_argument("--substrate", default="/tmp/rig-substrate-v0.5.0")
     parser.add_argument("--direct-port", type=int)
     parser.add_argument(
@@ -574,6 +636,8 @@ if __name__ == "__main__":
         help="delete only the suspended actor's worker in the disposable cluster",
     )
     args = parser.parse_args()
+    if not args.fixture and not args.receipts:
+        parser.error("live inference requires --receipts")
     if args.cross_node and not args.replace_worker:
         parser.error("--cross-node requires --replace-worker")
     proof = Live(args)
