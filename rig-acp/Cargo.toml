@@ -43,5 +43,9 @@ required-features = ["process"]
 name = "acp_peer"
 required-features = ["process"]
 
+[[example]]
+name = "acp_live"
+required-features = ["process"]
+
 [lints]
 workspace = true

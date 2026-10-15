@@ -13,7 +13,24 @@ base="http://127.0.0.1:$port"
 server="fixture-$$"
 cleanup() {
   local status=$?
-  if ! amp orb service stop "$service" >/dev/null 2>&1; then
+  trap '' TERM INT
+  if [[ ${ACP_NATIVE:-0} = 1 ]]; then
+    if [[ -n ${service_pid:-} ]]; then
+      for signal in TERM KILL; do
+        kill -"$signal" -- "-$service_pid" 2>/dev/null || true
+        for _ in $(seq 1 50); do
+          kill -0 "$service_pid" 2>/dev/null || break
+          sleep 0.1
+        done
+        kill -0 "$service_pid" 2>/dev/null || break
+      done
+      if kill -0 "$service_pid" 2>/dev/null; then
+        echo "FAIL native supervisor stop; data retained at $data"
+        exit 1
+      fi
+      wait "$service_pid" || true
+    fi
+  elif ! amp orb service stop "$service" >/dev/null 2>&1; then
     echo "FAIL supervisor stop; disposable data retained at $data"
     exit 1
   fi
@@ -34,10 +51,18 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 mkdir -p "$data/sandbox-agent/bin/agent_processes"
 cp "$root/rig-acp/examples/fixtures/agent.mjs" "$data/sandbox-agent/bin/agent_processes/mock-acp"
 chmod +x "$data/sandbox-agent/bin/agent_processes/mock-acp"
-amp orb service start "$service" --command "env -i PATH='$PATH' HOME='$data' XDG_DATA_HOME='$data' ACP_FIXTURE_RECEIPTS='$data/receipts.jsonl' '$binary' server --host 127.0.0.1 --port '$port' --token '$token' --no-telemetry" >/dev/null
+if [[ ${ACP_NATIVE:-0} = 1 ]]; then
+  setsid env -i PATH="$PATH" HOME="$data" XDG_DATA_HOME="$data" ACP_FIXTURE_RECEIPTS="$data/receipts.jsonl" \
+    "$binary" server --host 127.0.0.1 --port "$port" --token "$token" --no-telemetry > "$data/server.log" 2>&1 &
+  service_pid=$!
+else
+  amp orb service start "$service" --command "env -i PATH='$PATH' HOME='$data' XDG_DATA_HOME='$data' ACP_FIXTURE_RECEIPTS='$data/receipts.jsonl' '$binary' server --host 127.0.0.1 --port '$port' --token '$token' --no-telemetry" >/dev/null
+fi
 for _ in $(seq 1 100); do
   if curl -fsS -H "Authorization: Bearer $token" "$base/v1/acp" > /dev/null 2>&1; then break; fi
   sleep 0.1

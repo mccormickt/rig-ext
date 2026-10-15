@@ -229,9 +229,10 @@ Hermes enables Python SDK unstable extensions, but this smoke test uses only v1
 initialize/new/prompt and Rig text output. The harness isolates HOME/environment,
 disables configured MCP, tools, memory, and automatic model-generated titles,
 and uses a loopback model fixture with a dummy credential. It checks actual model
-requests, not only final text. Live model inference, Hermes tool permissions,
-Hermes cancellation, media handling, and all unstable methods remain unproven.
-No real provider credentials are used.
+requests, not only final text. This fixture does not test live inference,
+Hermes tool permissions, or Hermes cancellation; see the separate live harness
+below. Media handling and all unstable methods remain unproven. No real provider
+credentials are used.
 
 To capture provenance, sanitized synthetic receipts, commands, timestamps, exit
 codes, source hashes, and optional external demos:
@@ -254,3 +255,75 @@ does not identify a reproducible ACP bridge/image/version. The
 uses `/v1/chat/completions`, not ACP JSON-RPC. Neither is a claimed test layer here.
 Its [wrong-route fallback incident](https://github.com/agent-substrate/always-on-agent/commit/3cb37731ae744e6cfdd145ab67df3212dbaa3f22)
 is why these tests require peer receipts and an invalid-route control.
+
+## Live Hermes and local Ollama checks
+
+`scripts/ollama_live.py` uses the pinned, unmodified Hermes peer and an already
+installed `qwen3.5:9b` on loopback Ollama. It checks model digest
+`56671c2ab9385f9cfcb404638e32cd62d88e3501d44822208363c010179a3c90` and never pulls
+models. Coordinate access before using a shared daemon. These are native local
+Linux/Python 3.12+ checks, not container, Substrate, official HTTP, or cluster
+tests. The harness rejects a different or dirty Hermes checkout.
+
+```sh
+cargo build --locked -p rig-acp --features rivet --example acp_live
+python3 rig-acp/scripts/ollama_live.py /path/to/pinned/hermes text
+python3 rig-acp/scripts/ollama_live.py /path/to/pinned/hermes tools
+python3 rig-acp/scripts/ollama_live.py /path/to/pinned/hermes absent
+python3 rig-acp/scripts/ollama_live.py /path/to/pinned/hermes unavailable
+# Add the released native Rivet binary as the last argument for POST/SSE.
+python3 rig-acp/scripts/ollama_live.py /path/to/pinned/hermes tools /path/to/sandbox-agent
+# The independent Node fixture also supports a native Linux supervisor.
+ACP_NATIVE=1 SANDBOX_AGENT_BIN=/path/to/sandbox-agent bash rig-acp/scripts/rivet_demo.sh
+# Recheck complete model → ACP → Rig delivery and reject corrupted receipts.
+python3 rig-acp/scripts/ollama_live.py --check-delivery /path/to/tool-evidence --controls
+# Inject SIGTERM while a real foreground command runs; expected exit is 130.
+python3 rig-acp/scripts/ollama_live.py /path/to/pinned/hermes interrupt
+```
+
+The live harness uses a separate HOME, profile, and disposable cwd. It disables
+memory, title generation, MCP, and tool discovery. Tool checks expose only
+`terminal` and `process_manage`. **Local terminal execution is not a security sandbox.**
+Manual approvals cover detected dangerous commands, not every shell command.
+The synthetic commands remove only precreated probe files or write delayed
+markers. The live permission policy approves only its expected command once.
+
+Transparent stdio and model relays record ACP request/session IDs, the Hermes
+PID, synthetic user histories, generated tool arguments, tool results, response
+hashes, and Ollama request options. They do not generate model answers. They do
+not retain credentials, HTTP headers, or system prompts. Evidence and source
+snapshots go under `.amp/in/artifacts/ollama-*`; these files are not committed.
+Set the repository-local exclude rule `/.amp/in/` before running the harness.
+Every successful turn, including recovery, must have complete model output that
+matches ACP output and then Rig output. The offline controls remove recovery
+responses or truncate a successful HTTP 200 stream; both must fail verification.
+The Linux test supervisor adopts its own orphaned descendants and uses bounded
+TERM/KILL cleanup before it removes disposable data. It does not stop Ollama.
+
+| Case | Independent checks |
+| --- | --- |
+| `text` | Rig agents, exact upstream histories `[A1]`, `[A1,A2]`, `[B1]`; invalid Rig route between valid calls adds zero ACP prompts or inference calls |
+| `tools` | Generated terminal calls, separate ACP permission and execution events, allow-once then deny in one session, file contents checked while permission is held, allowed deletion control |
+| `tools` cancellation | Matched eight-second foreground commands; normal command writes its finish marker; cancel waits for the start-file receipt, requires shell/child exit within four seconds and no finish marker after nine more seconds; same-session recovery precedes owner cleanup |
+| `absent` | An absent model name reaches Ollama and gets HTTP 404; no successful inference or tool effect |
+| `unavailable` | The private relay returns HTTP 503 without forwarding generation; the shared daemon is not stopped |
+
+Generation requests specify temperature 0, seed 42, max_tokens 512, think false,
+reasoning_effort none, and `options.num_ctx=65536`. These are **requested** options:
+the observed Ollama 0.40.3 loaded-model metadata reported context length 32768.
+The harness records loaded model identity separately; it does not claim every
+OpenAI-compatible request option is effective.
+
+**Peer error limitation:** Hermes can retry model failures and return its error
+explanation with ACP `end_turn`. Rig then returns successful text containing the
+error. The absent-model control observed three HTTP 404 requests; the unavailable
+control observed 23 generation attempts, all rejected by the private relay.
+Protocol success does not prove successful inference; check the independent
+upstream receipts.
+The client does not classify error prose or add ACP prompt retries.
+
+Rivet uses its `mock-acp` launcher slot to start the real Hermes process. This is
+not built-in Hermes support. The server is authenticated and loopback-only with a
+fresh ID. Session cancellation, client drop, server DELETE, and supervisor cleanup
+remain separate operations. The Node control still observes a five-second DELETE
+timeout and verifies process exit under separate supervisor cleanup.
