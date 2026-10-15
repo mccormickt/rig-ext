@@ -1,33 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT=$(git rev-parse --show-toplevel)
-SUBSTRATE=${SUBSTRATE:-/tmp/rig-substrate-v0.4.0}
+SUBSTRATE=${SUBSTRATE:-/tmp/rig-substrate-v0.5.0}
 export KIND_CLUSTER_NAME=${KIND_CLUSTER_NAME:-rig-ollama-e2e}
 export KUBECTL_CONTEXT=kind-$KIND_CLUSTER_NAME
 test "$KIND_CLUSTER_NAME" = rig-ollama-e2e
 REGISTRY=${REGISTRY:-rig-ollama-registry}
 REGISTRY_PORT=${REGISTRY_PORT:-15010}
-RUN_DIR=${RUN_DIR:-$ROOT/.amp/in/substrate-run}
+RUN_DIR=${RUN_DIR:-$ROOT/.amp/in/substrate-v05-run}
 mkdir -p "$RUN_DIR"
 export KUBECONFIG=$RUN_DIR/kubeconfig
 export KO_DOCKER_REPO=localhost:$REGISTRY_PORT KO_DEFAULTPLATFORMS=linux/amd64
-PIN=756c2a53741121e728f4cc3066c8a19e575b4919
+PIN=e8d40c33f96f4b7a4984bfea7334a36ab5b45b7b
 python3 - <<'PY'
 import platform
 version = tuple(map(int, platform.release().split('.')[:2]))
 if version < (6, 5):
-    raise SystemExit('BLOCKED: Substrate v0.4.0 requires Linux >=6.5 (overlayfs lowerdir+); host is ' + platform.release())
+    raise SystemExit('BLOCKED: Substrate requires Linux >=6.5 (overlayfs lowerdir+); host is ' + platform.release())
 PY
 command -v go kubectl docker cargo >/dev/null
 docker info >/dev/null
 if [[ ! -d "$SUBSTRATE" ]]; then
-  git clone --depth 1 --branch v0.4.0 https://github.com/agent-substrate/substrate.git "$SUBSTRATE"
+  git clone --depth 1 --branch v0.5.0 https://github.com/agent-substrate/substrate.git "$SUBSTRATE"
 fi
 test "$(git -C "$SUBSTRATE" rev-parse HEAD)" = "$PIN"
 test -z "$(git -C "$SUBSTRATE" status --porcelain)"
 # Never adopt or replace a cluster, registry, or kubeconfig.
 test ! -e "$KUBECONFIG"
-for name in "$KIND_CLUSTER_NAME-control-plane" "$REGISTRY"; do
+for name in "$KIND_CLUSTER_NAME-control-plane" "$KIND_CLUSTER_NAME-worker" "$REGISTRY"; do
   if docker inspect "$name" >/dev/null 2>&1; then
     echo "Refusing existing container: $name" >&2
     exit 1
@@ -41,6 +41,7 @@ kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
 - role: control-plane
+- role: worker
 featureGates:
   ClusterTrustBundle: true
   ClusterTrustBundleProjection: true
@@ -59,15 +60,17 @@ kubeadmConfigPatches:
 EOF
 (cd "$SUBSTRATE"; ./hack/kind.sh create cluster --name "$KIND_CLUSTER_NAME" --config "$RUN_DIR/kind.yaml")
 docker inspect "$KIND_CLUSTER_NAME-control-plane" --format '{{.Id}}' > "$RUN_DIR/node.id"
+docker inspect "$KIND_CLUSTER_NAME-worker" --format '{{.Id}}' > "$RUN_DIR/worker-node.id"
 docker network connect kind "$REGISTRY"
 REGISTRY_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "kind").IPAddress}}' "$REGISTRY")
-NODE=$KIND_CLUSTER_NAME-control-plane
 # These network sysctls apply only inside the dedicated node namespace.
-docker exec "$NODE" sysctl net.ipv4.conf.all.proxy_arp=1
-docker exec "$NODE" sysctl -e net.ipv6.conf.all.proxy_ndp=1
-docker exec "$NODE" mkdir -p "/etc/containerd/certs.d/localhost:$REGISTRY_PORT"
-printf '[host."http://%s:5000"]\n' "$REGISTRY_IP" | docker exec -i "$NODE" \
-  sh -c "cat > /etc/containerd/certs.d/localhost:$REGISTRY_PORT/hosts.toml"
+for NODE in "$KIND_CLUSTER_NAME-control-plane" "$KIND_CLUSTER_NAME-worker"; do
+  docker exec "$NODE" sysctl net.ipv4.conf.all.proxy_arp=1
+  docker exec "$NODE" sysctl -e net.ipv6.conf.all.proxy_ndp=1
+  docker exec "$NODE" mkdir -p "/etc/containerd/certs.d/localhost:$REGISTRY_PORT"
+  printf '[host."http://%s:5000"]\n' "$REGISTRY_IP" | docker exec -i "$NODE" \
+    sh -c "cat > /etc/containerd/certs.d/localhost:$REGISTRY_PORT/hosts.toml"
+done
 (cd "$SUBSTRATE"
   go build -o bin/ate-setup ./cmd/ate-setup
   go build -o bin/kubectl-ate ./cmd/kubectl-ate
@@ -91,6 +94,8 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: rig-local
+  labels:
+    ate.dev/api-access: 'true'
 ---
 apiVersion: ate.dev/v1alpha1
 kind: WorkerPool
@@ -102,13 +107,17 @@ metadata:
 spec:
   replicas: 2
   workerImage: $WORKER_IMAGE
+  sandboxClasses:
+  - name: gvisor
+    configRef: {name: gvisor-default}
   template:
     nodeSelector:
-      ate.dev/substrate-version: v0.4.0
+      kubernetes.io/hostname: $KIND_CLUSTER_NAME-worker
     resources:
       requests: {cpu: 250m, memory: 1Gi}
       limits: {cpu: '1', memory: 1Gi}
 EOF
+kubectl --context "$KUBECTL_CONTEXT" wait --for=create deployment/rig -n rig-local --timeout=120s
 kubectl --context "$KUBECTL_CONTEXT" rollout status deployment/rig -n rig-local --timeout=10m
 if ! kubectl ate --context "$KUBECTL_CONTEXT" get atespace rig-local >/dev/null 2>&1; then
   kubectl ate --context "$KUBECTL_CONTEXT" create atespace rig-local
@@ -132,10 +141,10 @@ resources:
   - {name: cpu, quantity: '1'}
   - {name: memory, quantity: 512Mi}
 snapshotConfig:
-  onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
+  preferredFidelity: SNAPSHOT_FIDELITY_MEMORY
   storageLocation: gs://ate-snapshots/rig-poc/
 sandboxConfig:
-  sandboxClass: SANDBOX_CLASS_GVISOR
+  sandboxClass: gvisor
   configName: gvisor-default
 volumes:
 - name: data

@@ -61,6 +61,28 @@ class Live(Proof):
             golden = template.get("status", {}).get("goldenSnapshotStatus", {})
             self.check("golden tag exists", bool(golden.get("goldenTag")), True)
             self.check("golden has no error", bool(golden.get("errorMessage")), False)
+            tag = json.loads(
+                self.ate(
+                    "get",
+                    "tag",
+                    golden["goldenTag"]["name"],
+                    "-a",
+                    golden["goldenTag"]["atespace"],
+                    "-o",
+                    "json",
+                )
+            )
+            self.check(
+                "golden durable copy complete",
+                tag["status"]["snapshot"]["durableSnapshot"]["status"],
+                "SNAPSHOT_STORAGE_STATUS_COMPLETED",
+            )
+            self.check(
+                "golden MEMORY",
+                tag["status"]["snapshot"]["fidelity"],
+                "SNAPSHOT_FIDELITY_MEMORY",
+            )
+            self.record("golden_tag", tag=tag)
             self.record("template_image_golden", template=template)
         initial = self.inspect()
         self.check("expected actor build", initial["build"], self.args.build)
@@ -98,7 +120,8 @@ class Live(Proof):
             [(operation1, secret)],
         )
         if not self.args.direct_port:
-            before, assignment, suspended = self.suspend()
+            before, assignment, suspended = self.suspend(reopen=False)
+            snapshot = self.snapshot(suspended)
             self.record("snapshot_join", actor=suspended, worker_before=assignment)
             if self.args.replace_worker:
                 worker = assignment["status"]["workerAssignment"]
@@ -121,6 +144,56 @@ class Live(Proof):
                     worker["workerPod"],
                     "--all-containers=true",
                 )
+                if self.args.cross_node:
+                    destination = "rig-ollama-e2e-control-plane"
+                    self.check(
+                        "source is worker node",
+                        worker["nodeName"],
+                        "rig-ollama-e2e-worker",
+                    )
+                    self.check(
+                        "snapshot local to source",
+                        snapshot["locality"],
+                        worker["nodeName"],
+                    )
+                    self.command(
+                        "docker",
+                        "exec",
+                        destination,
+                        "sh",
+                        "-ec",
+                        f"test -d /var/lib/ate/actors; test ! -e /var/lib/ate/actors/{initial_actor['metadata']['uid']}/local-checkpoint/{snapshot['uuid']}",
+                    )
+                    self.command(
+                        "kubectl",
+                        "--context",
+                        self.kube_context,
+                        "patch",
+                        "workerpool",
+                        "rig",
+                        "-n",
+                        "rig-local",
+                        "--type=merge",
+                        "-p",
+                        json.dumps(
+                            {
+                                "spec": {
+                                    "template": {
+                                        "nodeSelector": {
+                                            "kubernetes.io/hostname": destination
+                                        },
+                                        "tolerations": [
+                                            {
+                                                "key": "node-role.kubernetes.io/control-plane",
+                                                "operator": "Exists",
+                                                "effect": "NoSchedule",
+                                            }
+                                        ],
+                                    }
+                                }
+                            }
+                        ),
+                    )
                 self.command(
                     "kubectl",
                     "--context",
@@ -148,6 +221,7 @@ class Live(Proof):
                     self.actor()["status"]["state"],
                     "ACTOR_STATE_SUSPENDED",
                 )
+            self.open_admission()
         # No discovery, inspect, or manual resume precedes the waking message.
         task2 = self.send(second, self.context)
         self.check(
@@ -172,6 +246,23 @@ class Live(Proof):
                     != worker["workerPodUid"],
                     True,
                 )
+                self.check(
+                    "restore node",
+                    restored["status"]["workerAssignment"]["nodeName"],
+                    "rig-ollama-e2e-control-plane"
+                    if self.args.cross_node
+                    else worker["nodeName"],
+                )
+            self.check(
+                "runtime continuity",
+                restored["status"]["workerAssignment"]["sandboxRuntime"],
+                snapshot["sandboxRuntime"],
+            )
+            self.check(
+                "one IPv4 worker address",
+                len(restored["status"]["workerAssignment"]["workerPodIps"]),
+                1,
+            )
             self.record("restore_join", actor=restored)
         after = self.inspect()
         self.check("heap nonce continuity", after["nonce"], before["nonce"])
@@ -360,8 +451,28 @@ class Live(Proof):
                     ]
                 ),
             )
-            snapshot = suspended["status"]["externalSnapshot"]["snapshotUri"]
+            snapshot_uri = snapshot["durableSnapshot"]["object"]["snapshotUri"]
             wake = turns[-1]
+            restores = [
+                e
+                for e in rpc_receipts(
+                    worker_logs[restored_worker],
+                    "/ateom.Ateom/RestoreWorkload",
+                    uid,
+                    wake["start"],
+                    wake["time"],
+                )
+                if e.get("err") is None
+                and e["req"].get("fidelity") == 3
+                and e["req"].get("snapshot_uri") == snapshot_uri
+            ]
+            self.check("executed successful MEMORY restore", len(restores), 1)
+            self.check(
+                "restore local-copy choice",
+                restores[0]["req"].get("preserve_restore_dir", False),
+                not self.args.cross_node,
+            )
+            self.record("executed_restore", snapshot=snapshot, records=restores)
             joins = [
                 event
                 for event in rpc_receipts(
@@ -374,15 +485,16 @@ class Live(Proof):
                 )
                 if event["err"] is None
                 and event["resp"].get("resumed") is True
-                and event["resp"]["actor"]["status"]["external_snapshot"][
-                    "snapshot_uri"
-                ]
-                == snapshot
+                and any(
+                    s["uuid"] == snapshot["uuid"]
+                    and s["generation"] == snapshot["generation"]
+                    for s in event["resp"]["actor"]["status"]["snapshots"]
+                )
                 and event["principal"]["ID"]
                 == "spiffe://cluster.local/ns/ate-system/sa/atenet-router"
             ]
             self.check(
-                "control plane resumed the full snapshot in waking interval",
+                "control plane resumed the captured snapshot in waking interval",
                 len(joins),
                 1,
             )
@@ -406,14 +518,22 @@ if __name__ == "__main__":
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--build", required=True)
     parser.add_argument("--receipts", type=Path, required=True)
-    parser.add_argument("--substrate", default="/tmp/rig-substrate-v0.4.0")
+    parser.add_argument("--substrate", default="/tmp/rig-substrate-v0.5.0")
     parser.add_argument("--direct-port", type=int)
+    parser.add_argument(
+        "--cross-node",
+        action="store_true",
+        help="move the owned pool to the other owned node",
+    )
     parser.add_argument(
         "--replace-worker",
         action="store_true",
         help="delete only the suspended actor's worker in the disposable cluster",
     )
-    proof = Live(parser.parse_args())
+    args = parser.parse_args()
+    if args.cross_node and not args.replace_worker:
+        parser.error("--cross-node requires --replace-worker")
+    proof = Live(args)
     try:
         proof.run()
     except Exception as error:

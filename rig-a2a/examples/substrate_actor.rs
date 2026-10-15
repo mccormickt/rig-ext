@@ -90,6 +90,7 @@ struct Memory {
     invocations: AtomicU64,
     commits: AtomicU64,
     readiness_failures: AtomicU64,
+    readiness_delay: Mutex<(u64, Option<std::time::Instant>)>,
     held: AtomicBool,
     release: AtomicBool,
 }
@@ -205,6 +206,49 @@ async fn probe_egress(url: String) -> Json<Value> {
     })
 }
 
+async fn probe_dns(Path(transport): Path<String>) -> Result<Json<Value>, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let operation = async {
+        let resolv = tokio::fs::read_to_string("/etc/resolv.conf").await?;
+        let server = resolv
+            .lines()
+            .find_map(|line| line.strip_prefix("nameserver "))
+            .ok_or_else(|| std::io::Error::other("no nameserver"))?
+            .trim();
+        let address = format!("{server}:53");
+        let mut query = vec![0x52, 0x49, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in "ollama.rig-local.svc".split('.') {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.extend_from_slice(&[0, 0, 1, 0, 1]);
+        let reply = if transport == "tcp" {
+            let mut socket = tokio::net::TcpStream::connect(&address).await?;
+            socket.write_u16(query.len() as u16).await?;
+            socket.write_all(&query).await?;
+            let length = socket.read_u16().await?;
+            let mut reply = vec![0; usize::from(length)];
+            socket.read_exact(&mut reply).await?;
+            reply
+        } else if transport == "udp" {
+            let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+            socket.connect(&address).await?;
+            socket.send(&query).await?;
+            let mut reply = vec![0; 4096];
+            let length = socket.recv(&mut reply).await?;
+            reply.truncate(length);
+            reply
+        } else {
+            return Err(std::io::Error::other("transport must be udp or tcp"));
+        };
+        Ok(Json(json!({"server":server,"query":query,"reply":reply})))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), operation)
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
 async fn reject_tenant(request: Request, next: Next) -> Response {
     let (parts, body) = request.into_parts();
     let Ok(bytes) = to_bytes(body, 1024 * 1024).await else {
@@ -302,8 +346,23 @@ async fn main() -> anyhow::Result<()> {
                     .readiness_failures
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                     .unwrap_or(0);
-                eprintln!("{}", json!({"event":"readiness","remaining":remaining}));
-                if remaining == 0 {
+                let mut delay = app
+                    .record
+                    .memory
+                    .readiness_delay
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let elapsed = delay
+                    .1
+                    .get_or_insert_with(std::time::Instant::now)
+                    .elapsed();
+                let ready = remaining == 0 && elapsed.as_millis() >= u128::from(delay.0);
+                eprintln!(
+                    "{}",
+                    json!({"event":"readiness","remaining":remaining,
+                    "delay_ms":delay.0,"elapsed_ms":elapsed.as_millis(),"ready":ready})
+                );
+                if ready {
                     StatusCode::OK
                 } else {
                     StatusCode::SERVICE_UNAVAILABLE
@@ -318,6 +377,19 @@ async fn main() -> anyhow::Result<()> {
                         .memory
                         .readiness_failures
                         .store(failures, Ordering::SeqCst);
+                    StatusCode::OK
+                },
+            ),
+        )
+        .route(
+            "/readiness-delay/{milliseconds}",
+            post(
+                |State(app): State<App>, Path(milliseconds): Path<u64>| async move {
+                    *app.record
+                        .memory
+                        .readiness_delay
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = (milliseconds, None);
                     StatusCode::OK
                 },
             ),
@@ -353,6 +425,11 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/egress/wrong-port",
             get(|| probe_egress("http://ollama.rig-local.svc:15027/probe".into())),
+        )
+        .route("/dns/{transport}", get(probe_dns))
+        .route(
+            "/egress/link-local",
+            get(|| probe_egress("http://link-local.rig-local.svc:15024/probe".into())),
         )
         .with_state(app)
         .merge(agent_card::agent_card_router(Arc::new(

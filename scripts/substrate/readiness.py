@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import time
 import uuid
 from pathlib import Path
 
@@ -17,7 +18,7 @@ if __name__ == "__main__":
         before = proof.inspect()
         proof.check(
             "arm delayed readiness",
-            proof.http("/actors/rig-1/readiness/3", {}, owner="admin")[0],
+            proof.http("/actors/rig-1/readiness-delay/2000", {}, owner="admin")[0],
             200,
         )
         proof.suspend()
@@ -51,14 +52,17 @@ if __name__ == "__main__":
             except ValueError:
                 pass
         probes = [
-            (i, e["remaining"])
+            (i, e)
             for i, e in enumerate(events)
-            if e.get("event") == "readiness"
+            if e.get("event") == "readiness" and e.get("delay_ms") == 2000
         ]
         proof.check(
-            "three failed probes then readiness",
-            [n for _, n in probes][-4:],
-            [3, 2, 1, 0],
+            "probe-relative readiness delay",
+            bool(probes)
+            and not probes[0][1]["ready"]
+            and probes[-1][1]["ready"]
+            and probes[-1][1]["elapsed_ms"] >= 2000,
+            True,
         )
         operation = json.loads(prompt)["operation"]
         effect_index = next(
@@ -68,6 +72,82 @@ if __name__ == "__main__":
         )
         proof.check(
             "effect follows successful probe", effect_index > probes[-1][0], True
+        )
+        proof.check(
+            "arm beyond gateway deadline",
+            proof.http("/actors/rig-1/readiness-delay/7000", {}, owner="admin")[0],
+            200,
+        )
+        proof.suspend()
+        late = proof.prompt("must-not-run-after-timeout")
+        status, response = proof.http(
+            "/jsonrpc",
+            {
+                "jsonrpc": "2.0",
+                "id": uuid.uuid4().hex,
+                "method": "SendMessage",
+                "params": {
+                    "message": {
+                        "messageId": uuid.uuid4().hex,
+                        "role": "ROLE_USER",
+                        "parts": [{"text": late}],
+                    }
+                },
+            },
+        )
+        proof.check("beyond deadline first status", status, 504)
+        proof.check(
+            "beyond deadline first state",
+            proof.actor()["status"]["state"],
+            "ACTOR_STATE_RESUMING",
+        )
+        time.sleep(8)
+        status, _ = proof.http(
+            "/jsonrpc",
+            {
+                "jsonrpc": "2.0",
+                "id": uuid.uuid4().hex,
+                "method": "SendMessage",
+                "params": {
+                    "message": {
+                        "messageId": uuid.uuid4().hex,
+                        "role": "ROLE_USER",
+                        "parts": [{"text": late}],
+                    }
+                },
+            },
+        )
+        proof.check("gateway retry exceeds deadline again", status, 504)
+        proof.check(
+            "gateway retry retains assignment",
+            proof.actor()["status"]["state"],
+            "ACTOR_STATE_RESUMING",
+        )
+        proof.ate("resume", "actor", "rig-1", "-a", "rig-local")
+        proof.check(
+            "long operator retry ready",
+            proof.actor()["status"]["state"],
+            "ACTOR_STATE_RUNNING",
+        )
+        after = proof.inspect()
+        proof.check(
+            "timeout has no late effect",
+            json.loads(late)["operation"] in after["journal"],
+            False,
+        )
+        proof.check(
+            "neither timed-out request commits", after["commits"], before["commits"] + 1
+        )
+        proof.settled(proof.send(proof.prompt("after-operator-readiness")))
+        proof.check(
+            "fresh request commits once",
+            proof.inspect()["commits"],
+            before["commits"] + 2,
+        )
+        proof.check(
+            "clear timed delay",
+            proof.http("/actors/rig-1/readiness-delay/0", {}, owner="admin")[0],
+            200,
         )
         proof.check(
             "arm failed readiness",

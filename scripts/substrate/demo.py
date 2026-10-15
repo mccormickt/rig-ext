@@ -208,7 +208,26 @@ class Proof:
             time.sleep(0.1)
         raise TimeoutError(name)
 
-    def suspend(self):
+    def snapshot(self, actor):
+        snapshots = actor["status"]["snapshots"]
+        snapshot = max(snapshots, key=lambda s: s["generation"])
+        self.check("captured MEMORY", snapshot["fidelity"], "SNAPSHOT_FIDELITY_MEMORY")
+        self.check("actor-owned snapshot", snapshot["owner"], "SNAPSHOT_OWNER_ACTOR")
+        self.check(
+            "durable copy completed",
+            snapshot["durableSnapshot"]["status"],
+            "SNAPSHOT_STORAGE_STATUS_COMPLETED",
+        )
+        self.check("snapshot runtime recorded", bool(snapshot["sandboxRuntime"]), True)
+        self.check("snapshot UUID recorded", bool(snapshot["uuid"]), True)
+        return snapshot
+
+    def open_admission(self):
+        status, opened = self.http("/admin/open", {}, owner="admin")
+        self.check("admission open HTTP", status, 200)
+        self.check("admission reopened", opened["closed"], False)
+
+    def suspend(self, *, reopen=True):
         status, closed = self.http("/admin/close", {}, owner="admin")
         self.check("admission close HTTP", status, 200)
         self.check("admission closed", closed["closed"], True)
@@ -228,14 +247,9 @@ class Proof:
         self.check(
             "assignment cleared", "workerAssignment" in suspended["status"], False
         )
-        self.check(
-            "full external snapshot",
-            suspended["status"]["externalSnapshot"]["contentScope"],
-            "SNAPSHOT_CONTENT_SCOPE_FULL",
-        )
-        status, opened = self.http("/admin/open", {}, owner="admin")
-        self.check("admission open HTTP", status, 200)
-        self.check("admission reopened", opened["closed"], False)
+        self.snapshot(suspended)
+        if reopen:
+            self.open_admission()
         return before, assignment, suspended
 
     def provenance(self):
@@ -343,7 +357,7 @@ class Proof:
         self.record(
             "result",
             status="TWO_TURN_CHECKS_PASS",
-            scope="requires independent gateway/worker/actor receipt correlation before accepting FULL restore proof",
+            scope="requires independent executed MEMORY restore and gateway/worker/actor receipt correlation",
         )
 
 
@@ -351,7 +365,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
-    parser.add_argument("--substrate", default="/tmp/rig-substrate-v0.4.0")
+    parser.add_argument("--substrate", default="/tmp/rig-substrate-v0.5.0")
     args = parser.parse_args()
     proof = Proof(args)
     try:

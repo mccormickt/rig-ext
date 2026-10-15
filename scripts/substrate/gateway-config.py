@@ -9,6 +9,7 @@ import subprocess
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--parking-max", type=int, default=1024)
+parser.add_argument("--cache", choices=("default", "0s"), default="0s")
 args = parser.parse_args()
 if args.parking_max < 0:
     parser.error("parking capacity cannot be negative")
@@ -32,7 +33,8 @@ assert (
 text = text.replace(
     anchor,
     anchor
-    + f"      cacheTtl: 0s\n      requestParking: {{budget: 5s, max: {args.parking_max}, retryInterval: 100ms, retryFactor: 1.1}}\n",
+    + ("      cacheTtl: 0s\n" if args.cache == "0s" else "")
+    + f"      requestParking: {{budget: 5s, max: {args.parking_max}, retryInterval: 100ms, retryFactor: 1.1}}\n",
 )
 config["data"]["config.yaml"] = text
 print(text)

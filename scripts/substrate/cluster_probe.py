@@ -13,19 +13,44 @@ from demo import Proof
 
 
 def duplicates(proof, port, method, values):
+    operation = uuid.uuid4().hex
+    payload = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": operation,
+            "method": "SendMessage",
+            "params": {
+                "message": {
+                    "messageId": operation,
+                    "role": "ROLE_USER",
+                    "parts": [
+                        {
+                            "text": json.dumps(
+                                {"operation": operation, "value": "selector-control"}
+                            )
+                        }
+                    ],
+                }
+            },
+        }
+    ).encode()
+    inner = (
+        f"POST /jsonrpc HTTP/1.1\r\nHost: rig-1:80\r\nA2A-Version: 1.0\r\n"
+        f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n"
+    )
     with socket.create_connection(("127.0.0.1", port), timeout=30) as conn:
-        target = "rig-1:80" if method == "CONNECT" else "/inspect"
         headers = "".join(f"ate-target-actor: {value}\r\n" for value in values)
-        conn.sendall(
-            f"{method} {target} HTTP/1.1\r\nHost: rig-1:80\r\n{headers}\r\n".encode()
-        )
+        if method == "CONNECT":
+            conn.sendall(
+                f"CONNECT rig-1:80 HTTP/1.1\r\nHost: rig-1:80\r\n{headers}\r\n".encode()
+            )
+        else:
+            conn.sendall((inner + headers + "\r\n").encode() + payload)
         response = http.client.HTTPResponse(conn)
         response.begin()
         outer = response.status
         if method == "CONNECT" and outer == 200:
-            conn.sendall(
-                b"GET /inspect HTTP/1.1\r\nHost: rig-1:80\r\nConnection: close\r\n\r\n"
-            )
+            conn.sendall((inner + "\r\n").encode() + payload)
             response = http.client.HTTPResponse(conn)
             response.begin()
         body = response.read().decode()
@@ -37,7 +62,14 @@ def duplicates(proof, port, method, values):
             outer_status=outer,
             status=response.status,
             body=body,
+            operation=operation,
         )
+        if response.status == 200:
+            proof.check(
+                "selector request executed real tool",
+                json.loads(body)["result"]["task"]["status"]["state"],
+                "TASK_STATE_COMPLETED",
+            )
         return response.status
 
 
@@ -45,7 +77,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
-    parser.add_argument("--substrate", default="/tmp/rig-substrate-v0.4.0")
+    parser.add_argument("--substrate", default="/tmp/rig-substrate-v0.5.0")
     p = Proof(parser.parse_args())
     gateway_port = int(os.environ.get("GATEWAY_PORT", "15021"))
     connect_port = int(os.environ.get("CONNECT_PORT", "15022"))
@@ -93,7 +125,7 @@ if __name__ == "__main__":
             p.http(path, body, owner, headers)[0],
             expected,
         )
-    for method in ("GET", "CONNECT"):
+    for method in ("POST", "CONNECT"):
         p.check(
             "edge duplicate selector denied",
             duplicates(p, p.edge_port, method, ["rig-local/rig-1", "rig-local/rig-2"]),
@@ -122,12 +154,13 @@ if __name__ == "__main__":
     p.check(
         "broken route cannot pass", bad_response, 'actor "does-not-exist" not found'
     )
-    for method, port in (("GET", gateway_port), ("CONNECT", connect_port)):
+    for method, port in (("POST", gateway_port), ("CONNECT", connect_port)):
         for values in (
             ["rig-local/does-not-exist"],
             ["rig-local/does-not-exist", "rig-local/rig-1"],
             ["rig-local/rig-1", "rig-local/does-not-exist"],
             ["rig-local/rig-1", "rig-local/rig-1"],
+            ["rig-local/rig-1", "rig-local/rig-2"],
             ["rig-local/rig-1, rig-local/does-not-exist"],
         ):
             actual = duplicates(p, port, method, values)
@@ -142,6 +175,7 @@ if __name__ == "__main__":
                     actual,
                     200,
                 )
+    p.check("unselected actor remains unchanged", p.actor("rig-2"), other_before)
     actors = json.loads(p.ate("get", "actors", "-a", "rig-local", "-o", "json"))
     p.check(
         "unknown actor not created",

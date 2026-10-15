@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run the pinned mount tests without host mounts, devices, or network access.
 set -euo pipefail
-: "${SUBSTRATE:?Set SUBSTRATE to the clean v0.4.0 checkout}"
-test "$(git -C "$SUBSTRATE" rev-parse HEAD)" = 756c2a53741121e728f4cc3066c8a19e575b4919
+: "${SUBSTRATE:?Set SUBSTRATE to the clean v0.5.0 checkout}"
+test "$(git -C "$SUBSTRATE" rev-parse HEAD)" = e8d40c33f96f4b7a4984bfea7334a36ab5b45b7b
 test -z "$(git -C "$SUBSTRATE" status --porcelain)"
 BUILD=$(mktemp -d)
 NAME=rig-overlay-$(basename "$BUILD")

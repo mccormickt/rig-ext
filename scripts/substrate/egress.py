@@ -3,6 +3,8 @@
 
 import argparse
 import json
+import struct
+import time
 import urllib.request
 from pathlib import Path
 
@@ -21,14 +23,34 @@ if __name__ == "__main__":
         proof.record("independent_sink", path=path, value=value)
         return value
 
+    def dns(actor, rcode):
+        for transport in ("udp", "tcp"):
+            status, value = proof.http(
+                f"/actors/{actor}/dns/{transport}", owner="admin"
+            )
+            proof.check("DNS handler", status, 200)
+            query, reply = bytes(value["query"]), bytes(value["reply"])
+            header = struct.unpack("!6H", reply[:12])
+            proof.check("DNS transaction", list(reply[:2]), [0x52, 0x49])
+            proof.check("DNS response flag", bool(header[1] & 0x8000), True)
+            proof.check("DNS one question", header[2], 1)
+            question = b"\x06ollama\x09rig-local\x03svc\0\0\x01\0\x01"
+            proof.check("DNS query", list(query[12:]), list(question))
+            proof.check(
+                "DNS echoed question", list(reply[12 : len(query)]), list(question)
+            )
+            proof.check("DNS RCODE " + transport, header[1] & 15, rcode)
+            proof.check("DNS answers", header[3] > 0, rcode == 0)
+
     try:
         before = sink("/stats")
         positive = sink("/probe")
         proof.check("sink live before denial", positive["probes"], before["probes"] + 1)
         for actor in ("rig-1", "rig-2"):
+            dns(actor, 5)
             status, denied = proof.http(f"/actors/{actor}/egress", owner="admin")
             proof.check("actor egress handler reached", status, 200)
-            proof.check("default-deny explicit HTTP denial", denied, {"status": 403})
+            proof.check("unresolved denied destination", "error" in denied, True)
         proof.check("denied traffic did not reach sink", sink("/stats"), positive)
         policy = proof.out / "allow.json"
         policy.write_text(
@@ -49,6 +71,8 @@ if __name__ == "__main__":
             "create", "egress-policy", "rig-1", "-a", "rig-local", "-f", str(policy)
         )
         proof.ate("get", "egress-policy", "rig-1", "-a", "rig-local", "-o", "json")
+        time.sleep(6)
+        dns("rig-1", 0)
         status, allowed = proof.http("/actors/rig-1/egress", owner="admin")
         proof.check("allowed HTTP handler", status, 200)
         proof.check("narrow allowed destination", allowed, {"status": 200})
@@ -59,15 +83,18 @@ if __name__ == "__main__":
         proof.check("probe is not inference", after["calls"], positive["calls"])
         proof.check(
             "other actor remains denied",
-            proof.http("/actors/rig-2/egress", owner="admin")[1],
-            {"status": 403},
+            "error" in proof.http("/actors/rig-2/egress", owner="admin")[1],
+            True,
         )
         proof.check("other actor did not reach sink", sink("/stats"), after)
         for path in ("wrong-host", "wrong-port"):
+            denied = proof.http("/actors/rig-1/egress/" + path, owner="admin")[1]
             proof.check(
                 "excluded " + path,
-                proof.http("/actors/rig-1/egress/" + path, owner="admin")[1],
-                {"status": 403},
+                "error" in denied
+                if path == "wrong-host"
+                else denied == {"status": 403},
+                True,
             )
         proof.check("excluded requests did not reach sink", sink("/stats"), after)
         control = proof.out / "control-allow.json"
@@ -91,6 +118,7 @@ if __name__ == "__main__":
         proof.ate(
             "create", "egress-policy", "rig-2", "-a", "rig-local", "-f", str(control)
         )
+        time.sleep(6)
         for path in ("wrong-host", "wrong-port"):
             proof.check(
                 "excluded destination live under control grant " + path,
@@ -103,16 +131,18 @@ if __name__ == "__main__":
             after["probes"] + 2,
         )
         proof.ate("delete", "egress-policy", "rig-2", "-a", "rig-local")
+        time.sleep(6)
+        dns("rig-2", 5)
         proof.check(
             "control grant removed",
-            proof.http("/actors/rig-2/egress", owner="admin")[1],
-            {"status": 403},
+            "error" in proof.http("/actors/rig-2/egress", owner="admin")[1],
+            True,
         )
         proof.suspend()
         proof.record(
             "result",
             status="PASS",
-            scope="two actors, HTTP default-deny and one host/port allow; DNS port53 is outside this contract",
+            scope="two actors, UDP/TCP DNS REFUSED without policy, exact local host/port allow and independent sink receipts",
         )
     except Exception as error:
         proof.record(
