@@ -6,6 +6,7 @@ import datetime
 import hashlib
 import http.client
 import json
+import os
 import subprocess
 import sys
 import time
@@ -17,9 +18,35 @@ def now():
     return datetime.datetime.now(datetime.UTC).isoformat()
 
 
+def rpc_receipts(logs, method, uid, start, end, worker_uid=None):
+    """Select one actor's RPC receipts in a UTC request interval."""
+    start, end = map(datetime.datetime.fromisoformat, (start, end))
+    matches = []
+    for line in logs.splitlines():
+        try:
+            event = json.loads(line[line.index("{") :])
+            stamp = datetime.datetime.fromisoformat(event["time"])
+        except (ValueError, KeyError):
+            continue
+        actor_uid = (event.get("req") or {}).get("actor_uid") or (
+            ((event.get("resp") or {}).get("actor") or {}).get("metadata") or {}
+        ).get("uid")
+        if worker_uid is not None:
+            assignment = (
+                ((event.get("resp") or {}).get("actor") or {}).get("status") or {}
+            ).get("worker_assignment") or {}
+            if assignment.get("worker_pod_uid") != worker_uid:
+                continue
+        if event.get("method") == method and actor_uid == uid and start <= stamp <= end:
+            matches.append(event)
+    return matches
+
+
 class Proof:
     def __init__(self, args):
         self.args = args
+        self.kube_context = os.environ.get("KUBECTL_CONTEXT", "kind-rig-ollama-e2e")
+        self.edge_port = int(os.environ.get("EDGE_PORT", "15020"))
         self.tokens = json.loads(args.tokens.read_text())
         self.out = args.evidence
         self.out.mkdir(parents=True, exist_ok=False)
@@ -63,7 +90,9 @@ class Proof:
 
     def command(self, *command):
         start = now()
-        result = subprocess.run(command, text=True, capture_output=True, check=False)
+        result = subprocess.run(
+            command, text=True, capture_output=True, check=False, timeout=180
+        )
         self.record(
             "command",
             command=command,
@@ -76,9 +105,7 @@ class Proof:
         return result.stdout
 
     def ate(self, *command):
-        return self.command(
-            "kubectl", "ate", "--context", "kind-rig-substrate", *command
-        )
+        return self.command("kubectl", "ate", "--context", self.kube_context, *command)
 
     def actor(self, name="rig-1"):
         return json.loads(
@@ -86,8 +113,10 @@ class Proof:
         )
 
     def http(
-        self, path, body=None, owner="rig-1", headers=None, method=None, port=18081
+        self, path, body=None, owner="rig-1", headers=None, method=None, port=None
     ):
+        start = now()
+        port = self.edge_port if port is None else port
         correlation = uuid.uuid4().hex
         hdr = {
             "Content-Type": "application/json",
@@ -116,6 +145,7 @@ class Proof:
             pass
         self.record(
             "http",
+            start=start,
             request=correlation,
             owner=owner,
             path=path,
@@ -179,7 +209,9 @@ class Proof:
         raise TimeoutError(name)
 
     def suspend(self):
-        self.http("/admin/close", {}, owner="admin")
+        status, closed = self.http("/admin/close", {}, owner="admin")
+        self.check("admission close HTTP", status, 200)
+        self.check("admission closed", closed["closed"], True)
         self.wait(
             "forwarding drained",
             lambda: self.http("/admin/status", owner="admin")[1]["inflight"] == 0,
@@ -201,7 +233,9 @@ class Proof:
             suspended["status"]["externalSnapshot"]["contentScope"],
             "SNAPSHOT_CONTENT_SCOPE_FULL",
         )
-        self.http("/admin/open", {}, owner="admin")
+        status, opened = self.http("/admin/open", {}, owner="admin")
+        self.check("admission open HTTP", status, 200)
+        self.check("admission reopened", opened["closed"], False)
         return before, assignment, suspended
 
     def provenance(self):
@@ -212,7 +246,7 @@ class Proof:
             ("cargo", "--version"),
             ("go", "version"),
             ("docker", "version", "--format", "{{.Server.Version}}"),
-            ("kubectl", "--context", "kind-rig-substrate", "version", "-o", "json"),
+            ("kubectl", "--context", self.kube_context, "version", "-o", "json"),
         ):
             self.command(*command)
         self.command("git", "-C", self.args.substrate, "rev-parse", "HEAD")
@@ -220,7 +254,7 @@ class Proof:
         self.command(
             "kubectl",
             "--context",
-            "kind-rig-substrate",
+            self.kube_context,
             "get",
             "pods",
             "-A",
@@ -230,7 +264,16 @@ class Proof:
 
     def run(self):
         self.provenance()
-        self.check("empty initial actor", self.inspect()["nonce"], None)
+        initial = self.inspect()
+        for key, expected in {
+            "nonce": None,
+            "journal": "",
+            "active": 0,
+            "commits": 0,
+            "invocations": 0,
+            "completions": 0,
+        }.items():
+            self.check("empty initial " + key, initial[key], expected)
         card_status, card = self.http("/actors/rig-1/.well-known/agent-card.json")
         self.check("card discovery", card_status, 200)
         self.record("card", value=card)
@@ -238,12 +281,27 @@ class Proof:
         task1 = self.send(first)
         self.context = task1["contextId"]
         self.check("first Rig prompt", self.settled(task1)["prompts"], [first])
+        status, history1 = self.http(
+            f"/actors/rig-1/history/{self.context}", owner="admin"
+        )
+        self.check("history HTTP", status, 200)
+        self.check("first canonical history exists", bool(history1), True)
         before, _assignment, suspended = self.suspend()
+        self.check("nonce created before suspend", bool(before["nonce"]), True)
+        self.check(
+            "first effect count", (before["invocations"], before["commits"]), (1, 1)
+        )
         second = self.prompt("second-" + uuid.uuid4().hex)
         # No actor HTTP request or manual resume between SUSPENDED and this call.
         task2 = self.send(second, self.context)
         self.check(
             "two-turn Rig history", self.settled(task2)["prompts"], [first, second]
+        )
+        restored = self.actor()
+        self.check(
+            "running before any follow-up actor HTTP",
+            restored["status"]["state"],
+            "ACTOR_STATE_RUNNING",
         )
         after = self.inspect()
         self.check("heap-only nonce restored", after["nonce"], before["nonce"])
@@ -259,7 +317,6 @@ class Proof:
             after["journal"].startswith(before["journal"]),
             True,
         )
-        restored = self.actor()
         self.check(
             "selected actor is running",
             restored["status"]["state"],
@@ -275,7 +332,14 @@ class Proof:
             restored["metadata"]["uid"],
             suspended["metadata"]["uid"],
         )
-        self.http(f"/actors/rig-1/history/{self.context}", owner="admin")
+        status, history2 = self.http(
+            f"/actors/rig-1/history/{self.context}", owner="admin"
+        )
+        self.check("restored history HTTP", status, 200)
+        self.check(
+            "canonical history prefix retained", history2[: len(history1)], history1
+        )
+        self.check("canonical history extended", len(history2) > len(history1), True)
         self.record(
             "result",
             status="TWO_TURN_CHECKS_PASS",

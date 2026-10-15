@@ -24,6 +24,8 @@ class Edge(http.server.BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.close_connection = True
         self.end_headers()
         self.wfile.write(body)
 
@@ -92,10 +94,16 @@ class Edge(http.server.BaseHTTPRequestHandler):
         except ValueError:
             self.reply(413, {"error": "invalid body length"})
             return
-        body = self.rfile.read(length)
         admitted = False
         with Edge.lock:
-            if not Edge.closed or owner == "admin":
+            drain_control = owner == "admin" and (
+                (
+                    self.command == "GET"
+                    and (path == "/inspect" or path.startswith("/history/"))
+                )
+                or (self.command == "POST" and path == "/release")
+            )
+            if not Edge.closed or drain_control:
                 Edge.inflight += 1
                 admitted = True
         if not admitted:
@@ -119,6 +127,11 @@ class Edge(http.server.BaseHTTPRequestHandler):
         )
         started = False
         try:
+            self.connection.settimeout(10)
+            body = self.rfile.read(length)
+            if len(body) != length:
+                self.reply(400, {"error": "incomplete body"})
+                return
             headers = {
                 "ate-target-actor": "rig-local/" + actor,
                 "X-Request-ID": correlation,

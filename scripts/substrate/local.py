@@ -17,6 +17,8 @@ from demo import Proof
 
 
 class Local(Proof):
+    cluster = False
+
     def http(
         self, path, body=None, owner="rig-1", headers=None, method=None, port=18190
     ):
@@ -27,7 +29,9 @@ class Local(Proof):
         return super().http(path, body, None, headers, method, port)
 
     def stream(self, method, params):
-        conn = http.client.HTTPConnection("127.0.0.1", 18190, timeout=20)
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", self.edge_port if self.cluster else 18190, timeout=20
+        )
         request = {
             "jsonrpc": "2.0",
             "id": uuid.uuid4().hex,
@@ -42,6 +46,11 @@ class Local(Proof):
                 "Content-Type": "application/json",
                 "A2A-Version": "1.0",
                 "X-Request-ID": request["id"],
+                **(
+                    {"Authorization": "Bearer " + self.tokens["rig-1"]}
+                    if self.cluster
+                    else {}
+                ),
             },
         )
         response = conn.getresponse()
@@ -87,7 +96,10 @@ class Local(Proof):
                 "A2A 1.0 JSON-RPC/SSE",
             ],
             fixture=["deterministic inference"],
-            excluded=["kind", "agentgateway", "Substrate", "gVisor", "ACP"],
+            excluded=["ACP"]
+            if self.cluster
+            else ["kind", "agentgateway", "Substrate", "gVisor", "ACP"],
+            deployed=self.cluster,
         )
         self.command("git", "rev-parse", "HEAD")
         self.command("git", "status", "--porcelain")

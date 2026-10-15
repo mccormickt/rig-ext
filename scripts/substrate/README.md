@@ -1,128 +1,95 @@
 # Rig actor on Agent Substrate: bounded prototype
 
-**The full cluster proof is blocked, not passed.** On 2026-10-14, this orb ran
-kind, Kubernetes, Substrate, two gVisor workers, and agentgateway. It registered
-the Rust actor image, an ActorTemplate, and two actors. An A2A request sent while
-`rig-1` was `SUSPENDED` reached `ResumeActor`, but startup failed before `runsc`
-could create the sandbox:
+**Zeus passed real Ollama cross-worker restore on 2026-10-15.** Linux
+7.0.0-38-generic passed the pinned overlay mount tests. A public A2A request
+through the authenticated edge and deployed agentgateway woke a SUSPENDED
+gVisor actor. After explicit drain/suspend and deletion of its worker Pod, a
+second request restored the same heap nonce, counters, file and conversation on
+a different worker Pod UID. No manual resume preceded that waking request.
+
+The installed model was `qwen3.5:9b`, digest
+`56671c2ab9385f9cfcb404638e32cd62d88e3501d44822208363c010179a3c90`.
+Native `/api/chat` used `think:false`, temperature 0, seed 42, context8192 and
+prediction limit512. Independent provider receipts contain actual token counts
+and tool calls. Tool/file counters and model-to-A2A text checks reject a plausible
+fallback answer. No model download or shared Ollama configuration change was needed.
+
+## Boundaries
 
 ```text
-Linux 6.1.158+
-overlayfs: unrecognized mount option "lowerdir+=..."
-while creating overlay superblock: invalid argument
-SUSPENDED → CRASHED; gateway HTTP 500
+client → loopback authenticated edge → agentgateway substrateIngress
+       → ResumeActor → worker atunnel → gVisor → Rust A2A server → Rig
+       → narrow egress allow → receipt proxy → shared local Ollama
 ```
 
-Substrate v0.4.0 requires Linux **6.5 or later** for this mount API. See its
-[implementation](https://github.com/agent-substrate/substrate/blob/v0.4.0/internal/imagecache/bundle_linux.go)
-and [contract](https://github.com/agent-substrate/substrate/blob/v0.4.0/internal/imagecache/README.md).
-Changing the kind node image does not change the host kernel. No KVM, microVM,
-unsandboxed fallback, or core patch is used to bypass this failure.
+`INFERENCE=fixture` preserves deterministic protocol controls. Its model reads
+actual Rig history, calls the registered file tool, then returns the tool result.
+`INFERENCE=ollama` replaces only inference with Rig's native provider. Provider
+failure fails the task; it never selects the fixture. The tool writes and fsyncs
+a file, counts invocations separately from commits, and creates a heap-only nonce
+on its first call. Readiness does not create the nonce; the golden snapshot has none.
 
-## Protocol and execution boundaries
+One actor contains one workspace. Contexts have separate histories and locks but
+share the file journal. Use separate actors for separate owners. Non-null `tenant`
+parameters are rejected before task lookup or state changes. The task store is
+not a multitenant authorization boundary. Operation-ID deduplication is local to
+the journal, not an external-effect transaction. **No external exactly-once claim.**
 
-```text
-test client → loopback authenticated edge → real agentgateway substrateIngress
-            → ResumeActor → worker atunnel → gVisor → Rust A2A server → Rig
-                                                      ↑ blocked before here
-```
+A2A1.0 JSON-RPC uses `SendMessage`, `SendStreamingMessage`, `GetTask`,
+`SubscribeToTask` and `CancelTask`, with `A2A-Version: 1.0`. The card advertises
+protocolVersion1.0. Missing,0.3 and unsupported versions are rejected. SSE carries
+task events, not model tokens. Resubscribe returns current state and later events,
+not missed-token replay. Native Substrate routing is not A2A card rewriting.
+`PUBLIC_URL` sets the advertised endpoint. Do not use discovery as the waking turn.
 
-The separate local component suite executes the same Rust server and ordinary
-Rig AgentRunner without Substrate. Its deterministic model reads actual Rig
-history, requests a registered file tool, and returns the actual tool result.
-Only inference is simulated. The tool writes and fsyncs a file, counts calls
-separately from commits, and generates a heap-only nonce on its first call.
-Readiness does not create the nonce, so a golden snapshot should contain none.
+**This is not ACP.** HTTP wake is not A2A-exclusive. A separate authenticated
+ACP HTTP/WS-to-stdio host is possible but is not implemented here. Hermes is a real
+ACP stdio peer. The older OpenClaw `acp-runtime.ts` is an application plugin using
+OpenAI HTTP/SSE, not ACP wire-conformance evidence. The separate `rig-acp` branch
+was not copied into this checkout or tested through this cluster.
 
-The actor contains one workspace. Distinct A2A contexts have separate histories
-and locks, but share its file journal. Use separate actors for separate owners.
-The example rejects non-null A2A `tenant` parameters before task lookup or state
-changes. Its task store is not a multitenant authorization boundary.
-The fixture's operation-ID deduplication is local to that journal. It is **not**
-an external-effect transaction protocol; snapshots do not give exactly-once
-external effects. A repeated operation can invoke the tool again without a
-second file commit. A process crash during a file write is outside this fixture's
-contract.
+## Pins and host requirements
 
-A2A 1.0 JSON-RPC uses `SendMessage`, `SendStreamingMessage`, `GetTask`,
-`SubscribeToTask`, and `CancelTask`, with `A2A-Version: 1.0`. The card advertises
-`supportedInterfaces[].protocolVersion = "1.0"`. Missing, 0.3, and unsupported
-version headers are rejected. Streaming means A2A task events, not model token
-streaming. Resubscribe gives current task state plus later events, not missed
-token replay. The gateway's native Substrate policy is not its separate A2A
-inspection/card-rewrite policy. No version conversion or signed-card rewrite is
-claimed. The fixture card URL is the loopback edge endpoint. The edge selects
-the actor from bearer credentials at `/jsonrpc`; `/actors/<name>/jsonrpc` is
-also available for explicit selection controls. Set `PUBLIC_URL` for a different
-host. Do not use card discovery as the waking second turn.
-
-**This is not an ACP test.** Request-triggered wake is HTTP routing and is not
-exclusive to A2A. ACP could use a separate authenticated HTTP/WS-to-stdio host or
-a compatible ACP server transport inside an actor. This prototype implements
-neither. Hermes is a real ACP stdio peer, but a public reproducible
-Hermes/Substrate ACP bridge was not identified. The `always-on-agent`
-`acp-runtime.ts` implements OpenClaw's plugin API through OpenAI HTTP/SSE; that
-does not establish ACP JSON-RPC interoperability. The standalone `rig-acp`
-prototype is separate and is not copied into this checkout.
-
-## Pins and prerequisites
-
-| Component | Version/source |
+| Component | Pin |
 |---|---|
-| Substrate source, manifests, CLI, workers | v0.4.0, `756c2a53741121e728f4cc3066c8a19e575b4919` |
+| Substrate source, CLI, manifests and workers | v0.4.0, `756c2a53741121e728f4cc3066c8a19e575b4919` |
 | agentgateway | `cr.agentgateway.dev/agentgateway:v0.0.0-alpha.168b05d6@sha256:5e8384d1fcfdc443a3ad5155ea6a64dc7953bde162df7f5f8e131a5c19ae08a3` |
-| gVisor assets | release manifest's 2026-09-02 nightly; amd64 SHA-256 `d547d81401461fd1c679c5c4fa0a6c2b8ef7dc3c22ce23c9e25dcc4c69cfd06f` |
-| kind / node | release tool module: kind 0.33.0 / Kubernetes 1.37.0 |
-| Go | 1.27.0 |
-| Rust / Rig | tested Rust 1.99.0 / Rig 0.44.0; workspace Cargo.lock |
-| A2A crates | a2a-lf 0.4.1; a2a-server-lf 0.5.2; a2a-client-lf 0.2.8 |
-| actor base | digest-pinned Debian trixie in Dockerfile |
+| gVisor systrap assets | release manifest nightly; amd64 SHA256 `d547d81401461fd1c679c5c4fa0a6c2b8ef7dc3c22ce23c9e25dcc4c69cfd06f` |
+| kind / Kubernetes | release tool module0.33.0 /1.37.0 |
+| Zeus toolchain | Go1.27.1, Rust1.98.1, Docker29.8.2 |
+| Rig / A2A | Rig0.44.0; a2a-lf0.4.1, a2a-server-lf0.5.2, a2a-client-lf0.2.8; Cargo.lock |
+| Actor base | digest-pinned Debian trixie in Dockerfile, with CA certificates |
 
-Use a disposable Linux amd64 Docker host with kernel >=6.5, privileged container
-support, mount/network namespaces, and writable cgroup v2 delegation. KVM is not
-needed for gVisor systrap. Keep at least 8 GiB RAM and 15 GiB free disk available.
-These are planning allowances, not measured minimums. Use a local Docker daemon;
-the script's kernel preflight does not inspect a remote Docker host.
+Use Linux amd64 >=6.5, a local Docker daemon with privileged disposable containers,
+mount/network namespaces and cgroupv2. KVM is not needed. Install Go, Rust, protoc,
+kubectl, Docker, Python3 and binutils. The upstream modules pin kind and ko.
+`preflight.sh` exercises the actual `lowerdir+` mount API inside disposable
+containers before provisioning. It makes no host mount or permission changes.
+Source-built Substrate image digests must be recorded; upstream base tags can move.
 
-Install Go 1.27.0, Rust, protoc, kubectl 1.37.x, Docker, Python 3, and binutils.
-The upstream tool modules pin kind and ko. `setup.sh` builds Substrate images
-from the verified tag and pushes **only to the local registry**. The initially
-tried `ghcr.io/agent-substrate/substrate/*:v0.4.0` path returned access denied;
-it is not a prerequisite. Source builds use upstream base images; save their
-resolved digests because they need not be bit-for-bit reproducible later.
+## Dedicated deployment
 
-## Deploy only to the disposable cluster
-
-Run from this repository root. These commands write only to `kind-rig-substrate`.
-Do not use them with shared clusters. The upstream creation script owns a local
-`kind-registry` container; use a fresh Docker environment to avoid name conflicts.
+Run from the repository root. Setup uses only cluster `rig-ollama-e2e`, registry
+`rig-ollama-registry` on loopback15010 and Kubernetes API on loopback15011. It
+refuses existing resources or kubeconfig. It does not use upstream's destructive
+creation script, sudo, or host permission changes. Network sysctls apply only
+inside the disposable node container. Do not run against a shared cluster.
 
 ```bash
 bash scripts/substrate/setup.sh
 export PATH="/tmp/rig-substrate-v0.4.0/bin:$PATH"
-kubectl ate --context kind-rig-substrate get actor-template rig-poc -a rig-local -o json
+export KUBECONFIG="$PWD/.amp/in/substrate-run/kubeconfig"
+kubectl ate --context kind-rig-ollama-e2e get actor-template rig-poc -a rig-local -o json
 ```
 
-Wait for `status.goldenSnapshotStatus` to contain its completed golden tag, with
-no `errorMessage`. **Stop on an error.** Do not silently call cold startup a
-golden restore. Create the logical actors through the Substrate API:
+Wait for a completed `status.goldenSnapshotStatus.goldenTag` with no errorMessage.
+Stop on failure. ActorTemplate is a Substrate API object; WorkerPool is Kubernetes.
+Templates use v0.4.0 `onCommit: FULL`, not current-main snapshot APIs. RustFS stores
+external snapshots. Ordinary gateway HTTP targets actor port80.
 
 ```bash
-kubectl ate --context kind-rig-substrate create actor rig-1 -a rig-local --template rig-poc
-kubectl ate --context kind-rig-substrate create actor rig-2 -a rig-local --template rig-poc
-```
-
-For the blocked-path diagnostic only, actors were deliberately created after
-golden creation failed. Their initial SUSPENDED state contained no snapshot.
-The waking request therefore tested an attempted cold start, not memory restore.
-
-`ActorTemplate` is not a Kubernetes resource. `WorkerPool` is. Ordinary gateway
-HTTP targets actor port 80. Templates use the v0.4.0 `onCommit: FULL` contract,
-not main's newer fidelity fields. Kind's RustFS stores external snapshots.
-
-Generate private disposable credentials; do not print or save them in evidence:
-
-```bash
+kubectl ate --context kind-rig-ollama-e2e create actor rig-1 -a rig-local --template rig-poc
+kubectl ate --context kind-rig-ollama-e2e create actor rig-2 -a rig-local --template rig-poc
 python3 - <<'PY'
 import json, os, secrets
 fd = os.open('/tmp/rig-poc-tokens.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -131,144 +98,167 @@ os.close(fd)
 PY
 ```
 
-In an orb, use supervised services, **without portals**:
+Run each service in its own foreground terminal, without public portals:
 
 ```bash
-amp orb service start rig-substrate-forward --command \
-  'kubectl --context kind-rig-substrate -n ate-system port-forward --address=127.0.0.1 svc/atenet-router 18080:80 18082:8081'
-amp orb service start rig-substrate-edge --command \
-  'python3 scripts/substrate/edge.py --tokens /tmp/rig-poc-tokens.json'
+kubectl --context kind-rig-ollama-e2e -n ate-system port-forward --address=127.0.0.1 \
+  svc/atenet-router 15021:80 15022:8081 15025:15020
+python3 scripts/substrate/edge.py --tokens /tmp/rig-poc-tokens.json --port 15020 --gateway-port 15021
 ```
 
-On a standalone host, run those two commands in foreground terminals instead.
-Do not expose these ports publicly. The edge is a small test boundary, not a
-production HTTP proxy. Operator access to port-forward, the node, or the cluster
-is trusted. It does not isolate untrusted co-tenants inside Kubernetes.
+The edge is a test boundary, not a production proxy. Operator port-forward, node
+and cluster access are trusted. It does not isolate hostile Kubernetes tenants.
+It rejects all client actor selectors and CONNECT, authenticates the actor binding,
+and emits one trusted selector. Native gateway duplicates are a separate **failed
+expectation**: HTTP and valid CONNECT followed by inner HTTP select the first
+header ([issue2460](https://github.com/agent-substrate/substrate/issues/2460)).
+CONNECT200 alone is not wake evidence. Unknown actors must return404 and stay absent.
 
-The edge authenticates each actor binding, rejects **all** client actor-selector
-headers, generates one trusted selector, and rejects CONNECT. Native gateway
-duplicate-header behavior is a separate control: the pinned gateway selects the
-first header on ordinary HTTP and on an inner HTTP request after CONNECT. This
-is a failed security expectation, consistent with
-[issue #2460](https://github.com/agent-substrate/substrate/issues/2460).
-CONNECT 200 alone does not mean the actor woke.
+The dedicated gateway sets native `cacheTtl: 0s`: its default cache retained a
+deleted worker and caused503 in the first cross-worker test. This costs one
+control-plane lookup per request. `gateway-config.py` also sets explicit parking
+budget5s and max1024. Restart the owned port-forward after gateway rollout.
 
-## Execute and inspect the tests
+## Reproduce and inspect
 
-Use a new evidence directory for every run; scripts refuse to overwrite one.
-Evidence includes UTC times, inputs, expected values, HTTP/protocol responses,
-CLI exit codes, source hashes, lock hash, binary hash, actor metadata, and image
-digests. The harness omits credential headers and redacts its known test tokens.
-Review upstream command logs for other secrets before sharing. Only synthetic
-prompts are used.
+Use a new evidence directory per run. Scripts refuse overwrite. Evidence includes
+UTC times, commands, exit codes, inputs, independent expected outcomes, HTTP data,
+source/lock/binary hashes, image and actor metadata. Known tokens are redacted.
+Review logs for other secrets before sharing; only synthetic prompts are used.
+Do not commit evidence, credentials or binaries.
 
 ```bash
 cargo test --locked -p rig-a2a --features server
 cargo check --locked -p rig-a2a --no-default-features
 cargo check --locked -p rig-a2a --no-default-features --features server
-cargo build --locked -p rig-a2a --features server --example substrate_actor
-python3 scripts/substrate/local.py --evidence .amp/in/artifacts/substrate/local-new
-
-# Run against a newly created SUSPENDED rig-1. This characterizes failure too.
-python3 scripts/substrate/cluster_probe.py --tokens /tmp/rig-poc-tokens.json \
-  --evidence .amp/in/artifacts/substrate/cluster-new
-
-# On a supported host, with fresh actors and a successful golden snapshot:
-python3 scripts/substrate/demo.py --tokens /tmp/rig-poc-tokens.json \
-  --evidence .amp/in/artifacts/substrate/restore-new
+cargo clippy --locked -p rig-a2a --features server --all-targets -- -D warnings
+python3 scripts/substrate/edge_test.py
+python3 scripts/substrate/receipt_test.py
+python3 scripts/substrate/local.py --evidence .amp/in/artifacts/local-new
+# Derive expected identity from the packaged source, not the actor under test.
+SOURCE_HASH=$(sha256sum Cargo.lock rig-a2a/Cargo.toml rig-a2a/src/*.rs rig-a2a/examples/substrate_actor.rs | sha256sum | cut -c1-16)
+BUILD="$(git rev-parse HEAD)-$SOURCE_HASH"
+# Each fresh-state test needs newly created actors, not actors used by another test.
+python3 scripts/substrate/cluster_probe.py --tokens /tmp/rig-poc-tokens.json --evidence .amp/in/artifacts/probe-new
+python3 scripts/substrate/demo.py --tokens /tmp/rig-poc-tokens.json --evidence .amp/in/artifacts/restore-new
+python3 scripts/substrate/cluster.py --tokens /tmp/rig-poc-tokens.json --evidence .amp/in/artifacts/protocol-new \
+  --substrate /tmp/rig-substrate-v0.4.0 --build "$BUILD"
+python3 scripts/substrate/races.py --tokens /tmp/rig-poc-tokens.json --evidence .amp/in/artifacts/races-new
+python3 scripts/substrate/readiness.py --tokens /tmp/rig-poc-tokens.json --evidence .amp/in/artifacts/readiness-new
 ```
 
-`cluster_probe.py` deliberately sends raw duplicate selectors to the private
-gateway. It is diagnostic and reports BLOCKED rather than PASS if startup fails.
-Do not run it immediately before a fresh-state restore test without recreating
-the disposable actors. The raw known-actor duplicate cases can trigger wake.
+Readiness failure deliberately leaves RESUMING: gateway deadline5s cancels the
+30s worker probe. A separate operator `kubectl ate ... resume actor` retry waits
+for the worker timeout and crashes the actor; then it can be deleted. That retry
+is a negative-test cleanup action, **not** evidence for request-triggered restore.
 
-`demo.py` is the **unverified two-turn restore procedure**, not the complete
-acceptance suite. It closes external admission, waits for forwarded requests and
-Rig execution to finish, suspends explicitly, checks `SUSPENDED` and the FULL
-external snapshot, reopens admission, and sends the next A2A turn. It does not
-manually resume or fetch a card between suspension and that turn. There is no
-automatic idle suspender. Admin callers must not admit new work during drain.
-It checks the selected actor is RUNNING with a worker after the second turn.
-Its `TWO_TURN_CHECKS_PASS` result still requires independent routing evidence:
-join the client request ID to the gateway trace, then actor UID, worker
-assignment, and the actor's operation-ID/nonce receipt. Trace IDs need not
-propagate unchanged through the gateway's ResumeActor RPC. Reject a correct
-answer without that chain. The procedure does not test cross-worker movement.
+For parking, use fresh fixture actors, set the owned WorkerPool replicas1 and run
+`gateway-config.py --parking-max 1`. Restart port-forward, then run `parking.py`
+with the same token/evidence arguments. It checks gauge1, overflow503, release→200,
+budget504, exact effect counts and absence of HPA. Restore replicas2 and default
+gateway config afterward. This proves parking, not Kubernetes autoscaling.
 
-| Case | Executed result / acceptance condition |
+### Real Ollama
+
+Agree on an inference window with other host users first. Inspect `/api/tags`
+and `/api/version`; use the installed pinned model. Do not download models or
+change the shared listener. Determine the Docker `kind` bridge gateway, then run:
+
+```bash
+export OLLAMA_BRIDGE_IP=$(docker network inspect kind --format '{{(index .IPAM.Config 0).Gateway}}')
+(set -o noclobber; python3 scripts/substrate/receipt_proxy.py --bind "$OLLAMA_BRIDGE_IP" --port 15024 \
+  > .amp/in/artifacts/ollama-receipts.jsonl)
+# Separate terminal:
+bash scripts/substrate/ollama-setup.sh
+```
+
+The proxy accepts only non-streaming qwen3.5:9b `/api/chat` and forwards to fixed
+127.0.0.1:11434. It records synthetic requests/responses. It binds only the private
+bridge, never all interfaces. The Kubernetes Service/EndpointSlice provides a
+stable name; no shared Ollama listener change is required.
+
+Wait for rig-ollama's golden snapshot. Delete disposable fixture actors and create
+rig-1/rig-2 from rig-ollama. `egress.py --sink http://$OLLAMA_BRIDGE_IP:15024` plus
+token/evidence arguments checks both actors' default403, live sink counters and
+then grants only rig-1 HTTP hostname `ollama.rig-local.svc`, port15024. It suspends
+rig-1 afterward. DNS port53 is outside this egress contract.
+
+```bash
+# Use the source-derived BUILD above and the same image for positive/negative tests.
+python3 scripts/substrate/ollama.py --tokens /tmp/rig-poc-tokens.json \
+  --evidence .amp/in/artifacts/live-new --build "$BUILD" \
+  --receipts .amp/in/artifacts/ollama-receipts.jsonl --replace-worker
+python3 scripts/substrate/live-cancel.py --tokens /tmp/rig-poc-tokens.json \
+  --evidence .amp/in/artifacts/cancel-new --sink "http://$OLLAMA_BRIDGE_IP:15024"
+```
+
+The live check joins client request ID to gateway trace/route/actor UID. Control
+plane trace IDs differ: join actor UID, snapshot URI, worker assignment and request
+interval instead. Unique operation IDs join provider tool calls to worker effects
+and the journal. Each final model response must equal the corresponding A2A artifact;
+no exact expected prose is imposed. Independently generated values test history.
+Use `package-check.py --image "$IMAGE" --build "$BUILD" --evidence ...` for the
+unavailable-provider negative control, exact running image and empty-state check.
+It explicitly removes its owned container.
+
+## Executed controls and limits
+
+| Case | Zeus result |
 |---|---|
-| Real kind/control plane/gateway/workers | Ready; pinned images recorded |
-| Existing actor selected while SUSPENDED | Resume attempted; actor CRASHED before sandbox startup |
-| Wrong/missing credentials, cross-actor selection | Edge denies; actor UID/version/state unchanged |
-| Unknown actor / broken route | Gateway 404; no actor creation and no fallback answer |
-| Duplicate ordinary/CONNECT selectors | Edge denies; native gateway accepts duplicates and uses first value |
-| Local two-turn history / separate contexts | Exact prompts from actual Rig request history |
-| Local concurrent turns | Held tool prevents second effect; second request sees first transcript |
-| Local SSE disconnect/resubscribe | Held execution continues; reconnect gets terminal result; GetTask agrees |
-| Local active/queued cancellation | Active cancellation waits for in-flight effect; queued cancellation has no tool call |
-| Local cancellation dispatch | A canceled held turn makes no next model call; uncanceled turns make two calls |
-| Local tenant/malformed-input controls | Mismatched-tenant cancel leaves the working task unchanged; array/scalar fixture prompts fail without tool effects |
-| Local uncertain response | Read stored task; replay invokes tool but operation ID prevents second file commit |
-| Local cold restart | File survives; memory nonce and counter do not. Cannot pass a memory-continuity assertion |
-| Cluster retained memory/file/history | BLOCKED; no successful actor turn or snapshot |
-| Cross-worker restore | BLOCKED. Require old/new worker Pod UIDs, same actor UID, nonce and exact file bytes |
-| Wake/suspend races | BLOCKED. Close admission atomically; count or reject each racing turn; no suspend while cleanup is active |
-| Readiness delay/timeout | BLOCKED. Use delayed/failed readiness; verify no early request delivery and explicit timeout |
-| Parking capacity and worker autoscaling | NOT VERIFIED. Test parking with small configured capacity separately; no autoscaler is installed |
-| Direct-worker bypass | NOT VERIFIED against a running actor; require mTLS rejection plus a valid gateway positive control |
-| Default-deny/allowed egress | BLOCKED. Use a live local sink and one narrow allow rule; check independent sink counters, not just timeouts |
-| Card/task reads without wake | NOT IMPLEMENTED; native routing can wake for any forwarded HTTP request |
-| ACP/WS bridge, permission flow, Origin/backpressure | NOT IMPLEMENTED; no ACP interoperability claim |
+| Golden/startup, FULL memory/file/history restore | Passed, including different worker Pod UID and post-golden heap nonce |
+| Context isolation/serialization, SSE disconnect/resubscribe | Passed through deployed edge/gateway with deterministic inference |
+| Active/queued cancel, cleanup, uncertain response | Passed; separate invocation/effect counters; live canceled tool makes no next model call |
+| Wrong/missing auth, actor/task selection, tenant, JSON shape | Passed; unknown actor404, no creation or fallback |
+| Duplicate HTTP and valid CONNECT+inner HTTP | Protected edge denies; native gateway failure retained |
+| Wake/suspend races | Held cleanup blocks suspension; closed admission rejects work; concurrent waking turns serialize |
+| Readiness | Three503 probes before effect; permanent failure→gateway504, canceled probe, RESUMING; separate operator retry→30s failure/CRASHED |
+| Parking | Fixed one-worker pool, gauge1, overflow503, release200, timeout504; no HPA |
+| Direct worker bypass | TLS client certificate required; valid gateway positive succeeds |
+| Egress | Explicit default403, independent sink, exact local host/port allowed for one actor |
+| Cold process restart | File survives; nonce/counters do not; cannot pass memory continuity |
+| General quiescence | Not proved. Terminal task or closed HTTP is insufficient; active0 is not a general detached-handler barrier |
+| Automatic idle suspend, external exactly-once, ACP, autoscaling | Not implemented or claimed |
 
-The first local run had an incorrect expected error shape for non-text input:
-the server returns JSON-RPC `-32602`, not a failed task response. The test was
-corrected without changing that behavior. An initial CONNECT probe used an
-invalid authority; its 400 result was discarded. The valid probe sends
-`CONNECT rig-1:80` then an inner HTTP request. Keep those failed/invalid runs
-separate from the final evidence.
+Suspension is explicit after admission closure and observed executor/tool cleanup.
+Admin callers must not start work during drain. The controlled race test is not
+a general proof against arbitrary detached upstream handlers.
 
-The history check was also tested with a deliberate mutation: pass empty Rig
-history on each turn. The same local suite failed on the exact second-turn
-prompt assertion. The mutation was removed before the final build. This tests
-the history assertion; it does not validate the blocked snapshot assertions.
+## Failures remain evidence
 
-Oracle review found a mismatched-tenant cancellation and a JSON-shape panic.
-The added checks reproduced both: `tenant-before` failed its rejection assertion;
-`shape-before` timed out and its actor log contains the array-index panic.
-Keep these failures as before evidence. The local suite includes both regression
-checks. The cancellation hook observes all Rig dispatch families, but the
-executed fixture covers completion and tool dispatch only.
+Prior-orb archive is labelled separately, not credited as Zeus results. Linux
+6.1.158 rejected `lowerdir+` before runsc. Its SUSPENDED→CRASHED/HTTP500 was a
+snapshot-less cold-start attempt, not memory restore. Changing a kind image does
+not change the host kernel. No microVM, unsandboxed fallback or core patch was used.
 
-A package rerun (`package-reviewed`) reached an old Docker container left after
-stopping its supervising CLI service. Its effect-count assertion failed; that
-run is invalid for the rebuilt image. Package checks must compare the running
-container's image ID with the built image, require empty initial state, and stop
-the container explicitly. The review artifacts include the corrected command
-script and keep the failed run.
+Prior controls retain: invalid non-text error-shape expectation (actual -32602),
+invalid CONNECT authority (replaced by CONNECT rig-1:80 plus inner HTTP), an empty-
+history mutation that failed, tenant-mismatched cancel and array-index panic before
+their fixes, and a stale Docker container package run that failed exact effects.
+Prior Rust35 unit+56 integration+4 doc tests and local deterministic checks passed.
 
-## Sources and limits
+Zeus retains: an invalid overlay upper-dir probe, missing CA certificates in the
+first image, default gateway cache503 after worker deletion, readiness parser error,
+the incorrect CRASHED expectation after the shorter gateway deadline, and an early
+Docker startup connection reset. CA packaging, disabled native route cache and
+bounded package startup retry resolved the corresponding reruns. Native duplicate
+selectors remain a failure, not a passing security claim.
 
-- [Hermes ACP source](https://github.com/NousResearch/hermes-agent/tree/952322ca3cf23435af4f95c2b91216d9e3658b84): real stdio peer, not the missing deployed bridge.
-- [Hermes actor reference](https://github.com/agent-substrate/substrate/pull/487#issuecomment-5097213171): not a reproducible ACP image/version contract.
-- [OpenClaw example](https://github.com/agent-substrate/always-on-agent/tree/c380889b73ee78b4bb71fc17079227ab886d9e82): separate application gateway and older Substrate baseline.
-- [Fallback false-positive precedent](https://github.com/agent-substrate/always-on-agent/commit/3cb37731ae744e6cfdd145ab67df3212dbaa3f22): require actor-side effect receipts, not only a good response.
-- [Egress omission](https://github.com/agent-substrate/substrate/issues/2487): inference success is not a default-deny egress test.
+## Sources
 
-The next required environment is a disposable kernel >=6.5 Linux host with the
-same pinned source and gVisor assets. Complete the blocked matrix there before
-claiming E2E compatibility. No shared cluster changes, cloud provisioning,
-remote push, PR, or public unauthenticated exposure is part of this example.
+- [Substrate overlay contract](https://github.com/agent-substrate/substrate/blob/v0.4.0/internal/imagecache/README.md)
+- [Hermes ACP source](https://github.com/NousResearch/hermes-agent/tree/952322ca3cf23435af4f95c2b91216d9e3658b84): real stdio peer, not a deployed bridge here.
+- [Hermes actor reference](https://github.com/agent-substrate/substrate/pull/487#issuecomment-5097213171): not a reproducible ACP image contract.
+- [OpenClaw example](https://github.com/agent-substrate/always-on-agent/tree/c380889b73ee78b4bb71fc17079227ab886d9e82): application gateway and older Substrate baseline.
+- [Fallback false positive](https://github.com/agent-substrate/always-on-agent/commit/3cb37731ae744e6cfdd145ab67df3212dbaa3f22): require actor effects, not a good answer alone.
+- [Egress omission](https://github.com/agent-substrate/substrate/issues/2487): inference success alone does not test default deny.
 
 ## Cleanup
 
-Stop the two supervised services. Delete only the disposable cluster:
+Stop only this run's edge, port-forward and receipt proxy. Never stop shared Ollama.
+`cleanup.sh` checks recorded container IDs and labels before deleting this run's
+cluster and registry. A missing or mismatched identity stops cleanup. Remove the
+private token file separately:
 
 ```bash
-amp orb service stop rig-substrate-edge
-amp orb service stop rig-substrate-forward
-(cd /tmp/rig-substrate-v0.4.0; ./hack/kind.sh delete cluster --name rig-substrate)
+bash scripts/substrate/cleanup.sh
 ```
-
-Remove `kind-registry` only if this run created it
-and no other local cluster uses it. Remove the disposable token file separately.

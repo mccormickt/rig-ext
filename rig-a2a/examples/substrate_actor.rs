@@ -1,4 +1,4 @@
-//! Disposable A2A actor. Inference is deterministic; Rig dispatch and file I/O are real.
+//! Disposable A2A actor with deterministic or local Ollama inference.
 use std::{
     path::PathBuf,
     sync::{
@@ -27,6 +27,7 @@ use rig_core::{
     completion::CompletionRequest,
     driver::{Exchange, Model, Opened, Opening, Transport},
     message::{Message, UserContent},
+    providers::ollama::OllamaConfig,
     test_utils::{MockCompletionModel, MockFrame, MockScript, MockTurn},
     tool::PortableTool,
 };
@@ -88,6 +89,7 @@ struct Memory {
     completions: AtomicU64,
     invocations: AtomicU64,
     commits: AtomicU64,
+    readiness_failures: AtomicU64,
     held: AtomicBool,
     release: AtomicBool,
 }
@@ -172,17 +174,35 @@ struct App {
     record: Record,
 }
 
-async fn inspect(State(app): State<App>) -> Json<Value> {
-    Json(json!({
+async fn inspect(State(app): State<App>) -> Result<Json<Value>, StatusCode> {
+    let journal = match tokio::fs::read_to_string(&app.record.journal).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    Ok(Json(json!({
         "active":app.executor.active(),
         "nonce":*app.record.memory.nonce.lock().unwrap_or_else(|e| e.into_inner()),
         "completions":app.record.memory.completions.load(Ordering::SeqCst),
         "invocations":app.record.memory.invocations.load(Ordering::SeqCst),
         "commits":app.record.memory.commits.load(Ordering::SeqCst),
         "held":app.record.memory.held.load(Ordering::SeqCst),
-        "journal":tokio::fs::read_to_string(&app.record.journal).await.unwrap_or_default(),
+        "journal":journal,
+        "pid":std::process::id(),
         "build":option_env!("RIG_POC_BUILD").unwrap_or("local")
-    }))
+    })))
+}
+
+async fn probe_egress(url: String) -> Json<Value> {
+    let result = reqwest::Client::new()
+        .get(url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await;
+    Json(match result {
+        Ok(response) => json!({"status":response.status().as_u16()}),
+        Err(error) => json!({"error":error.to_string()}),
+    })
 }
 
 async fn reject_tenant(request: Request, next: Next) -> Response {
@@ -209,7 +229,7 @@ async fn reject_tenant(request: Request, next: Next) -> Response {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter("rig_a2a::server=info")
+        .with_env_filter("rig_a2a::server=info,rig::completions=trace,rig::streaming=trace")
         .with_ansi(false)
         .with_writer(std::io::stderr)
         .init();
@@ -220,12 +240,27 @@ async fn main() -> anyhow::Result<()> {
         journal: data.join("operations.jsonl"),
         file_lock: Arc::default(),
     };
-    let agent = AgentBuilder::new(Model::new(
-        MockScript::default(),
-        FixtureModel(record.memory.clone()),
-    ))
-    .tool(record.clone())
-    .build();
+    let inference = std::env::var("INFERENCE").unwrap_or_else(|_| "fixture".into());
+    let builder = match inference.as_str() {
+        "fixture" => AgentBuilder::new(Model::new(
+            MockScript::default(),
+            FixtureModel(record.memory.clone()),
+        )),
+        "ollama" => {
+            let endpoint = std::env::var("OLLAMA_URL")?;
+            let model = std::env::var("OLLAMA_MODEL")?;
+            eprintln!(
+                "{}",
+                json!({"event":"inference_config","mode":inference,"endpoint":endpoint,"model":model})
+            );
+            AgentBuilder::new(OllamaConfig::new().with_base_url(endpoint).client().native_completion(model))
+                .temperature(0.0)
+                .additional_params(json!({"think":false,"options":{"seed":42,"num_ctx":8192,"num_predict":512}}))
+                .preamble("Use the record tool exactly once for each user request. Copy operation and value exactly. Set prompts to an empty array; it is not evidence of history. After the tool result, answer briefly. When asked for a value from a prior turn, use the actual conversation history.")
+        }
+        _ => anyhow::bail!("unknown INFERENCE mode: {inference}"),
+    };
+    let agent = builder.tool(record.clone()).build();
     let executor = RigExecutor::new(agent);
     let handler = Arc::new(DefaultRequestHandler::new(
         executor.clone(),
@@ -234,7 +269,7 @@ async fn main() -> anyhow::Result<()> {
     let public = std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://127.0.0.1:18081".into());
     let card = AgentCard {
         name: "rig-substrate-poc".into(),
-        description: "Real Rig loop with deterministic inference".into(),
+        description: format!("Real Rig loop with {inference} inference"),
         version: "0.1.0".into(),
         supported_interfaces: vec![AgentInterface::new(
             format!("{public}/jsonrpc"),
@@ -258,7 +293,35 @@ async fn main() -> anyhow::Result<()> {
     };
     let app = App { executor, record };
     let router = Router::new()
-        .route("/readyz", get(|| async { "ready" }))
+        .route(
+            "/readyz",
+            get(|State(app): State<App>| async move {
+                let remaining = app
+                    .record
+                    .memory
+                    .readiness_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .unwrap_or(0);
+                eprintln!("{}", json!({"event":"readiness","remaining":remaining}));
+                if remaining == 0 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        )
+        .route(
+            "/readiness/{failures}",
+            post(
+                |State(app): State<App>, Path(failures): Path<u64>| async move {
+                    app.record
+                        .memory
+                        .readiness_failures
+                        .store(failures, Ordering::SeqCst);
+                    StatusCode::OK
+                },
+            ),
+        )
         .route("/inspect", get(inspect))
         .route(
             "/history/{context}",
@@ -280,16 +343,16 @@ async fn main() -> anyhow::Result<()> {
             get(|| async {
                 let url = std::env::var("EGRESS_URL")
                     .unwrap_or_else(|_| "http://fixture-sink.rig-local.svc:8080/probe".into());
-                let result = reqwest::Client::new()
-                    .get(url)
-                    .timeout(std::time::Duration::from_secs(3))
-                    .send()
-                    .await;
-                Json(match result {
-                    Ok(response) => json!({"status":response.status().as_u16()}),
-                    Err(error) => json!({"error":error.to_string()}),
-                })
+                probe_egress(url).await
             }),
+        )
+        .route(
+            "/egress/wrong-host",
+            get(|| probe_egress("http://ollama.rig-local.svc.cluster.local:15024/probe".into())),
+        )
+        .route(
+            "/egress/wrong-port",
+            get(|| probe_egress("http://ollama.rig-local.svc:15027/probe".into())),
         )
         .with_state(app)
         .merge(agent_card::agent_card_router(Arc::new(
