@@ -217,7 +217,7 @@ async fn probe_dns(Path(transport): Path<String>) -> Result<Json<Value>, String>
             .trim();
         let address = format!("{server}:53");
         let mut query = vec![0x52, 0x49, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
-        for label in "ollama.rig-local.svc".split('.') {
+        for label in "ollama.rig-local.svc.cluster.local".split('.') {
             query.push(label.len() as u8);
             query.extend_from_slice(label.as_bytes());
         }
@@ -420,16 +420,18 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/egress/wrong-host",
-            get(|| probe_egress("http://ollama.rig-local.svc.cluster.local:15024/probe".into())),
+            get(|| probe_egress("http://ollama.rig-local.svc:15024/probe".into())),
         )
         .route(
             "/egress/wrong-port",
-            get(|| probe_egress("http://ollama.rig-local.svc:15027/probe".into())),
+            get(|| probe_egress("http://ollama.rig-local.svc.cluster.local:15027/probe".into())),
         )
         .route("/dns/{transport}", get(probe_dns))
         .route(
             "/egress/link-local",
-            get(|| probe_egress("http://link-local.rig-local.svc:15024/probe".into())),
+            get(|| {
+                probe_egress("http://link-local.rig-local.svc.cluster.local:15024/probe".into())
+            }),
         )
         .with_state(app)
         .merge(agent_card::agent_card_router(Arc::new(

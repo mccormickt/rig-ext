@@ -34,9 +34,9 @@ d=json.load(sys.stdin); d.pop("status",None)
 d["metadata"]={"name":"rig-ollama","atespace":"rig-local"}
 d["snapshotConfig"]["storageLocation"]="gs://ate-snapshots/rig-ollama/"
 d["containers"][0]["env"]=[{"name":k,"value":v} for k,v in {
-  "INFERENCE":"ollama", "OLLAMA_URL":"http://ollama.rig-local.svc:15024",
-  "OLLAMA_MODEL":"qwen3.5:9b", "EGRESS_URL":"http://ollama.rig-local.svc:15024/probe",
+  "INFERENCE":"ollama", "OLLAMA_URL":"http://ollama.rig-local.svc.cluster.local:15024",
+  "OLLAMA_MODEL":"qwen3.5:9b", "EGRESS_URL":"http://ollama.rig-local.svc.cluster.local:15024/probe",
   "PUBLIC_URL":"http://127.0.0.1:15020"}.items()]
 print(json.dumps(d))' | kubectl ate --context "$CONTEXT" create actor-template -f -
 echo 'Wait for a successful golden snapshot. Create actors from rig-ollama, then test default-deny before granting egress.'
-echo 'Allow only http hostnames: [ollama.rig-local.svc], ports: {numbers: [15024]}.'
+echo 'Allow only http hostnames: [ollama.rig-local.svc.cluster.local], ports: {numbers: [15024]}.'

@@ -34,7 +34,9 @@ if __name__ == "__main__":
             proof.check("DNS transaction", list(reply[:2]), [0x52, 0x49])
             proof.check("DNS response flag", bool(header[1] & 0x8000), True)
             proof.check("DNS one question", header[2], 1)
-            question = b"\x06ollama\x09rig-local\x03svc\0\0\x01\0\x01"
+            question = (
+                b"\x06ollama\x09rig-local\x03svc\x07cluster\x05local\0\0\x01\0\x01"
+            )
             proof.check("DNS query", list(query[12:]), list(question))
             proof.check(
                 "DNS echoed question", list(reply[12 : len(query)]), list(question)
@@ -59,7 +61,7 @@ if __name__ == "__main__":
                     "rules": [
                         {
                             "http": {
-                                "hostnames": ["ollama.rig-local.svc"],
+                                "hostnames": ["ollama.rig-local.svc.cluster.local"],
                                 "ports": {"numbers": [15024]},
                             }
                         }
@@ -91,9 +93,7 @@ if __name__ == "__main__":
             denied = proof.http("/actors/rig-1/egress/" + path, owner="admin")[1]
             proof.check(
                 "excluded " + path,
-                "error" in denied
-                if path == "wrong-host"
-                else denied == {"status": 403},
+                denied == {"status": 403},
                 True,
             )
         proof.check("excluded requests did not reach sink", sink("/stats"), after)

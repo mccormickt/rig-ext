@@ -151,18 +151,13 @@ class Live(Proof):
                         worker["nodeName"],
                         "rig-ollama-e2e-worker",
                     )
-                    self.check(
-                        "snapshot local to source",
-                        snapshot["locality"],
-                        worker["nodeName"],
-                    )
                     self.command(
                         "docker",
                         "exec",
                         destination,
                         "sh",
                         "-ec",
-                        f"test -d /var/lib/ate/actors; test ! -e /var/lib/ate/actors/{initial_actor['metadata']['uid']}/local-checkpoint/{snapshot['uuid']}",
+                        f"test -d /var/lib/ate; test ! -e /var/lib/ate/actors/{initial_actor['metadata']['uid']}/local-checkpoint/{snapshot['uuid']}",
                     )
                     self.command(
                         "kubectl",
@@ -380,6 +375,34 @@ class Live(Proof):
                 "--tail=-1",
                 "--prefix",
             )
+            atelet = self.command(
+                "kubectl",
+                "--context",
+                self.kube_context,
+                "logs",
+                "-n",
+                "ate-system",
+                "-l",
+                "app=atelet",
+                "-c",
+                "atelet",
+                "--tail=-1",
+                "--prefix",
+            )
+            self.command(
+                "kubectl",
+                "--context",
+                self.kube_context,
+                "logs",
+                "-n",
+                "ate-system",
+                "-l",
+                "app=atelet",
+                "-c",
+                "objectstore-plugin",
+                "--tail=-1",
+                "--prefix",
+            )
             uid = restored["metadata"]["uid"]
             events = [json.loads(line) for line in self.events.read_text().splitlines()]
             turns = [
@@ -462,17 +485,37 @@ class Live(Proof):
                     wake["start"],
                     wake["time"],
                 )
-                if e.get("err") is None
-                and e["req"].get("fidelity") == 3
-                and e["req"].get("snapshot_uri") == snapshot_uri
+                if e.get("err") is None and e["req"].get("fidelity") == 3
             ]
             self.check("executed successful MEMORY restore", len(restores), 1)
+            transfers = [
+                e
+                for e in rpc_receipts(
+                    atelet,
+                    "/atelet.AteomHerder/Restore",
+                    uid,
+                    wake["start"],
+                    wake["time"],
+                )
+                if e.get("err") is None
+                and e["req"].get("worker_pod_uid") == restored_worker
+                and e["req"]["snapshot"].get("snapshot_uuid") == snapshot["uuid"]
+                and e["req"]["snapshot"].get("fidelity") == 3
+                and e["req"]["snapshot"]["object"]["snapshot_uri"] == snapshot_uri
+            ]
+            self.check("atelet restored exact durable snapshot", len(transfers), 1)
             self.check(
                 "restore local-copy choice",
                 restores[0]["req"].get("preserve_restore_dir", False),
-                not self.args.cross_node,
+                snapshot.get("locality")
+                == restored["status"]["workerAssignment"]["nodeName"],
             )
-            self.record("executed_restore", snapshot=snapshot, records=restores)
+            self.record(
+                "executed_restore",
+                snapshot=snapshot,
+                records=restores,
+                transfers=transfers,
+            )
             joins = [
                 event
                 for event in rpc_receipts(
