@@ -99,6 +99,20 @@ try:
     warms = [
         e for e in events if e["kind"] == "http" and e["path"].endswith("/inspect")
     ]
+    first = warms[0]
+    fills = [
+        event
+        for event in rpc_receipts(
+            api,
+            "/ateapi.Control/ResumeActor",
+            assignment["metadata"]["uid"],
+            first["start"],
+            first["time"],
+            worker["workerPodUid"],
+        )
+        if event.get("err") is None
+    ]
+    p.check("first inspect resolves assigned worker", len(fills), 1)
     second = warms[1]
     lookups = rpc_receipts(
         api,
@@ -132,7 +146,7 @@ try:
     p.check("unique cache request receipt", len(receipts), 1)
     elapsed = (
         datetime.datetime.fromisoformat(receipts[0].split()[0])
-        - datetime.datetime.fromisoformat(second["start"])
+        - datetime.datetime.fromisoformat(first["start"])
     ).total_seconds()
     if p.args.cache == "default":
         p.check(
@@ -142,7 +156,7 @@ try:
             "native_cache_observation",
             status=status,
             response=response,
-            elapsed_from_warm=elapsed,
+            elapsed_from_cache_fill_request=elapsed,
             failed_expectation=status != 200,
         )
     else:
