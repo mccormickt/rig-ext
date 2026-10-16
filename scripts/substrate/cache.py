@@ -2,8 +2,8 @@
 """Compare warmed native route caching with cacheTtl0s on an owned worker."""
 
 import argparse
+import datetime
 import json
-import time
 from pathlib import Path
 
 from demo import Proof, rpc_receipts
@@ -15,12 +15,44 @@ parser.add_argument("--cache", choices=("default", "0s"), required=True)
 p = Proof(parser.parse_args())
 try:
     p.check("owned cluster", p.kube_context, "kind-rig-ollama-e2e")
+    p.check(
+        "other actor suspended",
+        p.actor("rig-2")["status"]["state"],
+        "ACTOR_STATE_SUSPENDED",
+    )
     p.inspect()
-    warm_start = time.monotonic()
     p.inspect()
     before, assignment, snapshot = p.suspend(reopen=False)
     worker = assignment["status"]["workerAssignment"]
     p.check("owned worker pool", worker["workerPool"], "rig")
+    pods = json.loads(
+        p.command(
+            "kubectl",
+            "--context",
+            p.kube_context,
+            "get",
+            "pods",
+            "-n",
+            "rig-local",
+            "-l",
+            "ate.dev/worker-pool=rig",
+            "-o",
+            "json",
+        )
+    )
+    p.check(
+        "ready spare worker",
+        any(
+            pod["metadata"]["uid"] != worker["workerPodUid"]
+            and not pod["metadata"].get("deletionTimestamp")
+            and any(
+                c["type"] == "Ready" and c["status"] == "True"
+                for c in pod["status"].get("conditions", [])
+            )
+            for pod in pods["items"]
+        ),
+        True,
+    )
     p.command(
         "kubectl",
         "--context",
@@ -34,18 +66,6 @@ try:
         "--force",
         "--wait=false",
     )
-    p.command(
-        "kubectl",
-        "--context",
-        p.kube_context,
-        "rollout",
-        "status",
-        "deployment/rig",
-        "-n",
-        "rig-local",
-        "--timeout=120s",
-    )
-    elapsed = time.monotonic() - warm_start
     p.open_admission()
     prompt = p.prompt("cache-after-worker-replacement")
     status, response = p.http(
@@ -75,7 +95,7 @@ try:
         "--tail=-1",
         "--prefix",
     )
-    p.command(
+    gateway = p.command(
         "kubectl",
         "--context",
         p.kube_context,
@@ -100,8 +120,21 @@ try:
     p.check(
         "warm request lookup count", len(lookups), 0 if p.args.cache == "default" else 1
     )
+    request = next(e for e in events if e["kind"] == "http" and e["path"] == "/jsonrpc")
+    receipts = [
+        line
+        for line in gateway.splitlines()
+        if "trace.id=" + request["request"] in line
+    ]
+    p.check("unique cache request receipt", len(receipts), 1)
+    elapsed = (
+        datetime.datetime.fromisoformat(receipts[0].split()[0])
+        - datetime.datetime.fromisoformat(second["start"])
+    ).total_seconds()
     if p.args.cache == "default":
-        p.check("attempt inside default five-second TTL", elapsed < 5, True)
+        p.check(
+            "gateway receipt inside default five-second TTL", 0 <= elapsed < 5, True
+        )
         p.record(
             "native_cache_observation",
             status=status,
@@ -111,12 +144,21 @@ try:
         )
     else:
         p.check("uncached request succeeds", status, 200)
+    if status == 200:
         p.check(
-            "uncached task completed",
+            "cache request task completed",
             response["result"]["task"]["status"]["state"],
             "TASK_STATE_COMPLETED",
         )
-        p.check("uncached effect once", p.inspect()["commits"], before["commits"] + 1)
+        p.check(
+            "cache request effect once", p.inspect()["commits"], before["commits"] + 1
+        )
+        p.check(
+            "different assigned worker",
+            p.actor()["status"]["workerAssignment"]["workerPodUid"]
+            != worker["workerPodUid"],
+            True,
+        )
     p.record(
         "result",
         status="OBSERVED",

@@ -78,6 +78,11 @@ if __name__ == "__main__":
     parser.add_argument("--tokens", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--substrate", default="/tmp/rig-substrate-v0.5.0")
+    parser.add_argument(
+        "--expect-selector-rejection",
+        action="store_true",
+        help="require native duplicate selectors to return404; use for the c624bd88 comparison",
+    )
     p = Proof(parser.parse_args())
     gateway_port = int(os.environ.get("GATEWAY_PORT", "15021"))
     connect_port = int(os.environ.get("CONNECT_PORT", "15022"))
@@ -155,6 +160,18 @@ if __name__ == "__main__":
         "broken route cannot pass", bad_response, 'actor "does-not-exist" not found'
     )
     for method, port in (("POST", gateway_port), ("CONNECT", connect_port)):
+        if p.args.expect_selector_rejection:
+            control = p.inspect()
+            p.check(
+                "single native selector succeeds",
+                duplicates(p, port, method, ["rig-local/rig-1"]),
+                200,
+            )
+            p.check(
+                "single native selector effect",
+                p.inspect()["commits"],
+                control["commits"] + 1,
+            )
         for values in (
             ["rig-local/does-not-exist"],
             ["rig-local/does-not-exist", "rig-local/rig-1"],
@@ -163,8 +180,12 @@ if __name__ == "__main__":
             ["rig-local/rig-1", "rig-local/rig-2"],
             ["rig-local/rig-1, rig-local/does-not-exist"],
         ):
+            control = p.inspect() if p.args.expect_selector_rejection else None
             actual = duplicates(p, port, method, values)
-            if values[0] == "rig-local/does-not-exist":
+            if p.args.expect_selector_rejection:
+                p.check("native invalid selector rejected", actual, 404)
+                p.check("native denied selector has no effect", p.inspect(), control)
+            elif values[0] == "rig-local/does-not-exist":
                 p.check("native first unknown selector returns 404", actual, 404)
             elif (
                 values[0] == "rig-local/rig-1"
@@ -217,7 +238,7 @@ if __name__ == "__main__":
     p.record(
         "result",
         status=result,
-        scope="actor execution and FULL snapshot proof",
+        scope="native routing controls; restore requires a separate proof",
         reason="inspect actor crash and worker errors above; host dmesg is not required",
     )
     if result in ("FAIL", "BLOCKED"):
