@@ -95,17 +95,7 @@ try:
         "--tail=-1",
         "--prefix",
     )
-    gateway = p.command(
-        "kubectl",
-        "--context",
-        p.kube_context,
-        "logs",
-        "-n",
-        "ate-system",
-        "deployment/atenet-router",
-        "--tail=-1",
-    )
-    events = [json.loads(l) for l in p.events.read_text().splitlines()]
+    events = [json.loads(line) for line in p.events.read_text().splitlines()]
     warms = [
         e for e in events if e["kind"] == "http" and e["path"].endswith("/inspect")
     ]
@@ -121,11 +111,24 @@ try:
         "warm request lookup count", len(lookups), 0 if p.args.cache == "default" else 1
     )
     request = next(e for e in events if e["kind"] == "http" and e["path"] == "/jsonrpc")
-    receipts = [
-        line
-        for line in gateway.splitlines()
-        if "trace.id=" + request["request"] in line
-    ]
+    receipts = p.wait(
+        "gateway cache receipt",
+        lambda: [
+            line
+            for line in p.command(
+                "kubectl",
+                "--context",
+                p.kube_context,
+                "logs",
+                "-n",
+                "ate-system",
+                "deployment/atenet-router",
+                "--tail=-1",
+            ).splitlines()
+            if "trace.id=" + request["request"] in line
+        ],
+        timeout=10,
+    )
     p.check("unique cache request receipt", len(receipts), 1)
     elapsed = (
         datetime.datetime.fromisoformat(receipts[0].split()[0])
@@ -164,7 +167,10 @@ try:
         status="OBSERVED",
         cache=p.args.cache,
         http_status=status,
-        scope="a native failure stays a failed expectation; does not authorize removing cacheTtl0s",
+        scope=(
+            "a native failure stays a failed expectation; "
+            "does not authorize removing cacheTtl0s"
+        ),
     )
 except Exception as error:
     p.record("result", status="FAIL", error=str(error), type=type(error).__name__)

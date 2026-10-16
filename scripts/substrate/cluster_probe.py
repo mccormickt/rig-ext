@@ -36,7 +36,8 @@ def duplicates(proof, port, method, values):
     ).encode()
     inner = (
         f"POST /jsonrpc HTTP/1.1\r\nHost: rig-1:80\r\nA2A-Version: 1.0\r\n"
-        f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n"
+        f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+        "Connection: close\r\n"
     )
     with socket.create_connection(("127.0.0.1", port), timeout=30) as conn:
         headers = "".join(f"ate-target-actor: {value}\r\n" for value in values)
@@ -81,7 +82,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--expect-selector-rejection",
         action="store_true",
-        help="require native duplicate selectors to return404; use for the c624bd88 comparison",
+        help="require native duplicate selectors to return404 (c624bd88 comparison)",
     )
     p = Proof(parser.parse_args())
     gateway_port = int(os.environ.get("GATEWAY_PORT", "15021"))
@@ -239,7 +240,7 @@ if __name__ == "__main__":
         "result",
         status=result,
         scope="native routing controls; restore requires a separate proof",
-        reason="inspect actor crash and worker errors above; host dmesg is not required",
+        reason="inspect actor and worker receipts; host dmesg is not required",
     )
     if result in ("FAIL", "BLOCKED"):
         raise SystemExit(2 if result == "BLOCKED" else 1)
