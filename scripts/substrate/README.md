@@ -28,7 +28,8 @@ Independent fixture controls found:
   real tool effect. Denied requests left actor state unchanged; the other actor
   remained suspended. Protected-edge controls and unknown404/no-creation passed.
 - Warm default-cache requests completed after assigned-Pod deletion, on another
-  ready Pod, within the default5s TTL (final gateway receipt0.727477s after warm).
+  ready Pod, within the default5s TTL (final gateway receipt0.974875s after the
+  initial cache-fill request started, with a matched successful lookup receipt).
   Zero-TTL also passed. These are bounded nightly observations. The release-pinned
   failure remains valid and its `cacheTtl: 0s` workaround stays in setup.
 - Readiness2s passed. Readiness7s still caused first/retry504 and RESUMING; a
