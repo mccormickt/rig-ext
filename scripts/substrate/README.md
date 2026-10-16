@@ -1,5 +1,73 @@
 # Rig actor on Agent Substrate: bounded prototype
 
+## Published nightly comparison: c624bd88 is blocked on stock v0.5
+
+On 2026-10-16, a fresh private Zeus installation tested the published nightly
+`ghcr.io/agentgateway/agentgateway:v0.0.0-alpha.c624bd88` at index digest
+`sha256:805c58c7ed4f2a111a2b1e2e2adecc0a5292ed17b9b5f70f115da806b7b71b25`
+(amd64 `sha256:505c2c6f733b9250b144e83b6c6e8f210dcccd337a83bab0ef5e9c5f511b3ba0`).
+Both gateway Pods ran revision `c624bd881364b765b977b176b4c9d3efda5efa03`.
+Substrate stayed at stock v0.5.0. No core patch, identity-validation bypass,
+Substrate main or Envoy substitution was used. The released setup pin below is
+unchanged; this nightly is not a stable release or a replacement live proof.
+
+**Permitted native HTTP egress failed before policy lookup.** The worker received
+`403 Forbidden: invalid worker-for-actor SPIFFE identity`. Its minted runtime
+certificate has URI `spiffe://substrate-actor.local/ateom-for-actor/rig-local/rig-1`;
+the nightly accepts only `worker-for-actor`. The same actor, policy and private
+destination first reproduced the release-pinned `name: Required value` failure.
+Host and ordinary-Pod probes reached the exact Service destination; actor UDP/TCP
+DNS succeeded. The nightly actor request did not increment the sink counter, and
+provider calls stayed zero. Absence of the old policy error is not proof of a
+working policy lookup: the nightly rejects the CONNECT earlier.
+
+Independent fixture controls found:
+
+- Native duplicate/conflicting selectors returned404 for ordinary HTTP and valid
+  CONNECT attempts. Single-selector HTTP and CONNECT+inner A2A each completed a
+  real tool effect. Denied requests left actor state unchanged; the other actor
+  remained suspended. Protected-edge controls and unknown404/no-creation passed.
+- Warm default-cache requests completed after assigned-Pod deletion, on another
+  ready Pod, within the default5s TTL (final gateway receipt0.727477s after warm).
+  Zero-TTL also passed. These are bounded nightly observations. The release-pinned
+  failure remains valid and its `cacheTtl: 0s` workaround stays in setup.
+- Readiness2s passed. Readiness7s still caused first/retry504 and RESUMING; a
+  separate longer operator retry succeeded with no late request effects.
+  Permanent failure reached CRASHED only on the operator retry's worker deadline.
+
+The full live-inference/restore matrix was not repeated after the egress blocker.
+There is no nightly Ollama, cross-node MEMORY, VOLUMES, ACP or exactly-once claim.
+Actor code and Cargo.lock are unchanged from the clean
+[9df331e](https://github.com/mccormickt/rig-ext/commit/9df331ec02305250c6652f59148870e45473bea6)
+build; its rebuilt actor image is
+`sha256:52428d13d07a161ad95afbdb2b4162821f3e3faa5797b694bd412b70ea1db9d8`.
+The separate evidence directory is `zeus-nightly-c624bd88`; prior archives remain
+unchanged. Initial worker startup hit inotify exhaustion. Scaling only the owned
+cluster's optional telemetry Deployments to zero released capacity. Host limits
+and shared services were not changed; local RPC/access logs supply the receipts.
+
+To repeat, use a new `RUN_DIR` and evidence directory with the dedicated setup
+below. First reproduce permitted egress with the stock pin and independent
+destination controls. Then change only the two gateway container images:
+
+```bash
+CANDIDATE=ghcr.io/agentgateway/agentgateway:v0.0.0-alpha.c624bd88@sha256:805c58c7ed4f2a111a2b1e2e2adecc0a5292ed17b9b5f70f115da806b7b71b25
+kubectl --context kind-rig-ollama-e2e -n ate-system set image \
+  deployment/atenet-router deployment/atenet-egress "agentgateway=$CANDIDATE"
+kubectl --context kind-rig-ollama-e2e -n ate-system rollout status deployment/atenet-egress
+kubectl --context kind-rig-ollama-e2e -n ate-system rollout status deployment/atenet-router
+```
+
+Restart only the owned router port-forward. Repeat the same actor `/egress`
+request, with sink counts before/after, certificate and worker-error receipts.
+If blocked, stop the live matrix. For fixture ingress checks, use fresh `rig-poc`
+actors and add `--expect-selector-rejection` to `cluster_probe.py`. This flag does
+not alter the release-pinned expectation. Run both cache settings with the matching
+gateway configuration. `cache.py` requires a ready spare and checks the actual
+gateway receipt inside the TTL; it does not wait for replacement-Pod startup.
+
+## Released v0.5 proof remains separate
+
 **Substrate v0.5.0 with the released native agentgateway pin fails live egress.**
 On Zeus, the gateway's `GetActorEgressPolicy` request omits the new required
 `name: default` field. The API rejects it with `name: Required value`, and the
