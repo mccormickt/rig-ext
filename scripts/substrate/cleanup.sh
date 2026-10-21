@@ -2,7 +2,7 @@
 # Delete only the disposable resources whose IDs this setup recorded.
 set -euo pipefail
 ROOT=$(git rev-parse --show-toplevel)
-RUN_DIR=${RUN_DIR:-$ROOT/.amp/in/substrate-v05-run}
+RUN_DIR=${RUN_DIR:-$ROOT/.amp/in/substrate-22acba54-run}
 NODE_ID=$(cat "$RUN_DIR/node.id")
 WORKER_NODE_ID=$(cat "$RUN_DIR/worker-node.id")
 REGISTRY_ID=$(cat "$RUN_DIR/registry.id")

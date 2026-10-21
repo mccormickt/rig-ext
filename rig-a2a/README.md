@@ -56,6 +56,12 @@ agentgateway omits the new required egress-policy name, so the API rejects even
 permitted HTTP egress. The live task failed with zero provider calls or effects.
 This is not a v0.5 live-inference pass; the v0.4 evidence remains separate.
 
+The separate Oct21 experiment with unreleased Substrate `22acba54` and published
+gateway nightly `f51a7fbc` is blocked earlier, at ingress. Their `Actor.status`
+protobuf field numbers differ. The API resumes the actor, but native HTTP and
+CONNECT+inner HTTP return500 before handler dispatch. No live-inference or
+conversation-restore pass is claimed for that pair.
+
 ## Use a remote agent as a Rig model
 
 ```rust,no_run

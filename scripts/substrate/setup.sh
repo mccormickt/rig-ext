@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ -n ${ATE_CONFIG:-} ]]; then
+  echo 'Refusing ATE_CONFIG: the isolated proof must not load another install target.' >&2
+  exit 1
+fi
 ROOT=$(git rev-parse --show-toplevel)
 SUBSTRATE=${SUBSTRATE:-$ROOT/.amp/in/substrate-22acba54}
 export KIND_CLUSTER_NAME=${KIND_CLUSTER_NAME:-rig-ollama-e2e}
@@ -150,13 +154,10 @@ containers:
   - {name: data, mountPath: /data}
 resources:
   limits:
-  - {name: cpu, quantity: '1'}
-  - {name: memory, quantity: 512Mi}
+    cpuMillicores: 1000
+    memoryBytes: 536870912
 snapshotConfig:
   preferredFidelity: SNAPSHOT_FIDELITY_MEMORY
-sandboxConfig:
-  sandboxClass: gvisor
-  configName: gvisor-default
 volumes:
 - name: data
   durableDir: {}

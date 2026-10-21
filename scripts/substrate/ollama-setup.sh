@@ -32,7 +32,6 @@ kubectl ate --context "$CONTEXT" get actor-template rig-poc -a rig-local -o json
   python3 -c 'import json,sys
 d=json.load(sys.stdin); d.pop("status",None)
 d["metadata"]={"name":"rig-ollama","atespace":"rig-local"}
-d["snapshotConfig"]["storageLocation"]="gs://ate-snapshots/rig-ollama/"
 d["containers"][0]["env"]=[{"name":k,"value":v} for k,v in {
   "INFERENCE":"ollama", "OLLAMA_URL":"http://ollama.rig-local.svc.cluster.local:15024",
   "OLLAMA_MODEL":"qwen3.5:9b", "EGRESS_URL":"http://ollama.rig-local.svc.cluster.local:15024/probe",

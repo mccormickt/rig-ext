@@ -1,5 +1,80 @@
 # Rig actor on Agent Substrate: bounded prototype
 
+## Unreleased source experiment: 22acba54 + f51a7fbc is blocked at ingress
+
+On 2026-10-21, a fresh private Zeus install used unmodified Substrate
+`22acba54bd7a75e1e51b5a742f05306e2b13baba` for the CLI, API, atelet and
+`ateworker-gvisor`. Both native gateways used the published nightly
+`ghcr.io/agentgateway/agentgateway:v0.0.0-alpha.f51a7fbc` at amd64 digest
+`sha256:2b9136f22df5b4b59244adbbc3381ae085c54f8bc2aa5c2b60fb0fa1c41e162c`
+(index `sha256:564c487cd458906b07aa7ee47ec595b7569583c6f101c1f23c94dba46a79915d`).
+This is not stock v0.5 compatibility. No core patch or Envoy substitution was used.
+
+**Native ingress returns500 before the actor's HTTP handler.** Substrate's
+`Actor.status` is protobuf field5; the gateway's embedded proto expects field7.
+The API's successful ResumeActor receipt contains RUNNING and a worker assignment,
+but the gateway reports `ResumeActor response did not include a worker assignment`.
+First wake, already-running retries, ordinary HTTP and CONNECT+inner HTTP all fail.
+An offline encode/decode check with both exact schemas reproduces the lost status;
+each schema's own round-trip control passes. This check is not a packet capture.
+
+New golden MEMORY snapshots completed under the pinned gVisor Oct17 runtime.
+The actual minted certificate has
+`spiffe://substrate-actor.local/worker-for-actor/rig-local/rig-1`.
+Host and ordinary-Pod probes reached the independent private sink. After an exact
+host/port policy grant, the actor `/egress` request still returned500 at ingress
+and the sink stayed unchanged. No gateway-originated policy lookup or allowed
+actor egress was proved. Provider calls stayed zero; the sink ran in probe-only mode.
+
+Protected-edge auth/selector denials left both suspended actors unchanged.
+Native duplicate/conflicting selectors returned404 for HTTP and CONNECT, and an
+unknown actor returned404 and stayed uncreated. Single-selector positives failed,
+so this is not a complete selector-security pass. Direct-worker access without a
+client certificate failed with a TLS `certificate required` alert. The same actor
+image's unavailable-provider package control passed, separately from the cluster.
+
+The live inference, conversation continuity, cross-worker/cross-node restore,
+VOLUMES, cache, readiness, parking and cancellation matrices were not rerun after
+this gate failed. No native egress exclusion, boot-time egress, UID isolation,
+physical-host failover, ACP or exactly-once claim follows. The actor image is
+`sha256:f047e43d2fc132ea5347b20192ffa821787c9d602ee628dff4d20b14a580a79d`,
+manifest `sha256:c2f3bb26a33bbfd767f4b5d0012a6cf0efa64bd286cc4d4b3e847394fd4ff822`,
+build `168d6cc2402d52d784f0cfab19a06f5cf4b305e4-51dea0791238467a`.
+Actor Rust source and Cargo.lock did not change. Subsequent changes are harness/docs.
+Evidence is separate in `zeus-22acba54-f51a7fbc`; prior archives are unchanged.
+No telemetry reduction or host setting change was needed for this install.
+
+Current `setup.sh`, `preflight.sh`, `ollama-setup.sh` and `cleanup.sh` target this
+experiment. Setup selects the new numeric resource contract and the worker pool's
+sandbox class, sets cluster-wide snapshot storage, and saves distinct installed
+and configured ConfigMaps. It rejects inherited `ATE_CONFIG` before calling tools;
+that file can override the install target. The two failed template parse attempts and an IPv6
+EndpointSlice setup error remain in evidence. Repeat only the first gate:
+
+```bash
+bash scripts/substrate/setup.sh
+export PATH="$PWD/.amp/in/substrate-22acba54/bin:$PATH"
+export KUBECONFIG="$PWD/.amp/in/substrate-22acba54-run/kubeconfig"
+export OLLAMA_BRIDGE_IP=$(docker network inspect kind | python3 -c 'import json,sys; print(next(c["Gateway"] for c in json.load(sys.stdin)[0]["IPAM"]["Config"] if ":" not in c["Gateway"]))')
+python3 scripts/substrate/receipt_proxy.py --probe-only --bind "$OLLAMA_BRIDGE_IP" --port 15024
+# Separate terminal, with the same environment:
+bash scripts/substrate/ollama-setup.sh
+```
+
+Verify rig-ollama's golden Tag is durable COMPLETED, create rig-1 and rig-2 from
+rig-ollama, and start tokens, edge and router forwarding as below. Run `egress.py`
+with a fresh evidence directory; it must fail its HTTP200 handler expectation on
+this pair. Do not turn that failure into a pass. Stop only owned processes, then
+run `bash scripts/substrate/cleanup.sh` with this run's recorded IDs.
+
+**The remaining sections record earlier proofs and their commands.** To reproduce
+the release-pinned v0.5 setup, use revision
+`9df331ec02305250c6652f59148870e45473bea6`; for the c624 comparison, use
+`5193acbc7a691d78e5600da6bb204c3c991fdf41`. The full restore harness has not been
+migrated to 22acba54 after the failed gate. A future compatible pair must update
+worker RPC/runtime receipts and the checkpoint path under `/var/lib/ate/snapshots`,
+wait for async durable completion, and verify node detach before cross-node work.
+
 ## Published nightly comparison: c624bd88 is blocked on stock v0.5
 
 On 2026-10-16, a fresh private Zeus installation tested the published nightly
