@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT=$(git rev-parse --show-toplevel)
-SUBSTRATE=${SUBSTRATE:-/tmp/rig-substrate-v0.5.0}
+SUBSTRATE=${SUBSTRATE:-$ROOT/.amp/in/substrate-22acba54}
 export KIND_CLUSTER_NAME=${KIND_CLUSTER_NAME:-rig-ollama-e2e}
 export KUBECTL_CONTEXT=kind-$KIND_CLUSTER_NAME
 test "$KIND_CLUSTER_NAME" = rig-ollama-e2e
 REGISTRY=${REGISTRY:-rig-ollama-registry}
 REGISTRY_PORT=${REGISTRY_PORT:-15010}
-RUN_DIR=${RUN_DIR:-$ROOT/.amp/in/substrate-v05-run}
+RUN_DIR=${RUN_DIR:-$ROOT/.amp/in/substrate-22acba54-run}
 mkdir -p "$RUN_DIR"
 export KUBECONFIG=$RUN_DIR/kubeconfig
 export KO_DOCKER_REPO=localhost:$REGISTRY_PORT KO_DEFAULTPLATFORMS=linux/amd64
-PIN=e8d40c33f96f4b7a4984bfea7334a36ab5b45b7b
+PIN=22acba54bd7a75e1e51b5a742f05306e2b13baba
+GATEWAY=ghcr.io/agentgateway/agentgateway:v0.0.0-alpha.f51a7fbc@sha256:2b9136f22df5b4b59244adbbc3381ae085c54f8bc2aa5c2b60fb0fa1c41e162c
 python3 - <<'PY'
 import platform
 version = tuple(map(int, platform.release().split('.')[:2]))
@@ -21,7 +22,8 @@ PY
 command -v go kubectl docker cargo >/dev/null
 docker info >/dev/null
 if [[ ! -d "$SUBSTRATE" ]]; then
-  git clone --depth 1 --branch v0.5.0 https://github.com/agent-substrate/substrate.git "$SUBSTRATE"
+  git clone --no-checkout https://github.com/agent-substrate/substrate.git "$SUBSTRATE"
+  git -C "$SUBSTRATE" checkout --detach "$PIN"
 fi
 test "$(git -C "$SUBSTRATE" rev-parse HEAD)" = "$PIN"
 test -z "$(git -C "$SUBSTRATE" status --porcelain)"
@@ -74,10 +76,17 @@ done
 (cd "$SUBSTRATE"
   go build -o bin/ate-setup ./cmd/ate-setup
   go build -o bin/kubectl-ate ./cmd/kubectl-ate
-  ./hack/install-ate-kind.sh --deploy-ate-system --atenet-dataplane=agentgateway \
+  ./hack/install-ate-kind.sh deploy ate-system --atenet-dataplane=agentgateway \
+    --snapshot-location=gs://ate-snapshots/rig-poc/ \
     --credential-provider='{"enabled":false}' --rollout-timeout=10m
-  ./hack/run-tool.sh ko build --base-import-paths ./cmd/ateom-gvisor > "$RUN_DIR/worker-image.txt"
+  ./hack/run-tool.sh ko build --base-import-paths ./cmd/ateworker-gvisor > "$RUN_DIR/worker-image.txt"
 )
+kubectl --context "$KUBECTL_CONTEXT" -n ate-system get configmaps -o json > "$RUN_DIR/configmaps-installed.json"
+kubectl --context "$KUBECTL_CONTEXT" -n ate-system set image \
+  deployment/atenet-router deployment/atenet-egress "agentgateway=$GATEWAY"
+for DEPLOYMENT in atenet-router atenet-egress; do
+  kubectl --context "$KUBECTL_CONTEXT" -n ate-system rollout status "deployment/$DEPLOYMENT" --timeout=180s
+done
 kubectl --context "$KUBECTL_CONTEXT" -n ate-system get daemonsets -o json | \
   python3 -c 'import json,sys; d=json.load(sys.stdin); ip=sys.argv[1]
 for item in d["items"]:
@@ -88,6 +97,7 @@ for item in d["items"]:
             print(json.dumps(item))' "$REGISTRY_IP" | kubectl --context "$KUBECTL_CONTEXT" replace -f -
 kubectl --context "$KUBECTL_CONTEXT" -n ate-system rollout status daemonset/atelet --timeout=120s
 python3 "$ROOT/scripts/substrate/gateway-config.py"
+kubectl --context "$KUBECTL_CONTEXT" -n ate-system get configmaps -o json > "$RUN_DIR/configmaps-configured.json"
 WORKER_IMAGE=$(tail -1 "$RUN_DIR/worker-image.txt")
 export PATH="$SUBSTRATE/bin:$PATH"
 ACTOR_IMAGE=$(REGISTRY="$REGISTRY" REGISTRY_PORT="$REGISTRY_PORT" bash "$ROOT/scripts/substrate/package.sh")
@@ -144,7 +154,6 @@ resources:
   - {name: memory, quantity: 512Mi}
 snapshotConfig:
   preferredFidelity: SNAPSHOT_FIDELITY_MEMORY
-  storageLocation: gs://ate-snapshots/rig-poc/
 sandboxConfig:
   sandboxClass: gvisor
   configName: gvisor-default

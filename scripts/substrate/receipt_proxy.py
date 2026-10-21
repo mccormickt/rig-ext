@@ -8,12 +8,14 @@ import http.server
 import json
 import threading
 import uuid
+from urllib.parse import urlsplit
 
 
 class Receipt(http.server.BaseHTTPRequestHandler):
     lock = threading.Lock()
     calls = 0
     probes = 0
+    probe_only = False
 
     def log_message(self, *args):
         pass
@@ -27,8 +29,20 @@ class Receipt(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         with self.lock:
-            if self.path == "/probe":
+            if urlsplit(self.path).path == "/probe":
                 Receipt.probes += 1
+                print(
+                    json.dumps(
+                        {
+                            "time": datetime.datetime.now(datetime.UTC).isoformat(),
+                            "event": "probe",
+                            "path": self.path,
+                            "peer": self.client_address,
+                            "probe": self.probes,
+                        }
+                    ),
+                    flush=True,
+                )
             elif self.path != "/stats":
                 self.reply(404, b"{}")
                 return
@@ -37,6 +51,9 @@ class Receipt(http.server.BaseHTTPRequestHandler):
             )
 
     def do_POST(self):
+        if self.probe_only:
+            self.reply(403, b'{"error":"probe-only endpoint"}')
+            return
         if self.path != "/api/chat":
             self.reply(404, b"{}")
             return
@@ -83,7 +100,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--bind", required=True)
     parser.add_argument("--port", type=int, default=15024)
+    parser.add_argument("--probe-only", action="store_true")
     args = parser.parse_args()
+    Receipt.probe_only = args.probe_only
     if args.bind in ("0.0.0.0", "::"):
         parser.error("bind to the dedicated Docker bridge address, not all interfaces")
     http.server.ThreadingHTTPServer((args.bind, args.port), Receipt).serve_forever()
