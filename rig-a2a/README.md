@@ -62,6 +62,11 @@ protobuf field numbers differ. The API resumes the actor, but native HTTP and
 CONNECT+inner HTTP return500 before handler dispatch. No live-inference or
 conversation-restore pass is claimed for that pair.
 
+The Oct23 source/offline check of released Substrate v0.6.0 and published gateway
+nightly `b75bb313` reproduces the same status-field mismatch. Separate controls
+also show actor-JWT request-field and actor-state enum mismatches. No cluster or
+inference ran for this pair; earlier runtime results remain separate.
+
 ## Use a remote agent as a Rig model
 
 ```rust,no_run

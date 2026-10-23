@@ -1,5 +1,43 @@
 # Rig actor on Agent Substrate: bounded prototype
 
+## v0.6.0 + b75bb313: source and offline schema gate remains blocked
+
+The Oct23 check resolved released Substrate v0.6.0 to
+[`d3f2363`](https://github.com/agent-substrate/substrate/commit/d3f2363590a11b2f50489971985ba033b4c9eff7)
+and checked published gateway nightly
+[`b75bb313`](https://github.com/agentgateway/agentgateway/commit/b75bb313e5fb930ea3d98fa5f53fb9b68746308b).
+Registry response hashes verified index
+`sha256:b39e9c66d380a31ea06081405ac255df24a26aec47c480a3dd78c119aa962ea1`
+and linux/amd64
+`sha256:5cd34ad3eec048cdde1e1154de4b60f0fae28a790686ed1565dd143d63062f42`.
+The config revision matches the successful
+[publication run](https://github.com/agentgateway/agentgateway/actions/runs/39889458226).
+No image layers, cluster or model inference were needed for this gate.
+
+**`Actor.status` is still field5 in the release and field7 in the gateway.**
+The release's generated Go API encoded a synthetic RUNNING ResumeActorResponse.
+Gateway-schema Rust types, generated with the pinned prost/prost-build0.14.4 and
+protox0.10.0, preserved UID, version and `resumed` but decoded no status. Both
+own-schema round-trips and a direct nested-status/assignment control passed.
+An absent-status control decoded successfully; truncated bytes were rejected.
+This is an executed offline compatibility failure, not a new HTTP500 observation.
+
+Two additional schema gaps remain. A valid gateway `MintActorJwtRequest` with
+audience `https://receipt.invalid/a` fails release decoding: gateway fields are
+actor5/audiences1/expiration8, versus release1/2/3. Both own-schema JWT controls
+pass. This affects the conditional actor-JWT path, not every HTTP request.
+Release enum values5/6/7 mean CRASHED/DELETING/REVERTING; the gateway decodes them
+as PAUSING/PAUSED/CRASHED. RUNNING2 and RESUMING1 still agree. Changing only the
+status field would leave these gaps.
+
+Source inspection confirms `name: default` and the `worker-for-actor` URI prefix
+align. It does not prove policy lookup, certificate acceptance or UID isolation.
+The release requires a fresh install for a pre1.0 minor upgrade. No cluster was
+built because the schema gate failed; no runtime, egress, Ollama, restore or
+security matrix was repeated. The separate `zeus-v06-b75bb313` archive contains
+source pins, manifests, generation inputs, exact commands and raw offline outputs.
+Earlier runtime evidence and the setup pins below remain unchanged.
+
 ## Unreleased source experiment: 22acba54 + f51a7fbc is blocked at ingress
 
 On 2026-10-21, a fresh private Zeus install used unmodified Substrate
