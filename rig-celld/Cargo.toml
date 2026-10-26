@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Rig integrations for celld and workers-rs"
 
+[[example]]
+name = "http_tools"
+path = "examples/mcp/http_tools.rs"
+required-features = ["mcp-http"]
+
 [dependencies]
 base64 = { version = "0.22", optional = true }
 jsonschema = { version = "0.58", default-features = false, optional = true }

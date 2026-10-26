@@ -9,6 +9,7 @@ done
 for features in '' worker-replay; do
   cargo check --locked --target "$target" -p rig-codemode --no-default-features --features "$features"
 done
+cargo check --locked --target "$target" -p mcp-worker-conformance
 for features in '' durable-object durable-object,codemode codemode-worker-replay; do
   cargo check --locked --target "$target" -p rig-durable --no-default-features --features "$features"
 done

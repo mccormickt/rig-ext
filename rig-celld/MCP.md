@@ -131,4 +131,52 @@ deadlines, byte bounds, and single-attempt behavior themselves.
 cargo test --locked -p rig-celld --features mcp-http
 cargo check --locked -p rig-celld --target wasm32-unknown-unknown --features mcp
 cargo check --locked -p rig-celld --target wasm32-unknown-unknown --features mcp-http
+bash scripts/workers/mcp.sh
 ```
+
+The [Worker fixture](examples/mcp/worker) runs the packaged Rust client against a
+loopback MCP server on celld and local workerd. It checks actual HTTP requests,
+code-mode dispatch, schema validation, metadata isolation, SSE rejection,
+oversized and stalled bodies, mismatched IDs, HTTP errors, uncertain disconnects,
+and caller cancellation before headers and during body reads.
+Server counters independently check no retries or followed redirects.
+It uses no model provider or production MCP server and proves neither production
+Cloudflare enforcement nor full MCP conformance. Do not expose or deploy it.
+
+## Cross-runtime test harness
+
+From the repository root in an Amp orb, run:
+
+```sh
+MCP_EVIDENCE_DIR="$PWD/.amp/in/artifacts/mcp-proof" bash scripts/workers/mcp.sh
+```
+
+This builds the native example and the Worker bundle, starts three loopback-only
+services, runs 22 fault checks on each Worker runtime, and checks the same script
+on native QuickJS, local workerd, and celld. It repeats successful runs three
+times, checks invalid output schemas, and reruns after both Worker restarts.
+The optional evidence directory receives raw client/server JSON and build hashes.
+
+- [Native conformance example](examples/mcp/http_tools.rs): paginated discovery, input validation,
+  `DynamicTool` registration, and `CodeMode::execute` over real HTTP.
+- [Worker example](examples/mcp/worker/src/demo.rs): the same script through
+  `WorkerReplayPlanner` and a `LOADER` binding. The small host keeps its journal
+  in memory; it does **not** implement durable recovery.
+- [Script](examples/mcp/stock.js): read west=37 and east=12, then emit only the total
+  49. These are controlled fixture values, not production inventory.
+- [E2E assertions](examples/mcp/e2e.py): compare reports with independent server
+  records; verify that invalid arguments make no HTTP request, bad output stops
+  the script, private metadata stays out, and prefix replay adds no HTTP calls.
+
+After the services start, run just the fixture-specific native checks:
+
+```sh
+cargo run --locked -p rig-celld --example http_tools --features mcp-http
+python3 rig-celld/examples/mcp/e2e.py --native-only
+```
+
+The harness leaves the services running for inspection. Stop them with
+`amp orb service stop mcp-fixture`, `amp orb service stop mcp-workerd`, and
+`amp orb service stop mcp-celld`. Plain MCP HTTP calls do not require Worker
+Loader; the Worker **code-mode** example does. The example bearer value is a
+public test constant. Do not use it as a production credential.

@@ -1,0 +1,20 @@
+[package]
+name = "mcp-worker-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+futures-util = "0.3"
+rig-celld = { path = "../../..", features = ["mcp-http"] }
+rig-codemode = { path = "../../../../rig-codemode", default-features = false, features = ["worker-replay"] }
+rig-core.workspace = true
+serde_json.workspace = true
+worker.workspace = true
+
+[lints]
+workspace = true

@@ -4689,6 +4689,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-worker-conformance"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "rig-celld",
+ "rig-codemode",
+ "rig-core",
+ "serde_json",
+ "worker",
+]
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
