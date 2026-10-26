@@ -96,6 +96,7 @@ pub(crate) fn compile(schema: &Value) -> Result<Vec<ParameterHeader>, Error> {
                 | "then"
                 | "else"
                 | "contains"
+                | "contentSchema"
                 | "additionalProperties"
                 | "unevaluatedProperties"
                 | "unevaluatedItems"

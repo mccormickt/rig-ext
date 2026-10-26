@@ -156,6 +156,12 @@ async fn header_annotations_reject_ambiguous_paths_but_not_schema_data() {
         json!({"type": "object", "properties": {"x": {"type": "string", "x-mcp-header": "Same"}, "y": {"type": "boolean", "x-mcp-header": "same"}}}),
         json!({"type": "object", "allOf": [{"properties": {"x": {"type": "string", "x-mcp-header": "X"}}}]}),
         json!({"type": "object", "properties": {"xs": {"type": "array", "items": {"type": "string", "x-mcp-header": "X"}}}}),
+        json!({"type": "object", "properties": {"payload": {
+            "type": "string", "contentMediaType": "application/json",
+            "contentSchema": {"type": "object", "properties": {
+                "tenant": {"type": "string", "x-mcp-header": "Tenant"}
+            }}
+        }}}),
     ] {
         let endpoint = Endpoint::new(move |request, _| {
             reply(
