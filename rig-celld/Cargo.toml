@@ -6,6 +6,16 @@ license.workspace = true
 description = "Rig integrations for celld and workers-rs"
 
 [[example]]
+name = "mcp_call"
+path = "examples/mcp/call.rs"
+required-features = ["mcp-http"]
+
+[[example]]
+name = "mcp_code_mode"
+path = "examples/mcp/code_mode.rs"
+required-features = ["mcp-http"]
+
+[[example]]
 name = "http_tools"
 path = "examples/mcp/http_tools.rs"
 required-features = ["mcp-http"]

@@ -62,6 +62,52 @@ Input and output schemas compile offline. Local references such as `#/$defs`
 work; external HTTP and file references fail even if another dependency enables
 JSON Schema resolver features.
 
+## Cargo examples
+
+These native Rust examples use a configured MCP endpoint. They do not start a
+fixture, need Node, or use the Amp CLI. Set `MCP_ENDPOINT` to a compatible
+JSON-only MCP `2026-07-28` URL. For authenticated endpoints, supply
+`MCP_BEARER_TOKEN` through your environment or secret manager; neither example
+uses a built-in credential. Do not put credentials in the endpoint URL.
+
+Discover tools without calling any of them:
+
+```sh
+cargo run --locked -p rig-celld --example mcp_call --features mcp-http -- "$MCP_ENDPOINT"
+```
+
+Call one discovered tool with explicit JSON arguments. Replace `lookup` and its
+arguments with a tool from your server:
+
+```sh
+cargo run --locked -p rig-celld --example mcp_call --features mcp-http -- \
+  "$MCP_ENDPOINT" lookup '{"region":"west"}'
+```
+
+The [direct example](examples/mcp/call.rs) prints the host-facing MCP result,
+including metadata. It exits unsuccessfully for transport/protocol/schema errors
+or a tool result with `isError: true`. Calls can have external effects; select
+tools and arguments deliberately. There are no automatic retries or approvals.
+
+Run a local JavaScript file through a Rust code-mode host:
+
+```sh
+cargo run --locked -p rig-celld --example mcp_code_mode --features mcp-http -- \
+  "$MCP_ENDPOINT" rig-celld/examples/mcp/stock.js lookup
+```
+
+The [code-mode example](examples/mcp/code_mode.rs) registers only the tool names
+listed after the script path. Missing names fail before script execution. The
+sample [stock script](examples/mcp/stock.js) requires a `lookup({region})` tool
+that returns `{answer: number}`; use your own script for other servers. Only
+emitted or returned payloads reach the transcript, without MCP metadata. A script
+error, timeout, or other incomplete execution returns a nonzero exit status.
+Neither example uses a model provider. Both accept `--help` without an endpoint.
+
+The [Worker example](examples/mcp/worker/src/demo.rs) is also Rust, but runs in
+celld or workerd after `worker-build`, not through `cargo run`. Its code-mode
+backend requires Worker Loader; plain MCP HTTP does not.
+
 ## Code mode and durable hosts
 
 `McpTool::into_dynamic_tool()` works with `rig-codemode::DynamicToolDispatcher`

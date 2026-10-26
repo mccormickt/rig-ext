@@ -19,7 +19,9 @@
 for JSON responses. It does not support SSE or legacy sessions and is not a
 complete Streamable HTTP client. Both MCP features are independent of storage,
 dynamic Workers, code mode, and durable workflows. The [MCP guide](MCP.md)
-describes tool registration, limits, and replay constraints.
+starts with [Cargo examples](MCP.md#cargo-examples) for direct tool calls and
+code mode. Worker examples, limits, and cross-runtime tests are documented there
+separately.
 
 ## Dynamic Workers
 
