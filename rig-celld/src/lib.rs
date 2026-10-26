@@ -1,14 +1,19 @@
-//! Rig storage integrations for Rust Workers running on celld.
+//! Rig integrations for Rust Workers running on celld.
 //!
 //! Common memory contracts do not select a storage backend. Enable `storage`
 //! for `CellStorage` on Cloudflare or celld SQLite Durable Objects. Enable
 //! `sqlite-vec` together with celld's `sqlite_vec` Wrangler compatibility flag
 //! to use `SqliteVecIndex`.
 //! Enable independent `dynamic-workers` for fresh Worker Loader invocations.
+//! Enable `mcp` for stateless JSON-only MCP tools, or `mcp-http` to also use
+//! native HTTP and Workers fetch without storage or Worker Loader bindings.
 
 mod capabilities;
 mod memory;
 mod vector;
+
+#[cfg(feature = "mcp")]
+pub mod mcp;
 
 #[cfg(feature = "dynamic-workers")]
 mod dynamic_workers;

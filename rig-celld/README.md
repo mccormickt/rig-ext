@@ -1,6 +1,6 @@
 # rig-celld
 
-`rig-celld` contains reusable storage contracts and Rig adapters for workers-rs applications on celld. Durable Object classes, routes, authorization, conversation state, and provider configuration stay in application crates.
+`rig-celld` contains reusable storage contracts, stateless MCP tools, and Rig adapters for workers-rs applications on celld. Durable Object classes, routes, authorization, conversation state, and provider configuration stay in application crates.
 
 ## Features
 
@@ -10,6 +10,16 @@
 | `dynamic-workers` | Fresh Worker Loader, JS/WASM modules, entrypoint Fetcher, bounded response reads | Compile only | Worker Loader binding on celld or Cloudflare/workerd |
 | `storage` | `CellStorage`, SQL access, and synchronous transactions | Compiles for tests | Cloudflare or celld SQLite Durable Objects |
 | `sqlite-vec` | Includes `storage`; `SqliteVecIndex<M>`, Rig `VectorStoreIndex`, and Rig `InsertDocuments` | Compiles for tests | celld 0.6.0 or later with the Wrangler `sqlite_vec` compatibility flag |
+| `mcp` | Stateless JSON-only MCP client, protocol types, schema validation, and Rig tools | Supported | Application-supplied transport |
+| `mcp-http` | Includes `mcp`; bounded HTTP transport | reqwest | Global Workers fetch; no storage or Loader binding |
+
+## MCP
+
+[`rig_celld::mcp`](MCP.md) supports stateless MCP `2026-07-28` endpoints configured
+for JSON responses. It does not support SSE or legacy sessions and is not a
+complete Streamable HTTP client. Both MCP features are independent of storage,
+dynamic Workers, code mode, and durable workflows. The [MCP guide](MCP.md)
+describes tool registration, limits, and replay constraints.
 
 ## Dynamic Workers
 

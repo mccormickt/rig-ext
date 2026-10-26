@@ -3,7 +3,7 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$root"
 target=wasm32-unknown-unknown
-for features in '' storage sqlite-vec dynamic-workers; do
+for features in '' storage sqlite-vec dynamic-workers mcp mcp-http; do
   cargo check --locked --target "$target" -p rig-celld --no-default-features --features "$features"
 done
 for features in '' worker-replay; do

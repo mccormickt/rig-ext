@@ -183,6 +183,14 @@ Shutdown retains completed tool outcomes even when the host has not yet joined t
 
 ## MCP
 
+For stateless JSON-only MCP `2026-07-28` endpoints on native or Workers targets,
+use [`rig-celld::mcp`](../rig-celld/MCP.md). Its tools work with
+`DynamicToolDispatcher` and validate their own structured results; no `mcp`
+feature in `rig-codemode` or `OutputSchemaValidator` is needed. SSE and legacy
+sessions are not supported by that client.
+
+The `mcp` feature below integrates the native-only `rig-rmcp` client:
+
 ```rust,ignore
 let definitions = client.list_all_tools().await?;
 let mcp_tools = rig_rmcp::tools_from_server(definitions, client.peer());

@@ -3746,6 +3746,8 @@ dependencies = [
  "percent-encoding",
  "referencing",
  "regex",
+ "reqwest 0.13.4",
+ "rustls",
  "serde",
  "serde_json",
  "strum 0.28.0",
@@ -6420,6 +6422,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -6550,10 +6553,20 @@ dependencies = [
 name = "rig-celld"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "futures-util",
+ "jsonschema",
+ "reqwest 0.13.4",
+ "rig-codemode",
  "rig-core",
+ "rmcp 3.6.0",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "tokio",
+ "tracing",
+ "url",
  "worker",
 ]
 
@@ -6567,7 +6580,7 @@ dependencies = [
  "rig-celld",
  "rig-core",
  "rig-rmcp",
- "rmcp",
+ "rmcp 2.2.0",
  "rquickjs",
  "serde",
  "serde_json",
@@ -6748,7 +6761,7 @@ checksum = "44ceee55a0644c19c17e8fb423ba96bbd6173c12f7b7d4eccd44f4c92df4fe03"
 dependencies = [
  "futures",
  "rig-core",
- "rmcp",
+ "rmcp 2.2.0",
  "serde_json",
  "thiserror",
  "tokio",
@@ -6884,6 +6897,25 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rmcp"
+version = "3.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ceb42e9e47443cd83a834dea57b5816d35481417bae72ade5dc5615c59122e26"
+dependencies = [
+ "chrono",
+ "futures",
+ "indexmap 2.14.0",
+ "libc",
+ "pin-project-lite",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
  "tokio-util",
  "tracing",
 ]
