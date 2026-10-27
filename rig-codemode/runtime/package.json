@@ -3,8 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node build.mjs",
-    "test": "node conformance.mjs"
+    "build": "node build.mjs"
   },
   "dependencies": {
     "@jitl/quickjs-ng-wasmfile-release-sync": "0.32.0",

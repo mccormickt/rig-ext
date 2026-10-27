@@ -106,9 +106,16 @@ Cargo uses checked-in `worker.js`, `quickjs.wasm`, `identity.txt`, and
 # From rig-codemode/runtime:
 npm ci
 npm run build
-npm test
 npm audit
+
+# From the repository root:
+cargo test --locked -p rig-worker-tests --test replay -- --ignored --nocapture
 ```
+
+The ignored Unix Rust integration test owns all 11 direct Dynamic Worker conformance
+groups, HTTP status checks, and semantic assertions. It starts and cleans up
+`miniflare.mjs`, a loopback-only Node adapter for the host Worker and `LOADER`.
+JavaScript guest programs remain test inputs; Node does not orchestrate tests.
 
 The lock pins `quickjs-emscripten-core` and
 `@jitl/quickjs-ng-wasmfile-release-sync` to 0.32.0. Esbuild uses
