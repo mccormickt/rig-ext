@@ -1,5 +1,5 @@
-//! Run against the loopback fixture started by scripts/workers/mcp.sh.
-//! cargo run -p rig-celld --example http_tools --features mcp-http
+//! Native host exercised by the Cargo MCP conformance test.
+//! cargo test -p rig-worker-tests --test mcp -- --ignored --nocapture
 
 use std::sync::Arc;
 

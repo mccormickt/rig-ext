@@ -6836,6 +6836,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rig-worker-tests"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.13.4",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

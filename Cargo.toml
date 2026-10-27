@@ -10,6 +10,7 @@ members = [
   "rig-durable",
   "rig-durable/examples/durable-object",
   "rig-typesafeai-tools",
+  "scripts/workers",
 ]
 
 [workspace.package]

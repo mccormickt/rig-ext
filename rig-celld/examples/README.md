@@ -13,16 +13,16 @@ guide before running tools with external effects or deploying an application.
 
 The two Durable Object applications target `wasm32-unknown-unknown` and need
 `worker-build` and celld. See the [`rig-celld` README](../README.md#examples) for
-build steps and constraints. Scripts under `scripts/workers` run cross-runtime
-tests; they are not required for the native MCP examples.
+build steps and constraints. The MCP cross-runtime tests run with
+`cargo test --locked -p rig-worker-tests --test mcp -- --ignored --nocapture`;
+they are not required for the native MCP examples.
 
-The MCP examples use Rust and Cargo. Non-Rust files serve these runtime and
-test requirements:
+The MCP examples, HTTP fault fixture, and test orchestration use Rust and Cargo.
+Non-Rust files serve these runtime requirements:
 
 - `mcp/stock.js` is guest input for the JavaScript code-mode engine, not a host
   launcher. The Rust `mcp_code_mode` example loads and executes it.
-- `mcp/worker/fixture.mjs` is an independent Node HTTP test server. It sends
-  malformed responses, stalls body reads, and records connection closure.
-- `mcp/e2e.py` and `scripts/workers/mcp.sh` build, start, and restart external
-  celld/workerd processes and compare their results with the native Rust example.
-  Cargo alone does not supply the Worker runtime or its bindings.
+- `scripts/workers/miniflare.mjs` configures workerd modules and bindings through
+  Miniflare's Node API. Rust starts, checks, restarts, and stops the process.
+- `rig-codemode/runtime/build.mjs` bundles the JavaScript guest with esbuild.
+  Cargo builds use the checked-in assets and do not run npm.

@@ -1,0 +1,18 @@
+[package]
+name = "rig-worker-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[target.'cfg(unix)'.dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json"] }
+serde_json.workspace = true
+tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+
+[lints]
+workspace = true
