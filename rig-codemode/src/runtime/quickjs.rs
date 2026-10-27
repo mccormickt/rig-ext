@@ -10,32 +10,42 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::sync::Arc;
+#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
+use std::{sync::atomic::Ordering, time::Instant};
 
 use rig_core::tool::ToolErrorKind;
 use rquickjs::context::EvalOptions;
 use rquickjs::convert::Coerced;
 use rquickjs::function::Opt;
 use rquickjs::promise::PromiseState;
-use rquickjs::{Context, Ctx, Exception, FromJs, Function, Object, Promise, Runtime, Value};
+#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
+use rquickjs::{Context, Runtime};
+use rquickjs::{Ctx, Exception, FromJs, Function, Object, Promise, Value};
 
-use super::{PRELUDE, SCRIPT_FILENAME, SpawnError, locate, wrap_source, write_text};
-use crate::bridge::{
-    Payload, Reply, Request, ScriptError, WorkerChannels, WorkerConfig, WorkerOutcome,
-};
+#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
+use super::SpawnError;
+use super::{PRELUDE, SCRIPT_FILENAME, locate, wrap_source, write_text};
+use crate::bridge::{Payload, Reply, Request, ScriptError, WorkerOutcome};
+#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
+use crate::bridge::{WorkerChannels, WorkerConfig};
 use crate::catalog::{MAX_NAME_BYTES, MAX_QUERY_BYTES};
 use crate::projection::bounded_json;
 use crate::report::{ExecutionStatus, ScriptDiagnostic, ScriptOutput};
+use crate::{Catalog, Limits};
 
+#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
 const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
 const GUEST_STACK_BYTES: usize = 512 * 1024;
+#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
 const JOBS_PER_DEADLINE_CHECK: u32 = 64;
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_SEARCH_LIMIT: usize = 50;
 
 /// Start the worker thread. Returns once the thread exists; the outcome
 /// arrives on `channels.done`.
+#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
 pub(crate) fn spawn(
     config: WorkerConfig,
     channels: WorkerChannels,
@@ -65,6 +75,7 @@ struct GuestState<'js> {
 
 type Shared<'js> = Rc<RefCell<GuestState<'js>>>;
 
+#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
 fn run(
     config: WorkerConfig,
     requests: tokio::sync::mpsc::Sender<Request>,
@@ -97,38 +108,45 @@ fn run(
         return failed("could not create the script context");
     };
     let outcome = context.with(|ctx| {
-        let state: Shared<'_> = Rc::new(RefCell::new(GuestState {
-            next_ordinal: 0,
-            over_budget_calls: 0,
-            output: ScriptOutput::default(),
-            pending: HashMap::new(),
-        }));
-        let session = Session {
-            ctx: ctx.clone(),
-            config: &config,
-            requests: &requests,
-            cancel: &cancel,
-            state: state.clone(),
-        };
-        let outcome = session.run(&replies);
-        // Drop guest handles held from Rust before the runtime is destroyed.
-        state.borrow_mut().pending.clear();
-        outcome
+        let stopped = Rc::new(move || {
+            if cancel.load(Ordering::Relaxed) {
+                Some(Stop::Cancelled)
+            } else if Instant::now() >= deadline {
+                Some(Stop::TimedOut)
+            } else {
+                None
+            }
+        });
+        let session = Session::new(
+            ctx,
+            config.catalog.clone(),
+            config.limits,
+            Rc::new(move |request| requests.try_send(request).is_ok()),
+            stopped,
+            Rc::new(|_, _| true),
+            Rc::new(|_| true),
+        );
+        session.run(&config.code, &replies, deadline)
     });
     drop(context);
     drop(runtime);
     outcome
 }
 
-struct Session<'js, 'a> {
-    ctx: Ctx<'js>,
-    config: &'a WorkerConfig,
-    requests: &'a tokio::sync::mpsc::Sender<Request>,
-    cancel: &'a std::sync::Arc<std::sync::atomic::AtomicBool>,
+pub(crate) struct Session<'js> {
+    pub(crate) ctx: Ctx<'js>,
+    catalog: Arc<Catalog>,
+    limits: Limits,
+    requests: Rc<dyn Fn(Request) -> bool>,
+    stopped: Rc<dyn Fn() -> Option<Stop>>,
+    check_output: Rc<OutputCheck>,
+    check_return: Rc<dyn Fn(usize) -> bool>,
     state: Shared<'js>,
 }
 
-enum Stop {
+type OutputCheck = dyn Fn(&ScriptOutput, &str) -> bool;
+
+pub(crate) enum Stop {
     Completed(Option<serde_json::Value>),
     Failed(ScriptDiagnostic),
     TimedOut,
@@ -136,15 +154,58 @@ enum Stop {
     Stalled,
 }
 
-impl<'js> Session<'js, '_> {
-    fn run(&self, replies: &std::sync::mpsc::Receiver<Reply>) -> WorkerOutcome {
+impl Drop for Session<'_> {
+    fn drop(&mut self) {
+        // Guest handles must be released before the context and runtime.
+        self.state.borrow_mut().pending.clear();
+    }
+}
+
+impl<'js> Session<'js> {
+    pub(crate) fn new(
+        ctx: Ctx<'js>,
+        catalog: Arc<Catalog>,
+        limits: Limits,
+        requests: Rc<dyn Fn(Request) -> bool>,
+        stopped: Rc<dyn Fn() -> Option<Stop>>,
+        check_output: Rc<OutputCheck>,
+        check_return: Rc<dyn Fn(usize) -> bool>,
+    ) -> Self {
+        Self {
+            ctx,
+            catalog,
+            limits,
+            requests,
+            stopped,
+            check_output,
+            check_return,
+            state: Rc::new(RefCell::new(GuestState {
+                next_ordinal: 0,
+                over_budget_calls: 0,
+                output: ScriptOutput::default(),
+                pending: HashMap::new(),
+            })),
+        }
+    }
+
+    #[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
+    fn run(
+        &self,
+        code: &str,
+        replies: &std::sync::mpsc::Receiver<Reply>,
+        deadline: Instant,
+    ) -> WorkerOutcome {
         let stop = match self.install() {
-            Ok(()) => match self.evaluate() {
-                Ok(promise) => self.drive(promise, replies),
+            Ok(()) => match self.evaluate(code) {
+                Ok(promise) => self.drive(promise, replies, deadline),
                 Err(error) => self.classify(error),
             },
             Err(error) => self.classify(error),
         };
+        self.outcome(stop)
+    }
+
+    pub(crate) fn outcome(&self, stop: Stop) -> WorkerOutcome {
         let state = self.state.borrow();
         let (status, returned, diagnostic) = match stop {
             Stop::Completed(returned) => (ExecutionStatus::Completed, returned, None),
@@ -177,18 +238,12 @@ impl<'js> Session<'js, '_> {
     }
 
     fn interrupted(&self) -> Option<Stop> {
-        if self.cancel.load(Ordering::Relaxed) {
-            Some(Stop::Cancelled)
-        } else if Instant::now() >= self.config.deadline {
-            Some(Stop::TimedOut)
-        } else {
-            None
-        }
+        (self.stopped)()
     }
 
     /// Turn an engine error into a stop reason. Interrupts win over the
     /// exception text they produce.
-    fn classify(&self, error: rquickjs::Error) -> Stop {
+    pub(crate) fn classify(&self, error: rquickjs::Error) -> Stop {
         if let Some(stop) = self.interrupted() {
             return stop;
         }
@@ -204,15 +259,19 @@ impl<'js> Session<'js, '_> {
 
     fn diagnostic_of(&self, thrown: Value<'js>) -> ScriptDiagnostic {
         let budget = self
-            .config
             .limits
             .message_bytes
-            .min(self.config.limits.output_bytes)
+            .min(self.limits.output_bytes)
             .min(8192);
         let read = |value: Value<'js>, limit| {
             Coerced::<rquickjs::String>::from_js(&self.ctx, value)
-                .and_then(|s| s.0.to_cstring())
-                .map(|s| truncate(s.as_str(), limit).to_owned())
+                .and_then(|s| {
+                    if s.0.clone().to_cstring()?.len() > limit {
+                        Ok(truncate("error", limit).to_owned())
+                    } else {
+                        s.0.to_string()
+                    }
+                })
                 .unwrap_or_else(|_| truncate("error", limit).to_owned())
         };
         if let Some(exception) = thrown.as_object().cloned().and_then(Exception::from_object) {
@@ -247,12 +306,11 @@ impl<'js> Session<'js, '_> {
         plain(&message)
     }
 
-    fn install(&self) -> rquickjs::Result<()> {
+    pub(crate) fn install(&self) -> rquickjs::Result<()> {
         let ctx = &self.ctx;
         let host = Object::new(ctx.clone())?;
 
         let names: Vec<String> = self
-            .config
             .catalog
             .entries()
             .iter()
@@ -262,8 +320,8 @@ impl<'js> Session<'js, '_> {
 
         let invoke = {
             let state = self.state.clone();
-            let catalog = self.config.catalog.clone();
-            let limits = self.config.limits;
+            let catalog = self.catalog.clone();
+            let limits = self.limits;
             let requests = self.requests.clone();
             move |ctx: Ctx<'js>,
                   name: String,
@@ -295,7 +353,7 @@ impl<'js> Session<'js, '_> {
                     return Ok(promise);
                 };
                 if !catalog.contains(&name) {
-                    let _ = requests.try_send(Request::Rejected {
+                    let _ = requests(Request::Rejected {
                         ordinal,
                         name: name.clone(),
                         kind: ToolErrorKind::NotFound,
@@ -315,7 +373,7 @@ impl<'js> Session<'js, '_> {
                     if matches!(serialized, Err(rquickjs::Error::Exception)) {
                         let _ = ctx.catch();
                     }
-                    let _ = requests.try_send(Request::Rejected {
+                    let _ = requests(Request::Rejected {
                         ordinal,
                         name: name.clone(),
                         kind: ToolErrorKind::InvalidArgs,
@@ -329,7 +387,7 @@ impl<'js> Session<'js, '_> {
                     return Ok(promise);
                 };
                 if arguments.len() > limits.message_bytes {
-                    let _ = requests.try_send(Request::Rejected {
+                    let _ = requests(Request::Rejected {
                         ordinal,
                         name: name.clone(),
                         kind: ToolErrorKind::InvalidArgs,
@@ -351,7 +409,7 @@ impl<'js> Session<'js, '_> {
                     arguments: arguments.as_str().to_owned(),
                     raw,
                 };
-                if requests.try_send(request).is_err() {
+                if !requests(request) {
                     let error = ScriptError::rejected(
                         ToolErrorKind::Cancelled,
                         "the host is no longer accepting tool calls",
@@ -371,10 +429,17 @@ impl<'js> Session<'js, '_> {
 
         let text = {
             let state = self.state.clone();
-            let limit = self.config.limits.output_bytes;
+            let limit = self.limits.output_bytes;
+            let check_output = self.check_output.clone();
             move |ctx: Ctx<'js>, value: Value<'js>| -> rquickjs::Result<()> {
                 if let Some(string) = value.as_string() {
                     let string = string.to_string()?;
+                    if !check_output(&state.borrow().output, &string) {
+                        return Err(Exception::throw_range(
+                            &ctx,
+                            "response exceeds transport limit",
+                        ));
+                    }
                     write_text(&mut state.borrow_mut().output, limit, &string);
                     return Ok(());
                 }
@@ -397,6 +462,12 @@ impl<'js> Session<'js, '_> {
                         ),
                     ));
                 }
+                if !check_output(&state.output, &json) {
+                    return Err(Exception::throw_range(
+                        &ctx,
+                        "response exceeds transport limit",
+                    ));
+                }
                 write_text(&mut state.output, limit, &json);
                 Ok(())
             }
@@ -404,30 +475,27 @@ impl<'js> Session<'js, '_> {
         host.set("text", Function::new(ctx.clone(), text)?)?;
 
         let search = {
-            let catalog = self.config.catalog.clone();
-            let cancel = self.cancel.clone();
-            let deadline = self.config.deadline;
-            let message_bytes = self.config.limits.message_bytes;
+            let catalog = self.catalog.clone();
+            let stopped = self.stopped.clone();
+            let message_bytes = self.limits.message_bytes;
             move |ctx: Ctx<'js>,
                   query: rquickjs::String<'js>,
                   limit: Opt<Option<f64>>|
                   -> rquickjs::Result<Value<'js>> {
-                let query = query.to_cstring()?;
-                if query.len() > MAX_QUERY_BYTES {
+                if query.clone().to_cstring()?.len() > MAX_QUERY_BYTES {
                     return Err(Exception::throw_range(
                         &ctx,
                         "search query exceeds 4096 bytes",
                     ));
                 }
+                let query = query.to_string()?;
                 let limit = match limit.0.flatten() {
                     Some(n) if n.is_finite() && n >= 1.0 => (n as usize).min(MAX_SEARCH_LIMIT),
                     Some(_) => 1,
                     None => DEFAULT_SEARCH_LIMIT,
                 };
                 let results: Vec<_> = catalog
-                    .search_checked(query.as_str(), limit, || {
-                        cancel.load(Ordering::Relaxed) || Instant::now() >= deadline
-                    })
+                    .search_checked(query.as_str(), limit, || stopped().is_some())
                     .map_err(|message| Exception::throw_range(&ctx, message))?
                     .into_iter()
                     .map(|entry| entry.summarize())
@@ -438,13 +506,13 @@ impl<'js> Session<'js, '_> {
         host.set("searchTools", Function::new(ctx.clone(), search)?)?;
 
         let describe = {
-            let catalog = self.config.catalog.clone();
-            let message_bytes = self.config.limits.message_bytes;
+            let catalog = self.catalog.clone();
+            let message_bytes = self.limits.message_bytes;
             move |ctx: Ctx<'js>, name: rquickjs::String<'js>| -> rquickjs::Result<Value<'js>> {
-                let name = name.to_cstring()?;
-                if name.len() > MAX_NAME_BYTES {
+                if name.clone().to_cstring()?.len() > MAX_NAME_BYTES {
                     return Err(Exception::throw_range(&ctx, "tool name exceeds 128 bytes"));
                 }
+                let name = name.to_string()?;
                 match catalog.get(name.as_str()) {
                     Some(entry) => to_guest(&ctx, &entry.describe(), message_bytes),
                     None => Ok(Value::new_null(ctx)),
@@ -469,15 +537,50 @@ impl<'js> Session<'js, '_> {
         Ok(())
     }
 
-    fn evaluate(&self) -> rquickjs::Result<Promise<'js>> {
+    pub(crate) fn evaluate(&self, code: &str) -> rquickjs::Result<Promise<'js>> {
         let mut options = EvalOptions::default();
         options.strict = false;
         options.filename = Some(SCRIPT_FILENAME.to_string());
         self.ctx
-            .eval_with_options::<Promise<'js>, _>(wrap_source(&self.config.code), options)
+            .eval_with_options::<Promise<'js>, _>(wrap_source(code), options)
     }
 
-    fn drive(&self, promise: Promise<'js>, replies: &std::sync::mpsc::Receiver<Reply>) -> Stop {
+    pub(crate) fn boundary(&self, promise: &Promise<'js>) -> Option<Stop> {
+        if let Some(stop) = self.interrupted() {
+            return Some(stop);
+        }
+        match promise.state() {
+            PromiseState::Pending if self.state.borrow().pending.is_empty() => Some(Stop::Stalled),
+            PromiseState::Pending => None,
+            PromiseState::Resolved => Some(match promise.result::<Value<'js>>() {
+                Some(Ok(value)) => self.returned(value),
+                Some(Err(error)) => self.classify(error),
+                None => Stop::Stalled,
+            }),
+            PromiseState::Rejected => {
+                let _ = promise.result::<Value<'js>>();
+                Some(self.classify(rquickjs::Error::Exception))
+            }
+        }
+    }
+
+    #[cfg(feature = "worker-runtime")]
+    pub(crate) fn output(&self) -> ScriptOutput {
+        self.state.borrow().output.clone()
+    }
+
+    #[cfg(feature = "worker-runtime")]
+    pub(crate) fn has_pending(&self, ordinal: u32) -> bool {
+        self.state.borrow().pending.contains_key(&ordinal)
+    }
+
+    #[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
+    fn drive(
+        &self,
+        promise: Promise<'js>,
+        replies: &std::sync::mpsc::Receiver<Reply>,
+        deadline: Instant,
+    ) -> Stop {
         loop {
             let mut executed: u32 = 0;
             while self.ctx.execute_pending_job() {
@@ -488,33 +591,13 @@ impl<'js> Session<'js, '_> {
                     return stop;
                 }
             }
-            if let Some(stop) = self.interrupted() {
+            if let Some(stop) = self.boundary(&promise) {
                 return stop;
             }
-            match promise.state() {
-                PromiseState::Pending => {}
-                PromiseState::Resolved => {
-                    return match promise.result::<Value<'js>>() {
-                        Some(Ok(value)) => self.returned(value),
-                        Some(Err(error)) => self.classify(error),
-                        None => Stop::Stalled,
-                    };
-                }
-                PromiseState::Rejected => {
-                    let _ = promise.result::<Value<'js>>();
-                    return self.classify(rquickjs::Error::Exception);
-                }
-            }
-            if self.state.borrow().pending.is_empty() {
-                return Stop::Stalled;
-            }
-            if self.requests.try_send(Request::Idle).is_err() {
+            if !(self.requests)(Request::Idle) {
                 return Stop::Cancelled;
             }
-            let remaining = self
-                .config
-                .deadline
-                .saturating_duration_since(Instant::now());
+            let remaining = deadline.saturating_duration_since(Instant::now());
             match replies.recv_timeout(remaining) {
                 Ok(reply) => {
                     if let Err(error) = self.settle(reply) {
@@ -527,7 +610,7 @@ impl<'js> Session<'js, '_> {
         }
     }
 
-    fn settle(&self, reply: Reply) -> rquickjs::Result<()> {
+    pub(crate) fn settle(&self, reply: Reply) -> rquickjs::Result<()> {
         let Some((resolve, reject)) = self.state.borrow_mut().pending.remove(&reply.ordinal) else {
             return Ok(());
         };
@@ -549,20 +632,27 @@ impl<'js> Session<'js, '_> {
             return Stop::Completed(None);
         }
         let json = match self.ctx.json_stringify(value) {
-            Ok(Some(json)) => match json.to_string() {
-                Ok(json) => json,
-                Err(error) => return self.classify(error),
-            },
+            Ok(Some(json)) => json,
             Ok(None) => return Stop::Completed(None),
             Err(error) => return self.classify(error),
         };
-        if json.len() > self.config.limits.message_bytes {
+        let bytes = match json.clone().to_cstring() {
+            Ok(buffer) => buffer.len(),
+            Err(error) => return self.classify(error),
+        };
+        if bytes > self.limits.message_bytes {
             return Stop::Failed(plain(&format!(
                 "the return value is {} bytes; the limit is {} bytes",
-                json.len(),
-                self.config.limits.message_bytes
+                bytes, self.limits.message_bytes
             )));
         }
+        if !(self.check_return)(bytes) {
+            return Stop::Failed(plain("response exceeds transport limit"));
+        }
+        let json = match json.to_string() {
+            Ok(json) => json,
+            Err(error) => return self.classify(error),
+        };
         match serde_json::from_str(&json) {
             Ok(value) => Stop::Completed(Some(value)),
             Err(_) => Stop::Failed(plain("the return value is not valid JSON")),
@@ -611,7 +701,7 @@ fn reject_with<'js>(
     reject.call::<_, ()>((exception,))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "quickjs", not(target_family = "wasm")))]
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,

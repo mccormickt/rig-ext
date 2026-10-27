@@ -155,6 +155,9 @@ pub mod report;
 mod runtime;
 #[cfg(feature = "worker-replay")]
 pub mod worker_replay;
+#[cfg(feature = "worker-runtime")]
+#[doc(hidden)]
+pub mod worker_runtime;
 
 use std::sync::Arc;
 #[cfg(not(target_family = "wasm"))]

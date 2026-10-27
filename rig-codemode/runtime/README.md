@@ -27,13 +27,38 @@ The guest has no Workers APIs. Outbound access is explicitly denied.
 This backend does not implement ordinary `CodeMode::execute` and does not change
 that method's native cancellation behavior.
 
+## Rust/WASM adapter
+
+The Worker runtime shares the native Rust `Session` bindings, catalog, output
+writer, return conversion, and guest prelude. Rust owns the replay exchange, prefix
+checks, integer work counters, and transport accounting. JavaScript only loads
+the WASM module, reads a bounded HTTP body, and returns the response. The engine
+is still QuickJS C compiled through `rquickjs`; this is not a Rust JavaScript
+engine. The shared `prelude.js` remains JavaScript.
+
+The standalone artifact crate contains the small unsafe job-step FFI call;
+`rig-codemode` retains `forbid(unsafe_code)`. It preserves pending job exceptions
+instead of using the binding's boolean job API, which clears them. A stalled
+root promise with unhandled rejections is a script error; a stalled root with no
+unhandled rejection remains `stalled`. The runtime counts rejections without
+retaining guest handles. Handled failures do not prevent normal completion.
+
+Guest diagnostic and discovery strings use checked UTF-8 conversion. Invalid or
+oversized diagnostic fields use a bounded `error` fallback before Rust copying.
+
+The WASM module has no WASI, clock, or network imports. A constant clock supplies
+the engine's hidden clock hook; guest clocks and random values remain unavailable. Heap limits apply
+to QuickJS allocations, not all Rust or Worker allocations. Non-polling engine
+built-ins still require platform CPU isolation. Local tests do not prove
+Cloudflare production enforcement or hard cancellation.
+
 ## Exchange contract
 
 Each exchange creates a fresh anonymous Worker and QuickJS interpreter. The
 shared `prelude.js` supplies the frozen tool table, `text`, `searchTools`, and
 `describeTool`. Date, WeakRef, and FinalizationRegistry are absent; Math.random
-throws. Captured VM JSON/String functions and wrapper-side state prevent guest
-global or prototype mutation from changing trusted protocol operations.
+throws. Engine JSON APIs and Rust-owned state keep trusted protocol operations
+separate from guest globals. Guest serialization can still execute `toJSON`.
 
 The guest emits an ordered Call/Rejected batch followed by Idle or Done. It
 compares the complete expected batch before injecting one selected reply, then
@@ -43,16 +68,16 @@ schemas, projections, history, and prefixes. Only new events advance host state.
 Output snapshots are reconstructed, not appended across exchanges.
 
 `Done.returned` is null or a JSON string on the private wire, not a nested
-transport object. This preserves the native return-depth ceiling. Raw strings
-cross the VM boundary as escaped JSON so embedded NUL bytes are not truncated.
+transport object. This preserves the native return-depth ceiling. Strings cross
+the VM boundary with explicit lengths so embedded NUL bytes are not truncated.
 
 ## Limits and identity
 
 The guest enforces `Limits` heap, call, message, and output ceilings. The WASM
 stack ceiling is fixed at **64 KiB**. Each exchange permits at most 10,000
-interrupt callbacks and 100,000 jobs; aggregate work charges both, including
-re-executed prefixes. These counters stop CPU loops and job storms without
-depending on a clock that can freeze during Worker CPU execution.
+interrupt callbacks and 100,000 jobs; aggregate work charges both and Rust
+discovery checks, including re-executed prefixes. These counters stop CPU loops
+and job storms without depending on a clock that can freeze during Worker CPU execution.
 
 `ReplayBudget` defaults to 64 MiB aggregate request/response bytes, 1,000,000 work
 units, and 30 seconds. Elapsed time is also bounded by `Limits.wall_time`. The
@@ -63,24 +88,23 @@ checkpoint too. A hung response or body cannot wait without a deadline.
 Each request has an independent 16 MiB transport cap. Rust already debits its
 encoded size before the exchange; the remaining byte allowance applies to the
 response, not to the request a second time. Response bytes are bounded before
-Rust parsing, and actual raw body length replaces guest usage. The wrapper
+Rust parsing, and actual raw body length replaces guest usage. The Rust runtime
 charges escaped event strings and repeated boundary/output snapshots before
 retaining them. Transport exhaustion is fatal even if guest code catches a
-bridge error. Final serialization has a second size check. Numeric budgets must
+bridge error. Return byte length is checked before Rust copying and JSON parsing.
+Final serialization has a second size check. Numeric budgets must
 fit JavaScript's safe integer range; the host timer must fit its signed 32-bit
 millisecond range. Transport depth is 128; discovery projection depth is 64.
 
 The immutable planner identity includes JS/WASM SHA-256 fingerprints, engine
 version, adapter version, compatibility date, CPU/subrequest profile, transport
 cap, and all aggregate budget values. Persist it with source, catalog, and
-`Limits`. Changing any of these requires an explicit migration or a new history.
-Adapter v3 separates response-envelope decoding from guest return conversion:
+`Limits`. Use a new history when these change. Response-envelope decoding is
+separate from guest return conversion:
 unrepresentable guest JSON (including unpaired surrogates and depth 128) produces
-a `Done` script error, not a protocol error. Depth 127 remains valid. The generated
-JS/WASM assets and their fingerprints are unchanged; the Rust adapter version in
-the full planner identity changes, so v2 histories still require migration.
-The supplied QuickJS-NG **0.12.1** is not history-compatible with native NG
-**0.16.2**; diagnostics, stack limits, and other engine semantics can differ.
+a `Done` script error, not a protocol error. Depth 127 remains valid.
+Native and WASM use QuickJS-NG **0.16.2**, but their diagnostics, stack limits,
+and compiled engine behavior can differ.
 Differential tests demonstrate selected shared contracts, not interchangeable
 histories.
 
@@ -102,6 +126,12 @@ production behavior and platform-level memory exhaustion are not tested here.
 Cargo uses checked-in `worker.js`, `quickjs.wasm`, `identity.txt`, and
 `fingerprint.json`; it never runs npm or downloads runtime artifacts.
 
+Build with Rust 1.99.1, the `wasm32-unknown-unknown` target, clang/lld (tested with
+14.0.6), and `wasm-bindgen-cli` 0.2.129. The orb setup installs the build tools.
+`crate/Cargo.lock` pins the standalone artifact's Rust dependencies, including
+`rquickjs` 0.14.0 and `wasm-bindgen` 0.2.129. The `worker-runtime` Cargo feature
+builds the interpreter; `worker-replay` only embeds its assets in the host planner.
+
 ```sh
 # From rig-codemode/runtime:
 npm ci
@@ -115,27 +145,22 @@ cargo test --locked -p rig-worker-tests --test replay -- --ignored --nocapture
 The ignored Unix Rust integration test owns all 11 direct Dynamic Worker conformance
 groups, HTTP status checks, and semantic assertions. It starts and cleans up
 `miniflare.mjs`, a loopback-only Node adapter for the host Worker and `LOADER`.
-JavaScript guest programs remain test inputs; Node does not orchestrate tests.
+An additional test loads the built assets through Node's VM module linker and
+checks WASM memory growth for oversized returns and diagnostics against controls.
+Rust owns the test assertions.
 
-The lock pins `quickjs-emscripten-core` and
-`@jitl/quickjs-ng-wasmfile-release-sync` to 0.32.0. Esbuild uses
-`workerd,browser` conditions and leaves `./quickjs.wasm` external. The Loader
-supplies that file as a compiled WASM module, not a fetchable URL. Engine package
-pins are independent of the Miniflare development harness. The shared tooling
-pins esbuild 0.28.2, Miniflare 4.20260730.0, sharp 0.35.5, and undici 7.30.1.
-`NOTICES.txt` contains the redistributed engine and wrapper licenses.
+`build.sh` compiles Rust and runs wasm-bindgen. `build.mjs` bundles the generated
+glue and `entry.js`, leaving `./quickjs.wasm` external. The Loader supplies that
+file as a compiled WASM module, not a fetchable URL. npm supplies only development
+tools: esbuild 0.28.2 and Miniflare 4.20260730.0, with sharp 0.35.5 and undici
+7.30.1 overrides. `NOTICES.txt` contains Rust dependency and engine licenses;
+review notices when dependency pins change.
 
-`build.mjs` applies one checked wrapper correction: typed-array out-parameter
-views read the current WASM buffer after memory growth. A stale view can cause
-the wrapper to create additional contexts and fail teardown during a job storm.
-The transform must match exactly once or the build fails. It does not change
-the engine WASM. Its version is recorded in the fingerprint, and the resulting
-bundle hash is part of the identity.
-
-Rebuild twice and compare hashes to check reproducibility. Cargo's package file
-list includes the assets, source, lock, and notices. Creating a publishable
-`.crate` remains blocked by the workspace's unpublished path-only dependencies;
-this runtime does not change publication policy.
+Rebuild twice with the same toolchain and compare hashes to check reproducibility.
+Cargo's package file list includes the assets, JavaScript source, npm lock, and
+notices. The standalone artifact crate is built from the repository. Creating a
+publishable `.crate` remains blocked by the workspace's unpublished path-only
+dependencies; this runtime does not change publication policy.
 
 ## Real Rust/runtime conformance
 
@@ -147,8 +172,8 @@ byte accounting, and a CPU-frozen host clock. It is not an alternate planner.
 
 ```sh
 # From rig-codemode/runtime/conformance; install worker-build separately:
-cargo build --features native --bin native-replay
-worker-build --release --no-opt -- --features worker
+cargo build --locked --features native --bin native-replay
+worker-build --release --no-opt -- --locked --features worker
 
 # Use separate supervised services for these alternatives:
 node miniflare.mjs 9890
@@ -159,6 +184,8 @@ celld dev --no-watch --port 9891
 node differential.mjs http://127.0.0.1:9890
 node differential.mjs http://127.0.0.1:9891
 ```
+
+Restart local conformance services after rebuilding so they load the current assets.
 
 The fixture covers deep promises, asymmetric schema-invalid/valid races, sparse
 history, reentrant serialization, late losers, unawaited calls, output/message

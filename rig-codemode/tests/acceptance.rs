@@ -687,6 +687,8 @@ async fn thrown_diagnostics_share_a_utf8_safe_budget() {
         "throw 'é'.repeat(1024 * 1024)",
         "throw new Error('é'.repeat(1024 * 1024))",
         "const e = new Error('small'); e.name = 'é'.repeat(1024 * 1024); e.stack = '界'.repeat(1024 * 1024); throw e;",
+        r"throw '\uD800'",
+        r"throw new Error('\uD800')",
     ] {
         let report = run(&f.codemode, source).await;
         assert_eq!(report.status, ExecutionStatus::ScriptError, "{report:?}");
@@ -754,6 +756,19 @@ async fn discovery_bounds_queries_and_serialized_responses() {
         assert_eq!(
             report.returned,
             Some(json!("RangeError")),
+            "{expression}: {report:?}"
+        );
+    }
+    for expression in [r"searchTools('\uD800')", r"describeTool('\uD800')"] {
+        let report = run(
+            &f.codemode,
+            &format!("try {{ {expression}; return false; }} catch(e) {{ return true; }}"),
+        )
+        .await;
+        assert_eq!(report.status, ExecutionStatus::Completed, "{report:?}");
+        assert_eq!(
+            report.returned,
+            Some(json!(true)),
             "{expression}: {report:?}"
         );
     }

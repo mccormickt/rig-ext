@@ -10,6 +10,7 @@ The crate owns script execution, tool discovery, and bounded results. The host o
 | --- | --- | --- |
 | none | `Catalog`, `Limits`, `ExecutionReport`, `HostDispatcher`, `DynamicToolDispatcher`, `ScriptPolicy`, `analyze`. `CodeMode::builder().build()` returns `BuildError::NoBackend`. | Stable Rust |
 | `quickjs` | Native QuickJS backend through `rquickjs`, one worker thread per script | A C compiler for QuickJS; native targets only |
+| `worker-replay` | Rust/WASM QuickJS replay planner in fresh Dynamic Workers | `wasm32-unknown-unknown` and a Worker Loader binding; uses checked-in assets |
 | `mcp` | `CatalogEntry::from_mcp_definition` and `mcp::OutputSchemaValidator` for `rig-rmcp` tools | Native targets only; MCP tools with declared output schemas |
 
 Enabling `mcp` does not change dispatch or permissions for non-MCP tools. The builder never selects a backend by feature precedence: with several backends compiled, call `CodeModeBuilder::backend`.
@@ -18,7 +19,9 @@ Enabling `mcp` does not change dispatch or permissions for non-MCP tools. The bu
 
 Use `rig-codemode` with `default-features = false` for contracts and direct host dispatch on `wasm32-unknown-unknown`. `HostDispatcher`, `ScriptPolicy`, and their callbacks use Rig's portable bounds: local state and non-`Send` futures are allowed on this target, while native targets retain `Send`/`Sync`. Threaded Wasm is not supported by Rig.
 
-This is not a Workers script backend. The `quickjs` feature requires a native target. `CodeModeBuilder::backend` selects a compiled engine; it does not accept an external executor. On Wasm, `build()` returns `BuildError::NoBackend`. The native bridge uses a worker thread, Tokio task scheduling, timers, and a join handle; it is not compiled on Wasm.
+For Worker script replay, enable `worker-replay` and use `WorkerReplayPlanner`. It shares the native Rust bindings and builds QuickJS into WASM. The host executes admitted tools and records their results. See the [runtime guide](runtime/README.md) for contracts, limits, and asset builds.
+
+The `quickjs` feature requires a native target. `CodeModeBuilder::backend` selects a compiled engine; it does not accept an external executor. On Wasm, `build()` returns `BuildError::NoBackend`; use the replay planner instead. The native bridge uses a worker thread, Tokio task scheduling, timers, and a join handle; it is not compiled on Wasm.
 
 An application-owned executor can use `ExecutionRequest`, `Limits::restrict`, `ExecutionReport::new(status)`, `ScriptDiagnostic::new(message)`, and `ExecutionReport::into_tool_result`. Use `CallRecord::new(ordinal, name, status, delivery)` for child calls and set its public `error_kind` when needed; it defaults to `None`. Delivery is explicit and independent of tool success. Fill the report's public fields with trusted execution results; `ScriptOutput::default()` provides an empty output. The constructors do not sanitize guest data or enforce limits. The application must enforce the limits it supports and keep host details out of diagnostics. QuickJS heap and cancellation guarantees do not apply to celld or other external executors.
 
@@ -231,4 +234,4 @@ CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
 
 - Nested calls pass through the supplied `HostDispatcher`, not an agent runner's hooks. Keep per-call policy in the dispatcher and script-level policy in a `ScriptPolicy`.
 - Scripts have no small-value store, image helpers, or raw provider source grammar.
-- QuickJS is the only script backend. It is native-only and runs in the host process.
+- QuickJS is the only script engine. Native execution runs in the host process; Worker replay uses a WASM build in a fresh Dynamic Worker.

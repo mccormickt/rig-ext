@@ -210,6 +210,20 @@ fn dynamic_worker_replay_conformance() {
             returned(&suffix(send(&input, 200))["boundary"]["Done"]),
             json!(["a\0b", "echo\0suffix"])
         );
+        for code in [r"throw '\uD800'", r"throw new Error('\uD800')"] {
+            let result = suffix(send(&request(code), 200));
+            assert_eq!(result["boundary"]["Done"]["status"], "script_error");
+            assert_eq!(result["boundary"]["Done"]["diagnostic"]["message"], "error");
+        }
+        for expression in [r"searchTools('\uD800')", r"describeTool('\uD800')"] {
+            let result = suffix(send(
+                &request(&format!(
+                    "try {{ {expression}; return false }} catch(e) {{ return true }}"
+                )),
+                200,
+            ));
+            assert_eq!(returned(&result["boundary"]["Done"]), true);
+        }
     }
     println!("PASS embedded NUL text, exact discovery names and rejection messages");
 
@@ -327,5 +341,76 @@ fn dynamic_worker_replay_conformance() {
             .next()
             .is_none(),
         "Miniflare must remove its temporary resources on shutdown"
+    );
+}
+
+#[test]
+#[ignore = "requires Node with VM modules and built replay assets"]
+fn bridge_budgets_bound_wasm_memory() {
+    let mut input = request("return Array(1200000).fill(0)");
+    input["limits"]["memory_bytes"] = json!(64 * 1024 * 1024);
+    input["limits"]["message_bytes"] = json!(4 * 1024 * 1024);
+    input["limits"]["output_bytes"] = json!(101);
+    input["budget"] = budget(4096);
+    let result = command("node")
+        .args(["--experimental-vm-modules", "--input-type=module", "-e", r#"
+import { readFile } from 'node:fs/promises';
+import { createContext, SourceTextModule, SyntheticModule } from 'node:vm';
+const path = 'rig-codemode/runtime/';
+const source = await readFile(path + 'worker.js', 'utf8');
+const wasm = await WebAssembly.compile(await readFile(path + 'quickjs.wasm'));
+const input = JSON.parse(process.argv[1]);
+const results = [];
+for (const code of [input.code, 'const a=Array(1200000).fill(0); return 0',
+  "throw 'x'.repeat(24 * 1024 * 1024)",
+  "const s='x'.repeat(24 * 1024 * 1024); throw 'control'"]) {
+  let memory;
+  const context = createContext({ TextEncoder, TextDecoder, Response,
+    WebAssembly: { Instance: class extends WebAssembly.Instance {
+      constructor(...args) { super(...args); memory = this.exports.memory; }
+    } },
+  });
+  const worker = new SourceTextModule(source, { context });
+  await worker.link((name) => {
+    if (name !== './quickjs.wasm') throw Error('unexpected import: ' + name);
+    return new SyntheticModule(['default'], function() { this.setExport('default', wasm); }, { context });
+  });
+  await worker.evaluate();
+  const response = await worker.namespace.default.fetch(new Request('http://test/', {
+    method: 'POST', body: JSON.stringify({ ...input, code }),
+  }));
+  results.push({ status: response.status, memory: memory.buffer.byteLength, body: await response.text() });
+}
+console.log(JSON.stringify(results));
+"#])
+        .arg(input.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let results: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(results[0]["status"], 429, "{results}");
+    assert_eq!(results[1]["status"], 200, "{results}");
+    let control: Value = serde_json::from_str(results[1]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(returned(&suffix(control)["boundary"]["Done"]), 0);
+    for (index, message) in [(2, "error"), (3, "control")] {
+        assert_eq!(results[index]["status"], 200, "{results}");
+        let body: Value = serde_json::from_str(results[index]["body"].as_str().unwrap()).unwrap();
+        let batch = suffix(body);
+        assert_eq!(batch["boundary"]["Done"]["status"], "script_error");
+        assert_eq!(batch["boundary"]["Done"]["diagnostic"]["message"], message);
+    }
+    for result in results.as_array().unwrap() {
+        assert!(
+            result["memory"].as_u64().unwrap() < 40 * 1024 * 1024,
+            "{results}"
+        );
+    }
+    println!(
+        "PASS bridge memory: return={} control={} diagnostic={} control={}",
+        results[0]["memory"], results[1]["memory"], results[2]["memory"], results[3]["memory"]
     );
 }

@@ -3,11 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node build.mjs"
-  },
-  "dependencies": {
-    "@jitl/quickjs-ng-wasmfile-release-sync": "0.32.0",
-    "quickjs-emscripten-core": "0.32.0"
+    "build": "./build.sh"
   },
   "devDependencies": {
     "esbuild": "0.28.2",

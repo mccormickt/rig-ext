@@ -3,6 +3,7 @@
 import hashlib
 import json
 import subprocess
+import tomllib
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[2]
@@ -14,7 +15,7 @@ selected = set(subprocess.check_output(
 ).splitlines())
 required = {
     "worker.js", "quickjs.wasm", "identity.txt", "fingerprint.json", "NOTICES.txt",
-    "build.mjs", "package.json", "package-lock.json", "guest.js", "prelude.js", "discovery.js",
+    "build.sh", "build.mjs", "package.json", "package-lock.json", "entry.js", "prelude.js",
 }
 assert {"runtime/" + name for name in required} <= selected, required - selected
 manifest = json.loads((runtime / "fingerprint.json").read_text())
@@ -28,13 +29,18 @@ assert identity == (
     f"{manifest['files']['worker.js']['sha256']}:"
     f"{manifest['files']['quickjs.wasm']['sha256']}"
 ), identity
-lock = json.loads((runtime / "package-lock.json").read_text())
-for package in ["quickjs-emscripten-core", "@jitl/quickjs-ng-wasmfile-release-sync"]:
-    assert lock["packages"]["node_modules/" + package]["version"] == manifest["package"]
-    assert lock["packages"]["node_modules/" + package]["license"] == "MIT"
+lock = tomllib.loads((runtime / "crate/Cargo.lock").read_text())
+packages = {package["name"]: package for package in lock["package"]}
+dependencies = tomllib.loads((runtime / "crate/Cargo.toml").read_text())["dependencies"]
+for package in ["rquickjs", "rquickjs-core", "rquickjs-sys"]:
+    assert packages[package]["version"] == manifest["rquickjs"]
+assert dependencies["rquickjs"]["version"] == "=" + manifest["rquickjs"]
+assert dependencies["wasm-bindgen"] == "=" + packages["wasm-bindgen"]["version"]
+assert not json.loads((runtime / "package.json").read_text()).get("dependencies")
 notices = (runtime / "NOTICES.txt").read_text()
-for expected in ["Jake Teton-Landis", "Fabrice Bellard", "Charlie Gordon", "Ben Noordhuis",
-                 "Saúl Ibarra Corretgé", "Permission is hereby granted", "THE SOFTWARE IS PROVIDED"]:
+for expected in ["Fabrice Bellard", "Charlie Gordon", "Ben Noordhuis",
+                 "Saúl Ibarra Corretgé", "rquickjs", "wasm-bindgen", "wasi-libc",
+                 "Permission is hereby granted", "THE SOFTWARE IS PROVIDED"]:
     assert expected in notices, expected
-print(f"PASS Cargo selects {len(required)} runtime files; asset hashes, engine pins, MIT notices")
+print(f"PASS Cargo selects {len(required)} runtime files; asset hashes, Rust pins, license notices")
 print("Cargo package selection is checked; this does not publish or verify a registry .crate archive.")

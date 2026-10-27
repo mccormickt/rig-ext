@@ -2,7 +2,10 @@
 //! worker, speaks the bridge protocol in [`crate::bridge`], and never exposes
 //! engine types outside this module.
 
-#[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
+#[cfg(any(
+    feature = "worker-runtime",
+    all(feature = "quickjs", not(target_family = "wasm"))
+))]
 pub(crate) mod quickjs;
 
 /// The worker could not be started.

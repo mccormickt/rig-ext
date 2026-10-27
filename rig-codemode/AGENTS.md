@@ -22,7 +22,7 @@
   semantics.
 - Cargo builds must not download npm packages. Check in reproducible JS/WASM
   assets, fingerprints, and required notices.
-- QuickJS-WASM NG 0.12.1 and native NG 0.16.2 are not history-compatible.
+- Native and WASM QuickJS builds are not history-compatible.
   Fingerprints must pin the engine, exact runtime assets, adapter policy, and
   aggregate replay budgets. Persist script limits separately.
 - Give each exchange a fresh interpreter and no guest I/O capabilities.

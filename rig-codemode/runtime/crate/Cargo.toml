@@ -1,0 +1,21 @@
+[package]
+name = "rig-codemode-worker-runtime"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rig-codemode = { path = "../..", default-features = false, features = ["worker-runtime"] }
+rquickjs = { version = "=0.14.0", default-features = false, features = ["std"] }
+wasm-bindgen = "=0.2.129"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
