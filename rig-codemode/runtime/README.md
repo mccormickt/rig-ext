@@ -115,7 +115,7 @@ The lock pins `quickjs-emscripten-core` and
 `workerd,browser` conditions and leaves `./quickjs.wasm` external. The Loader
 supplies that file as a compiled WASM module, not a fetchable URL. Engine package
 pins are independent of the Miniflare development harness. The shared tooling
-pins esbuild 0.28.2, Miniflare 4.20260730.0, sharp 0.35.5, and undici 7.30.0.
+pins esbuild 0.28.2, Miniflare 4.20260730.0, sharp 0.35.5, and undici 7.30.1.
 `NOTICES.txt` contains the redistributed engine and wrapper licenses.
 
 `build.mjs` applies one checked wrapper correction: typed-array out-parameter
