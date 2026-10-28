@@ -25,7 +25,6 @@ try:
     template["metadata"] = {"name": name, "atespace": "rig-local"}
     template["snapshotConfig"] = {
         "preferredFidelity": "SNAPSHOT_FIDELITY_VOLUMES",
-        "storageLocation": "gs://ate-snapshots/rig-volumes/",
         "goldenSnapshotConfig": {"mode": "GOLDEN_SNAPSHOT_MODE_DISABLED"},
     }
     path = p.out / "template.json"
@@ -36,12 +35,7 @@ try:
     first = p.prompt("volume-before")
     task = p.send(first)
     p.settled(task)
-    p.http("/admin/close", {}, owner="admin")
-    p.wait(
-        "forwarding drained",
-        lambda: p.http("/admin/status", owner="admin")[1]["inflight"] == 0,
-    )
-    before = p.inspect()
+    before, _, suspended = p.suspend(reopen=False, fidelity="SNAPSHOT_FIDELITY_VOLUMES")
     p.check("execution cleanup", before["active"], 0)
     p.check("no held tool", before["held"], False)
     p.check("first effect counts", (before["invocations"], before["commits"]), (1, 1))
@@ -59,15 +53,13 @@ try:
             }
         ],
     )
-    p.ate("suspend", "actor", "rig-1", "-a", "rig-local")
-    suspended = p.actor()
     p.check("suspended", suspended["status"]["state"], "ACTOR_STATE_SUSPENDED")
     snapshot = max(suspended["status"]["snapshots"], key=lambda s: s["generation"])
     p.check("VOLUMES captured", snapshot["fidelity"], "SNAPSHOT_FIDELITY_VOLUMES")
     p.check(
         "durable completed",
-        snapshot["durableSnapshot"]["status"],
-        "SNAPSHOT_STORAGE_STATUS_COMPLETED",
+        snapshot["durableSnapshot"]["state"],
+        "SNAPSHOT_STORAGE_STATE_COMPLETED",
     )
     p.open_admission()
     second = p.prompt("volume-after")
@@ -114,7 +106,7 @@ try:
         e
         for e in rpc_receipts(
             logs,
-            "/ateom.Ateom/RestoreWorkload",
+            "/ateworker.Worker/RestoreWorkload",
             actor["metadata"]["uid"],
             wake["start"],
             wake["time"],

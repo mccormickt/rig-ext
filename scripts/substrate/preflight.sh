@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run the pinned mount tests without host mounts, devices, or network access.
 set -euo pipefail
-: "${SUBSTRATE:?Set SUBSTRATE to the clean 22acba54 checkout}"
-test "$(git -C "$SUBSTRATE" rev-parse HEAD)" = 22acba54bd7a75e1e51b5a742f05306e2b13baba
+: "${SUBSTRATE:?Set SUBSTRATE to the clean 6a67f431 checkout}"
+test "$(git -C "$SUBSTRATE" rev-parse HEAD)" = 6a67f431e0f2d407eaaa73fa03756fac8a07ffcb
 test -z "$(git -C "$SUBSTRATE" status --porcelain)"
 BUILD=$(mktemp -d)
 NAME=rig-overlay-$(basename "$BUILD")
@@ -18,7 +18,6 @@ trap cleanup EXIT
 docker volume create --name "$NAME" --label rig-proof=overlay-preflight >/dev/null
 VOLUME=$NAME
 CONTAINER=$(docker create --name "$NAME" --network none --cap-add=SYS_ADMIN \
-  --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
   --tmpfs /ram:rw,exec,size=1g --mount "type=volume,src=$VOLUME,dst=/disk" \
   ubuntu:24.04 sh -ec '
     mount --make-rprivate /

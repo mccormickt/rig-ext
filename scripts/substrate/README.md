@@ -1,5 +1,102 @@
 # Rig actor on Agent Substrate: bounded prototype
 
+## Zeus 6a67f431 + gateway v1.7.0: live restore passes with limits
+
+The 2026-10-28 run used clean, unmodified Substrate
+`6a67f431e0f2d407eaaa73fa03756fac8a07ffcb` for the whole stack and gateway
+v1.7.0 source `26f5aebe99a36a037fe54f8080a608aca5547e15`. Both gateways used
+`cr.agentgateway.dev/agentgateway:v1.7.0@sha256:60216aafb03d37f94e952ff3d51d2f630a65b10ecaebdc0a864882f92610c45b`;
+the verified amd64 manifest is
+`sha256:460dda874be2dfa95fa5713c1f46f26079dce78df576008df704e54a59d5780d`.
+This is an unreleased Substrate revision, not stock v0.6 compatibility.
+
+**Native ingress and permitted inner HTTP egress passed before inference.**
+Actual `worker-for-actor` certificates, named `default` policy lookups, independent
+private sink receipts, host/Pod positives, default-deny, wrong-host/port,
+other-actor and revocation controls were checked. DNS denial is NXDOMAIN at this
+pin. Native ordinary HTTP and CONNECT followed by inner HTTP passed with one
+selector. Duplicate/conflicting selectors and unknown actors returned404; unknown
+actors stayed uncreated. Protected-edge auth/ownership/selector/CONNECT denials
+and missing/unlisted native client identities passed. Direct-worker access without
+a client certificate failed with TLS alert116, paired with unchanged authenticated
+edge inspections. The worker test verified the issuer CA, not a DNS hostname.
+
+**Real Ollama MEMORY restore passed on a replacement worker and across kind nodes.**
+Ollama0.40.3 used the installed qwen3.5:9b digest
+`56671c2ab9385f9cfcb404638e32cd62d88e3501d44822208363c010179a3c90`.
+Each fresh case made two public A2A turns. The second message woke a verified
+SUSPENDED actor without manual resume or a preceding actor inspection. Exact
+history, file effects and a heap-only nonce survived. Provider/tool/output receipts
+join operation IDs; gateway and control-plane traces join actor UID, exact snapshot,
+worker assignment and request interval. Async suspension reached durable COMPLETED
+for the captured UUID/generation after admission and execution drain. The cross-node
+case verified no destination copy under `/var/lib/ate/snapshots`, detach during
+wake and object-store transfer on the restore trace. Both nodes share Zeus.
+
+The runtime was gVisor v5, release20261019.0, archive SHA256
+`8637abfb50f81552af25ca08f7172589c09292a7c881efe8d9e09a9f3b6bec7b`,
+bundle `sha256:078445e3672a4bad894f713a43f519e50bff3b9b09a257b8b30a1ecc6ebb5b58`.
+Actor image ID was
+`sha256:e70bee77537abcacffb6e4c26cc4cb706a72b8d2801eace29eead200f525b80d`,
+manifest `sha256:c608551e4ae67dca2dc7c2a40e688cd5a7414c621ae0ff64a3341c42acfc8779`.
+Build identity was `23e025bf9b40118a0b35d6c5b4fbeac19d0c4e94-51dea0791238467a`:
+actor Rust and Cargo sources are unchanged; the harness was dirty during execution.
+
+Live cancellation and the same-image unavailable-provider negative passed.
+Deterministic protocol/SSE/resubscribe, cancellation, concurrency/isolation,
+uncertain-delivery counters, readiness, parking and VOLUMES controls passed.
+VOLUMES retained files but reset heap/history; it used deterministic inference.
+The permanent-readiness case reached CRASHED on a separate operator retry.
+Parking used fixed worker capacity, not autoscaling; rejected/timed-out requests
+had no late effects. The v1.7 capacity response is sanitized `ingress failed`;
+the exact cause is checked on its matching gateway trace. Budget expiry returns503
+with `no worker has room for the actor` after the configured five seconds.
+
+**Default-cache worker replacement still failed with503, 2.63s after cache fill.**
+Zero-TTL passed; setup retains `cacheTtl: 0s`. Terminal enum values5/6/7 still
+disagree. Conditional JWT injection, boot-time networking, certificate-UID isolation,
+link-local exclusions, physical-host failover, ACP and exactly-once semantics are
+not proved. These bounded live model runs are not a statistical reliability claim.
+No automatic idle suspender or generic quiescence guarantee is implemented.
+
+Evidence is separate in `zeus-6a67f431-v170`. Earlier archives are unchanged.
+Failed setup, DNS expectation, log parser, destination-parent assertion,
+stale port-forward and parking expectation attempts are retained, not counted as
+passes. The initial mount preflight used inherited container-only unconfined
+seccomp/AppArmor flags. Final review removed those relaxations; the default-security
+rerun failed at `mount --make-rprivate /` with `Unknown error 5005` (exit32). Setup stops
+there on this host. The earlier runtime observations do not prove that a fresh
+install can pass this stricter prerequisite. No host setting or shared service was
+changed, and no owned telemetry reduction was needed.
+
+Current scripts target this pair. Reprovision only where the mount preflight is
+permitted; do not bypass its failure. Use the same separate gate before inference:
+
+```bash
+export SUBSTRATE="$PWD/.amp/in/substrate-6a67f431"
+export RUN_DIR="$PWD/.amp/in/substrate-6a67f431-run"
+export KUBECONFIG="$RUN_DIR/kubeconfig" PATH="$SUBSTRATE/bin:$PATH"
+bash scripts/substrate/setup.sh
+bash scripts/substrate/ingress-setup.sh
+kubectl --context kind-rig-ollama-e2e -n ate-system port-forward --address=127.0.0.1 \
+  svc/atenet-router 15021:443 15022:8444 15025:15020
+# Separate terminal, using a private tokens file as described below:
+python3 scripts/substrate/edge.py --tokens "$RUN_DIR/tokens.json" --port 15020 \
+  --gateway-port 15021 --gateway-ca "$RUN_DIR/clients/ca.pem" \
+  --gateway-cert "$RUN_DIR/clients/rig-proof-client.pem"
+```
+
+Start `receipt_proxy.py --probe-only` on the private bridge and use
+`ollama-setup.sh` for the destination Service/template, without inference. Wait for
+the exact golden Tag's `durableSnapshot.state` COMPLETED, create fresh rig-ollama
+actors, then run `egress.py` and the archived `ingress-gate.py`. Their invocation
+records contain exact arguments. Only after both pass, restart the receipt proxy
+without `--probe-only` into a fresh log. Use the live commands below with the current
+`--substrate "$SUBSTRATE"`; start fresh actors for each worker-replacement case and
+add `--cross-node` for the second. Restore the owned pool selector before other
+cases. Keep failed runs separate. The remaining sections describe historical pins
+and results; their plaintext ingress ports do not apply to this TLS deployment.
+
 ## v0.6.0 + b75bb313: source and offline schema gate remains blocked
 
 The Oct23 check resolved released Substrate v0.6.0 to

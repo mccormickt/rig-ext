@@ -49,7 +49,7 @@ if __name__ == "__main__":
         positive = sink("/probe")
         proof.check("sink live before denial", positive["probes"], before["probes"] + 1)
         for actor in ("rig-1", "rig-2"):
-            dns(actor, 5)
+            dns(actor, 3)
             status, denied = proof.http(f"/actors/{actor}/egress", owner="admin")
             proof.check("actor egress handler reached", status, 200)
             proof.check("unresolved denied destination", "error" in denied, True)
@@ -132,7 +132,7 @@ if __name__ == "__main__":
         )
         proof.ate("delete", "egress-policy", "rig-2", "-a", "rig-local")
         time.sleep(6)
-        dns("rig-2", 5)
+        dns("rig-2", 3)
         proof.check(
             "control grant removed",
             "error" in proof.http("/actors/rig-2/egress", owner="admin")[1],
@@ -142,7 +142,7 @@ if __name__ == "__main__":
         proof.record(
             "result",
             status="PASS",
-            scope="two actors, UDP/TCP DNS REFUSED without policy, exact local host/port allow and independent sink receipts",
+            scope="two actors, UDP/TCP DNS NXDOMAIN without policy, exact local host/port allow and independent sink receipts",
         )
     except Exception as error:
         proof.record(

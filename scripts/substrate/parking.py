@@ -4,6 +4,7 @@
 import argparse
 import concurrent.futures
 import json
+import time
 import urllib.request
 import uuid
 from pathlib import Path
@@ -101,9 +102,29 @@ if __name__ == "__main__":
                 "/actors/rig-2/jsonrpc", body("overflow-must-not-run"), "rig-2"
             )
             p.check("parking overflow rejected", status, 503)
+            p.check("capacity response", response, "ingress failed")
+            overflow = [
+                e
+                for e in map(json.loads, p.events.read_text().splitlines())
+                if e["kind"] == "http"
+            ][-1]
+            logs = p.command(
+                "kubectl",
+                "--context",
+                p.kube_context,
+                "-n",
+                "ate-system",
+                "logs",
+                "deployment/atenet-router",
+                "--tail=100",
+            )
             p.check(
-                "capacity error specific",
-                "request parking capacity exhausted" in response,
+                "capacity error on matching gateway trace",
+                any(
+                    "trace.id=" + overflow["request"] in line
+                    and "request parking capacity exhausted" in line
+                    for line in logs.splitlines()
+                ),
                 True,
             )
             p.check("first request still waiting", waiting.done(), False)
@@ -128,9 +149,15 @@ if __name__ == "__main__":
             json.loads(request["params"]["message"]["parts"][0]["text"])["operation"],
         )
         timed_request = body("budget-must-not-run")
+        start = time.monotonic()
         status, response = p.http("/actors/rig-1/jsonrpc", timed_request)
-        p.check("parking wait budget", status, 504)
-        p.check("budget error specific", "request timed out" in response, True)
+        p.check("parking wait budget status", status, 503)
+        p.check(
+            "budget preserves capacity error",
+            response,
+            "no worker has room for the actor",
+        )
+        p.check("five-second parking budget", 4.5 <= time.monotonic() - start < 7, True)
         p.wait("timeout releases parking gauge", lambda: not parked())
         p.check(
             "budget target stays suspended",

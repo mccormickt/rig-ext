@@ -5,6 +5,7 @@ import argparse
 import http.client
 import http.server
 import json
+import ssl
 import threading
 import time
 from pathlib import Path
@@ -127,6 +128,12 @@ class Edge(http.server.BaseHTTPRequestHandler):
         )
         started = False
         try:
+            tls = getattr(self.server, "gateway_tls", None)
+            if tls is not None:
+                conn.connect()
+                conn.sock = tls.wrap_socket(
+                    conn.sock, server_hostname="atenet-router.ate-system.svc"
+                )
             self.connection.settimeout(10)
             body = self.rfile.read(length)
             if len(body) != length:
@@ -168,8 +175,19 @@ if __name__ == "__main__":
     parser.add_argument("--tokens", type=Path, required=True)
     parser.add_argument("--port", type=int, default=18081)
     parser.add_argument("--gateway-port", type=int, default=18080)
+    parser.add_argument("--gateway-ca", type=Path)
+    parser.add_argument("--gateway-cert", type=Path)
     args = parser.parse_args()
+    if bool(args.gateway_ca) != bool(args.gateway_cert):
+        parser.error(
+            "gateway CA and client credential bundle must be supplied together"
+        )
+    tls = None
+    if args.gateway_ca:
+        tls = ssl.create_default_context(cafile=args.gateway_ca)
+        tls.load_cert_chain(args.gateway_cert)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Edge)
     server.tokens = json.loads(args.tokens.read_text())
     server.gateway_port = args.gateway_port
+    server.gateway_tls = tls
     server.serve_forever()

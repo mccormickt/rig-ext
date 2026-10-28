@@ -203,7 +203,7 @@ if __name__ == "__main__":
             e
             for e in rpc_receipts(
                 logs,
-                "/ateom.Ateom/RestoreWorkload",
+                "/ateworker.Worker/RestoreWorkload",
                 timed_out["metadata"]["uid"],
                 start,
                 now(),

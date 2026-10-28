@@ -74,8 +74,8 @@ class Live(Proof):
             )
             self.check(
                 "golden durable copy complete",
-                tag["status"]["snapshot"]["durableSnapshot"]["status"],
-                "SNAPSHOT_STORAGE_STATUS_COMPLETED",
+                tag["status"]["snapshot"]["durableSnapshot"]["state"],
+                "SNAPSHOT_STORAGE_STATE_COMPLETED",
             )
             self.check(
                 "golden MEMORY",
@@ -164,7 +164,7 @@ class Live(Proof):
                         destination,
                         "sh",
                         "-ec",
-                        f"test -d /var/lib/ate; test ! -e /var/lib/ate/actors/{initial_actor['metadata']['uid']}/local-checkpoint/{snapshot['uuid']}",
+                        f"test -d /var/lib/ate; test ! -e /var/lib/ate/snapshots/{initial_actor['metadata']['uid']}/local-checkpoint/{snapshot['uuid']}",
                     )
                     self.command(
                         "kubectl",
@@ -504,7 +504,7 @@ class Live(Proof):
                 e
                 for e in rpc_receipts(
                     worker_logs[restored_worker],
-                    "/ateom.Ateom/RestoreWorkload",
+                    "/ateworker.Worker/RestoreWorkload",
                     uid,
                     wake["start"],
                     wake["time"],
@@ -516,7 +516,7 @@ class Live(Proof):
                 e
                 for e in rpc_receipts(
                     atelet,
-                    "/atelet.AteomHerder/Restore",
+                    "/atelet.Atelet/Restore",
                     uid,
                     wake["start"],
                     wake["time"],
@@ -528,22 +528,50 @@ class Live(Proof):
                 and e["req"]["snapshot"]["object"]["snapshot_uri"] == snapshot_uri
             ]
             self.check("atelet restored exact durable snapshot", len(transfers), 1)
-            asset_hash = (
-                "4ae7fab988c3647d2a835d6c3c70c6a99021c562db97827592562b6c51c3e88c"
-            )
+            runtime = transfers[0]["req"]["sandbox_runtime"]
             self.check(
-                "released runtime asset hash",
-                transfers[0]["req"]["sandbox_assets"]["assets"]["amd64"]["files"][
-                    "gvisor"
-                ]["sha256"],
-                asset_hash,
+                "executed snapshot runtime",
+                (
+                    runtime["sandbox_class"],
+                    runtime["version"]["schema_version"],
+                    runtime["version"]["attributes"],
+                ),
+                (
+                    snapshot["sandboxRuntime"]["sandboxClass"],
+                    snapshot["sandboxRuntime"]["version"]["schemaVersion"],
+                    snapshot["sandboxRuntime"]["version"]["attributes"],
+                ),
             )
+            runtime_path = f"/var/lib/ate/actors/{uid}/sandbox-assets/gvisor/runsc"
             self.check(
-                "executed released runtime path",
+                "executed runtime asset path",
                 restores[0]["req"]["runtime_asset_paths"]["gvisor"],
-                f"/var/lib/ate/static-files/gvisor-{asset_hash}/runsc",
+                runtime_path,
+            )
+            self.check(
+                "executed runsc path", restores[0]["req"]["runsc_path"], runtime_path
+            )
+            self.check(
+                "restore checkpoint root",
+                restores[0]["req"]["actor_dirs"]["restore_dir"].startswith(
+                    f"/var/lib/ate/snapshots/{uid}/"
+                ),
+                True,
             )
             if self.args.cross_node:
+                detaches = [
+                    e
+                    for e in rpc_receipts(
+                        atelet,
+                        "/atelet.Atelet/DetachActor",
+                        uid,
+                        wake["start"],
+                        wake["time"],
+                    )
+                    if e.get("err") is None
+                ]
+                self.check("source node detached during wake", len(detaches), 1)
+                self.record("node_detach", records=detaches)
                 downloads = []
                 for line in objectstore.splitlines():
                     try:
@@ -576,7 +604,7 @@ class Live(Proof):
                 event
                 for event in rpc_receipts(
                     api,
-                    "/ateapi.Control/ResumeActor",
+                    "/substrate.ateapi.v1.Control/ResumeActor",
                     uid,
                     wake["start"],
                     wake["time"],

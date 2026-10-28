@@ -28,6 +28,8 @@ def rpc_receipts(logs, method, uid, start, end, worker_uid=None):
             stamp = datetime.datetime.fromisoformat(event["time"])
         except (ValueError, KeyError):
             continue
+        if event.get("method") != method or not start <= stamp <= end:
+            continue
         actor_uid = (event.get("req") or {}).get("actor_uid") or (
             ((event.get("resp") or {}).get("actor") or {}).get("metadata") or {}
         ).get("uid")
@@ -37,7 +39,7 @@ def rpc_receipts(logs, method, uid, start, end, worker_uid=None):
             ).get("worker_assignment") or {}
             if assignment.get("worker_pod_uid") != worker_uid:
                 continue
-        if event.get("method") == method and actor_uid == uid and start <= stamp <= end:
+        if actor_uid == uid:
             matches.append(event)
     return matches
 
@@ -208,15 +210,15 @@ class Proof:
             time.sleep(0.1)
         raise TimeoutError(name)
 
-    def snapshot(self, actor):
+    def snapshot(self, actor, fidelity="SNAPSHOT_FIDELITY_MEMORY"):
         snapshots = actor["status"]["snapshots"]
         snapshot = max(snapshots, key=lambda s: s["generation"])
-        self.check("captured MEMORY", snapshot["fidelity"], "SNAPSHOT_FIDELITY_MEMORY")
+        self.check("captured fidelity", snapshot["fidelity"], fidelity)
         self.check("actor-owned snapshot", snapshot["owner"], "SNAPSHOT_OWNER_ACTOR")
         self.check(
             "durable copy completed",
-            snapshot["durableSnapshot"]["status"],
-            "SNAPSHOT_STORAGE_STATUS_COMPLETED",
+            snapshot["durableSnapshot"]["state"],
+            "SNAPSHOT_STORAGE_STATE_COMPLETED",
         )
         self.check("snapshot runtime recorded", bool(snapshot["sandboxRuntime"]), True)
         self.check("snapshot UUID recorded", bool(snapshot["uuid"]), True)
@@ -227,7 +229,7 @@ class Proof:
         self.check("admission open HTTP", status, 200)
         self.check("admission reopened", opened["closed"], False)
 
-    def suspend(self, *, reopen=True):
+    def suspend(self, *, reopen=True, fidelity="SNAPSHOT_FIDELITY_MEMORY"):
         status, closed = self.http("/admin/close", {}, owner="admin")
         self.check("admission close HTTP", status, 200)
         self.check("admission closed", closed["closed"], True)
@@ -240,14 +242,48 @@ class Proof:
         self.check("no held tool before suspend", before["held"], False)
         assignment = self.actor()
         self.ate("suspend", "actor", "rig-1", "-a", "rig-local")
-        suspended = self.actor()
+
+        def suspended_actor():
+            actor = self.actor()
+            return (
+                actor if actor["status"]["state"] == "ACTOR_STATE_SUSPENDED" else None
+            )
+
+        suspended = self.wait("asynchronous suspension", suspended_actor)
+        snapshot = max(suspended["status"]["snapshots"], key=lambda s: s["generation"])
+        self.check(
+            "new snapshot generation",
+            snapshot["generation"]
+            > assignment["status"].get("lastAssignedGeneration", 0),
+            True,
+        )
+
+        def durable_actor():
+            actor = self.actor()
+            matches = [
+                s
+                for s in actor["status"]["snapshots"]
+                if (s["uuid"], s["generation"])
+                == (snapshot["uuid"], snapshot["generation"])
+            ]
+            return (
+                actor
+                if len(matches) == 1
+                and matches[0].get("durableSnapshot", {}).get("state")
+                == "SNAPSHOT_STORAGE_STATE_COMPLETED"
+                else None
+            )
+
+        suspended = self.wait(
+            "exact snapshot durable completion", durable_actor, timeout=120
+        )
         self.check(
             "actor suspended", suspended["status"]["state"], "ACTOR_STATE_SUSPENDED"
         )
         self.check(
             "assignment cleared", "workerAssignment" in suspended["status"], False
         )
-        self.snapshot(suspended)
+        self.snapshot(suspended, fidelity)
         if reopen:
             self.open_admission()
         return before, assignment, suspended

@@ -5,18 +5,19 @@ if [[ -n ${ATE_CONFIG:-} ]]; then
   exit 1
 fi
 ROOT=$(git rev-parse --show-toplevel)
-SUBSTRATE=${SUBSTRATE:-$ROOT/.amp/in/substrate-22acba54}
+SUBSTRATE=${SUBSTRATE:-$ROOT/.amp/in/substrate-6a67f431}
 export KIND_CLUSTER_NAME=${KIND_CLUSTER_NAME:-rig-ollama-e2e}
 export KUBECTL_CONTEXT=kind-$KIND_CLUSTER_NAME
 test "$KIND_CLUSTER_NAME" = rig-ollama-e2e
 REGISTRY=${REGISTRY:-rig-ollama-registry}
 REGISTRY_PORT=${REGISTRY_PORT:-15010}
-RUN_DIR=${RUN_DIR:-$ROOT/.amp/in/substrate-22acba54-run}
+RUN_DIR=${RUN_DIR:-$ROOT/.amp/in/substrate-6a67f431-run}
 mkdir -p "$RUN_DIR"
 export KUBECONFIG=$RUN_DIR/kubeconfig
+export ATE_RECORD_DIR=$RUN_DIR/install-records
 export KO_DOCKER_REPO=localhost:$REGISTRY_PORT KO_DEFAULTPLATFORMS=linux/amd64
-PIN=22acba54bd7a75e1e51b5a742f05306e2b13baba
-GATEWAY=ghcr.io/agentgateway/agentgateway:v0.0.0-alpha.f51a7fbc@sha256:2b9136f22df5b4b59244adbbc3381ae085c54f8bc2aa5c2b60fb0fa1c41e162c
+PIN=6a67f431e0f2d407eaaa73fa03756fac8a07ffcb
+GATEWAY=cr.agentgateway.dev/agentgateway:v1.7.0@sha256:60216aafb03d37f94e952ff3d51d2f630a65b10ecaebdc0a864882f92610c45b
 python3 - <<'PY'
 import platform
 version = tuple(map(int, platform.release().split('.')[:2]))
@@ -81,6 +82,7 @@ done
   go build -o bin/ate-setup ./cmd/ate-setup
   go build -o bin/kubectl-ate ./cmd/kubectl-ate
   ./hack/install-ate-kind.sh deploy ate-system --atenet-dataplane=agentgateway \
+    --ingress-allowed-spiffe-ids=spiffe://cluster.local/ns/rig-local/sa/rig-proof-client \
     --snapshot-location=gs://ate-snapshots/rig-poc/ \
     --credential-provider='{"enabled":false}' --rollout-timeout=10m
   ./hack/run-tool.sh ko build --base-import-paths ./cmd/ateworker-gvisor > "$RUN_DIR/worker-image.txt"
@@ -113,7 +115,7 @@ metadata:
   labels:
     ate.dev/api-access: 'true'
 ---
-apiVersion: ate.dev/v1alpha1
+apiVersion: ate.dev/v1
 kind: WorkerPool
 metadata:
   name: rig

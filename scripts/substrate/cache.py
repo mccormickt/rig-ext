@@ -104,7 +104,7 @@ try:
         event
         for event in rpc_receipts(
             api,
-            "/ateapi.Control/ResumeActor",
+            "/substrate.ateapi.v1.Control/ResumeActor",
             assignment["metadata"]["uid"],
             first["start"],
             first["time"],
@@ -116,7 +116,7 @@ try:
     second = warms[1]
     lookups = rpc_receipts(
         api,
-        "/ateapi.Control/ResumeActor",
+        "/substrate.ateapi.v1.Control/ResumeActor",
         assignment["metadata"]["uid"],
         second["start"],
         second["time"],
