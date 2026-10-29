@@ -8,8 +8,11 @@ compatibility with previous crate versions.
 Duroxide recordings cover all three continuation windows, parallel code-mode
 children with worker restart, and fast-branch progress with race-loser drain.
 Temporal recordings cover retry, approval, session steering, and code-mode
-child race/restart. Temporal still uses the typed Rig state machine; these
-histories do not prove Temporal runner integration.
+child race/restart. They use the shared persistent Rig runner and Temporal SDK
+1.1.0 on CLI 1.9.1 / server 1.32.0. The runner batch includes 36 executable
+calls, malformed siblings and a malformed-only turn, repeated provider IDs,
+out-of-order completion, and worker restart. SDK nondeterministic-future
+detection stays enabled in workers and replay.
 
 Record to a new directory with the existing test export hooks:
 
@@ -24,6 +27,7 @@ cargo test -p rig-durable --all-features --test temporal temporal_retries_tools_
 cargo test -p rig-durable --all-features --test temporal temporal_approval_executes_only_approved_tools -- --ignored
 cargo test -p rig-durable --all-features --test temporal temporal_session_serializes_updates_and_drains_active_steering_on_close -- --ignored
 cargo test -p rig-durable --all-features --test temporal temporal_code_mode_out_of_order_child_race_restart_and_replay -- --ignored
+cargo test -p rig-durable --all-features --test temporal temporal_runner_sparse_batch_restart_and_malformed_outcomes -- --ignored
 ```
 
 Replace these recordings when the implementation changes. Replay needs no

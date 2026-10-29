@@ -35,7 +35,11 @@ use temporalio_client::{
     envconfig::LoadClientConfigProfileOptions, errors::WorkflowUpdateError,
 };
 use temporalio_common::HasWorkflowDefinition;
-use temporalio_sdk::{Runtime, Worker, WorkerOptions};
+use temporalio_sdk::{
+    Runtime, Worker, WorkerOptions,
+    testing::{EphemeralExe, LocalWorkflowEnvironmentOptions, WorkflowEnvironment},
+    workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions},
+};
 use tokio::sync::Notify;
 
 #[derive(Deserialize)]
@@ -131,6 +135,328 @@ async fn live_client() -> (Runtime, Client) {
     let connection = Connection::connect(connection_options).await.unwrap();
     let client = Client::new(connection, client_options).unwrap();
     (runtime, client)
+}
+
+fn local_environment_options() -> LocalWorkflowEnvironmentOptions {
+    let executable = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("temporal"))
+        .find(|path| path.is_file())
+        .expect("Temporal CLI must be on PATH");
+    LocalWorkflowEnvironmentOptions::builder()
+        .server_executable(EphemeralExe::ExistingPath(
+            executable.to_string_lossy().into_owned(),
+        ))
+        .build()
+}
+
+#[tokio::test]
+#[ignore = "requires the Temporal CLI on PATH"]
+async fn temporal_runner_sparse_batch_restart_and_malformed_outcomes() {
+    use rig::message::{ToolCall, ToolFunction, ToolName};
+    use temporalio_common::protos::temporal::api::history::v1::history_event::Attributes;
+
+    let env = WorkflowEnvironment::start_local(local_environment_options())
+        .await
+        .unwrap();
+    let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+    let client = env.client();
+    let call = |name: &str, args| {
+        AssistantContent::ToolCall(ToolCall::from_wire(
+            "reused-provider-id",
+            ToolFunction::new(ToolName::new(name).unwrap(), args),
+        ))
+    };
+    let mut calls = vec![
+        call("lookup", serde_json::json!("invalid")),
+        call("blocking_lookup", serde_json::json!({"key":"slow"})),
+    ];
+    // Exercise the SDK join's large-batch path and settlements after a missing
+    // earlier sibling. Provider IDs cannot identify these logical calls.
+    calls.extend((2..37).map(|index| call("lookup", serde_json::json!({"key":index.to_string()}))));
+    calls.push(call("lookup", serde_json::json!([1, 2])));
+    let model = MockCompletionModel::from_turns([
+        MockTurn::from_contents(calls),
+        MockTurn::from_contents([call("lookup", serde_json::json!("invalid again"))]),
+        MockTurn::text("complete"),
+    ]);
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let make_agent = || {
+        TemporalAgent::new(model.clone())
+            .tool(BlockingLookup {
+                started: started.clone(),
+                release: release.clone(),
+            })
+            .tool(FlakyLookup {
+                attempts: attempts.clone(),
+                fail_until: 0,
+                invocations: invocations.clone(),
+            })
+    };
+    let queue = format!("runner-batch-{}", uuid::Uuid::new_v4());
+    let agent = make_agent();
+    let input = agent.input("run batch");
+    let mut options = WorkerOptions::new(&queue).build();
+    assert!(options.detect_nondeterministic_futures);
+    agent.register(&mut options).unwrap();
+    let mut worker = Worker::new(&runtime, client.clone(), options).unwrap();
+    let stop = worker.shutdown_handle();
+    let run = async {
+        let handle = client
+            .start_workflow(
+                TemporalAgentWorkflow::run,
+                input,
+                WorkflowStartOptions::new(&queue, &queue).build(),
+            )
+            .await
+            .unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(45), async {
+            started.notified().await;
+            loop {
+                let events = handle
+                    .fetch_history(Default::default())
+                    .into_events()
+                    .await
+                    .unwrap();
+                let completed = events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event.attributes,
+                            Some(Attributes::ActivityTaskCompletedEventAttributes(_))
+                        )
+                    })
+                    .count();
+                if completed == 36 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            completed.is_ok(),
+            "fast siblings did not commit: {}",
+            String::from_utf8_lossy(
+                &handle
+                    .fetch_history(Default::default())
+                    .to_json()
+                    .await
+                    .unwrap()
+            )
+        );
+        assert_eq!(model.requests().len(), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 35);
+        stop();
+        release.notify_one();
+        handle
+    };
+    let (result, handle) = tokio::join!(worker.run(), run);
+    result.unwrap();
+    let before = invocations.lock().unwrap().clone();
+    let mut options = WorkerOptions::new(&queue).build();
+    make_agent().register(&mut options).unwrap();
+    let mut worker = Worker::new(&runtime, client.clone(), options).unwrap();
+    let stop = worker.shutdown_handle();
+    let finish = async {
+        let response = tokio::time::timeout(
+            Duration::from_secs(45),
+            handle.get_result(Default::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.output(), "complete");
+        let outcomes = handle
+            .query(TemporalAgentWorkflow::tool_outcomes, (), Default::default())
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 39);
+        for (index, outcome) in outcomes.iter().enumerate() {
+            assert_eq!(
+                (outcome.prompt_index, outcome.turn, outcome.call_index),
+                if index == 38 {
+                    (0, 2, 0)
+                } else {
+                    (0, 1, index)
+                }
+            );
+            assert_eq!(
+                (outcome.disposition, outcome.source),
+                if [0, 37, 38].contains(&index) {
+                    (ToolDisposition::Error, OutcomeSource::Preresolved)
+                } else {
+                    (ToolDisposition::Success, OutcomeSource::Retained)
+                }
+            );
+        }
+        stop();
+    };
+    let (result, ()) = tokio::join!(worker.run(), finish);
+    result.unwrap();
+    assert_eq!(
+        *invocations.lock().unwrap(),
+        before,
+        "settled siblings must not execute on restart"
+    );
+    let mut indices = before
+        .iter()
+        .map(|call| call.logical_key.as_ref().unwrap().call_index)
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+    assert_eq!(indices, (2..37).collect::<Vec<_>>());
+    let requests = model.requests();
+    assert_eq!(requests.len(), 3);
+    for request in requests.iter().skip(1) {
+        rig::conversation::pairing::validate(&request.chat_history).unwrap();
+    }
+    let feedback = serde_json::to_string(&requests[1].chat_history).unwrap();
+    for index in 2..37 {
+        assert!(
+            feedback.contains(&format!("{index}=available")),
+            "{feedback}"
+        );
+    }
+    assert!(feedback.contains("slow=released"));
+    let history = handle
+        .fetch_history(Default::default())
+        .to_json()
+        .await
+        .unwrap();
+    if let Ok(directory) = std::env::var("RIG_DURABLE_RECORD_DIR") {
+        std::fs::write(format!("{directory}/temporal-runner-batch.json"), &history).unwrap();
+    }
+    let mut options = WorkflowReplayerOptions::new().namespace("default").build();
+    assert!(options.detect_nondeterministic_futures);
+    options
+        .register_workflow::<TemporalAgentWorkflow>()
+        .unwrap();
+    WorkflowReplayer::new(options)
+        .unwrap()
+        .replay_workflow(temporalio_client::WorkflowHistory::from_json(&history).unwrap())
+        .await
+        .unwrap();
+    env.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the Temporal CLI on PATH"]
+async fn temporal_runner_cancellation_during_approval_and_tools() {
+    let env = WorkflowEnvironment::start_local(local_environment_options())
+        .await
+        .unwrap();
+    let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+    for route in [
+        "approval",
+        "tool",
+        #[cfg(feature = "codemode")]
+        "codemode",
+    ] {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let turn = if route == "codemode" {
+            MockTurn::tool_call(
+                "script",
+                "codemode",
+                serde_json::json!({
+                    "code":"return await tools.blocking_lookup({key: 'x'});"
+                }),
+            )
+        } else {
+            MockTurn::tool_call("blocked", "blocking_lookup", serde_json::json!({"key":"x"}))
+        };
+        let model = MockCompletionModel::from_turns([turn, MockTurn::text("must not run")]);
+        let tool = BlockingLookup {
+            started: started.clone(),
+            release: release.clone(),
+        };
+        let agent = TemporalAgent::new(model.clone());
+        let agent = if route == "approval" {
+            agent.approval_tool(tool)
+        } else {
+            agent.tool(tool)
+        };
+        #[cfg(feature = "codemode")]
+        let agent = if route == "codemode" {
+            agent.code_mode(Default::default())
+        } else {
+            agent
+        };
+        let input = agent.input("cancel this run");
+        let queue = format!("cancel-{}", uuid::Uuid::new_v4());
+        let mut options = WorkerOptions::new(&queue).build();
+        agent.register(&mut options).unwrap();
+        let mut worker = Worker::new(&runtime, env.client().clone(), options).unwrap();
+        let stop = worker.shutdown_handle();
+        let run = async {
+            let handle = env
+                .client()
+                .start_workflow(
+                    TemporalAgentWorkflow::run,
+                    input,
+                    WorkflowStartOptions::new(&queue, &queue).build(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                if route == "approval" {
+                    loop {
+                        if matches!(
+                            handle
+                                .query(TemporalAgentWorkflow::status, (), Default::default())
+                                .await
+                                .unwrap(),
+                            TemporalAgentStatus::Approval { .. }
+                        ) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                } else {
+                    started.notified().await;
+                }
+            })
+            .await
+            .unwrap();
+            handle.cancel(Default::default()).await.unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                handle.get_result(Default::default()),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    result,
+                    Err(temporalio_client::errors::WorkflowGetResultError::Cancelled { .. })
+                ),
+                "expected cancellation, got {result:?}"
+            );
+            assert_eq!(model.requests().len(), 1);
+            let history = handle
+                .fetch_history(Default::default())
+                .to_json()
+                .await
+                .unwrap();
+            stop();
+            release.notify_one();
+            history
+        };
+        let (result, history) = tokio::join!(worker.run(), run);
+        result.unwrap();
+        let mut options = WorkflowReplayerOptions::new().namespace("default").build();
+        options
+            .register_workflow::<TemporalAgentWorkflow>()
+            .unwrap();
+        WorkflowReplayer::new(options)
+            .unwrap()
+            .replay_workflow(temporalio_client::WorkflowHistory::from_json(&history).unwrap())
+            .await
+            .unwrap();
+    }
+    env.shutdown().await.unwrap();
 }
 
 #[cfg(feature = "codemode")]
@@ -1248,27 +1574,24 @@ fn temporal_registration_fails_closed_on_missing_contract_or_guard() {
 }
 
 #[test]
-fn temporal_inputs_recorded_before_policies_keep_the_legacy_contract() {
+fn temporal_input_requires_an_explicit_invocation_contract() {
     let agent = TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::text("done")]))
         .tool(MockAddTool);
     let fresh = agent.input("hello");
     assert_eq!(fresh.config.contract, InvocationContract::Logical);
 
-    // An input recorded before contracts and policies existed has neither field.
-    let mut recorded = serde_json::to_value(&fresh).unwrap();
-    recorded["config"]
+    let mut input = serde_json::to_value(&fresh).unwrap();
+    input["config"]
         .as_object_mut()
         .unwrap()
         .remove("contract")
         .expect("new inputs carry the contract");
-    recorded["config"]["tools"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("policy")
-        .expect("new inputs carry the policy");
-    let input: TemporalAgentInput = serde_json::from_value(recorded).unwrap();
-    assert_eq!(input.config.contract, InvocationContract::Legacy);
-    assert_eq!(input.config.tools[0].policy, ToolPolicy::default());
+    assert!(
+        serde_json::from_value::<TemporalAgentInput>(input)
+            .unwrap_err()
+            .to_string()
+            .contains("missing field `contract`")
+    );
 }
 
 #[tokio::test]
@@ -1520,20 +1843,19 @@ async fn full_audit_bytes_limit_admission_and_completed_prompts_after_compaction
 }
 
 #[tokio::test]
-#[ignore = "requires a Temporal dev server on port 7234 with limit.historyCount.suggestContinueAsNew=12"]
+#[ignore = "requires the Temporal CLI on PATH"]
 async fn continuation_preserves_failed_compaction_and_execution_chain_identity() {
-    let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
-    let (mut connection_options, client_options) =
-        ClientOptions::load_from_config(LoadClientConfigProfileOptions::default()).unwrap();
-    connection_options.target = std::env::var("TEMPORAL_CONTINUATION_ADDRESS")
-        .unwrap_or_else(|_| "http://localhost:7234".into())
-        .parse()
+    use temporalio_common::protos::temporal::api::history::v1::history_event::Attributes;
+    let mut environment_options = local_environment_options();
+    environment_options.extra_args = vec![
+        "--dynamic-config-value".into(),
+        "limit.historyCount.suggestContinueAsNew=12".into(),
+    ];
+    let env = WorkflowEnvironment::start_local(environment_options)
+        .await
         .unwrap();
-    let client = Client::new(
-        Connection::connect(connection_options).await.unwrap(),
-        client_options,
-    )
-    .unwrap();
+    let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+    let client = env.client();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     let model = MockCompletionModel::from_turns([
         MockTurn::tool_call("same", "lookup", serde_json::json!({"key":"x"})),
@@ -1625,9 +1947,42 @@ async fn continuation_preserves_failed_compaction_and_execution_chain_identity()
         );
         close(&handle).await;
         shutdown();
+        initial
     };
-    let (result, ()) = tokio::join!(worker.run(), run);
+    let (result, mut history_handle) = tokio::join!(worker.run(), run);
     result.unwrap();
+    let mut windows = 0;
+    loop {
+        let events = history_handle
+            .fetch_history(Default::default())
+            .into_events()
+            .await
+            .unwrap();
+        let next = events.iter().find_map(|event| match &event.attributes {
+            Some(Attributes::WorkflowExecutionContinuedAsNewEventAttributes(attributes)) => {
+                Some(attributes.new_execution_run_id.clone())
+            }
+            _ => None,
+        });
+        let mut options = WorkflowReplayerOptions::new().namespace("default").build();
+        options
+            .register_workflow::<TemporalAgentSessionWorkflow>()
+            .unwrap();
+        WorkflowReplayer::new(options)
+            .unwrap()
+            .replay_workflow(history_handle.fetch_history(Default::default()))
+            .await
+            .unwrap();
+        windows += 1;
+        let Some(next) = next else {
+            break;
+        };
+        let mut info = history_handle.info().clone();
+        info.run_id = Some(next);
+        history_handle = WorkflowHandle::new(client.clone(), info);
+    }
+    assert!(windows >= 2, "replay must cover continue-as-new");
+    env.shutdown().await.unwrap();
     let calls = invocations.lock().unwrap();
     assert_eq!(calls.len(), 2);
     let first = calls[0].logical_key.as_ref().unwrap();

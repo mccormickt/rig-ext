@@ -1,7 +1,9 @@
 //! Temporal-backed durable Rig agents.
 //!
-//! The workflow owns Rig's deterministic [`AgentRun`] state machine. Model and
-//! tool I/O runs in Temporal activities registered from [`TemporalAgent`].
+//! The workflow rebuilds [`Run`] from its input and Temporal history. Its pure
+//! planner runs Rig without backend futures or external I/O. Every replay issues
+//! the same typed activity and child commands; no external Rig log replaces
+//! Temporal history. Model and tool I/O runs in registered activities.
 //! Enable the `temporal` Cargo feature. Use `default-features = false` if the
 //! application does not use Duroxide or SQLite.
 //!
@@ -71,7 +73,7 @@ use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use rig::{
     DynModel,
-    agent::{AgentRun, PromptResponse},
+    agent::PromptResponse,
     completion::{CompletionRequest, Message, ToolDefinition},
     message::{ToolChoice, UserContent},
     operation::Completion,
@@ -99,6 +101,7 @@ use crate::{
     guard::InvocationGuardStore,
     identity::{AttemptMetadata, LogicalCallKey},
     outcome::{CallPosition, DurableResponse, ToolOutcome},
+    persistent::Run,
     policy::ToolPolicy,
     submission::{
         Admission, DEFAULT_LEDGER_MAX_BYTES, SessionAvailability, Submission, SubmissionError,
@@ -125,10 +128,8 @@ pub struct TemporalAgentConfig {
     pub activity_timeout_secs: u64,
     pub activity_max_attempts: u32,
     pub session_history_max_bytes: usize,
-    /// Tool activity contract. An omitted field deserializes as
-    /// [`InvocationContract::Legacy`]; inputs built by
-    /// [`TemporalAgent`] use [`InvocationContract::Logical`].
-    #[serde(default)]
+    /// Tool activity contract. Inputs built by [`TemporalAgent`] use
+    /// [`InvocationContract::Logical`].
     pub contract: InvocationContract,
     /// Completed-prompt compaction for session workflows. `None` disables it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1521,7 +1522,7 @@ where
 {
     ctx.state_mut(|workflow| workflow.runtime_mut().outcomes.clear());
     let config = input.config;
-    let mut agent = AgentRun::new(input.prompt)
+    let mut agent = Run::new(input.prompt)
         .with_history(input.history)
         .max_turns(config.max_turns);
     let mut prompt_index = allocate_prompt_index(ctx)?;
@@ -1616,9 +1617,12 @@ where
                 .collect::<Result<Vec<_>, _>>()?;
                 let (results, outcomes): (Vec<_>, Vec<_>) = results.into_iter().unzip();
                 ctx.state_mut(|workflow| workflow.runtime_mut().outcomes.extend(outcomes));
-                driver::temporal_tool_results(&mut agent, results).map_err(workflow_error)?;
+                agent.tool_results(results).map_err(workflow_error)?;
             }
             driver::Effect::Done(response) => {
+                ctx.state_mut(|workflow| {
+                    agent.complete_outcomes(prompt_index, &mut workflow.runtime_mut().outcomes)
+                });
                 let history = agent.full_history();
                 ctx.state_mut(|workflow| workflow.record_history(history.clone()))
                     .map_err(workflow_error)?;
@@ -1638,7 +1642,7 @@ where
                     return Ok(DurableResponse::new(response, outcomes));
                 };
                 prompt_index = allocate_prompt_index(ctx)?;
-                agent = AgentRun::new(prompt)
+                agent = Run::new(prompt)
                     .with_history(history)
                     .max_turns(config.max_turns);
                 model_turn = 0;
@@ -1770,9 +1774,7 @@ async fn execute_tool<W>(
             match serde_json::from_value::<crate::codemode::ScriptInput>(serde_json::Value::Object(
                 call.function.arguments.clone(),
             )) {
-                Ok(input) => Ok(run_code_mode(ctx, config, code_mode, input.code, position)
-                    .await
-                    .map_err(workflow_error)?),
+                Ok(input) => Ok(run_code_mode(ctx, config, code_mode, input.code, position).await?),
                 Err(_) => Err("code-mode requires a string code argument".into()),
             }
         } else {
@@ -1933,7 +1935,7 @@ async fn run_code_mode<W>(
     code_mode: &crate::codemode::CodeModeConfig,
     code: String,
     parent: CallPosition,
-) -> Result<rig::tool::ToolOutput, String> {
+) -> WorkflowResult<rig::tool::ToolOutput> {
     let report = crate::codemode::run(
         code,
         code_mode.limits,
@@ -1974,10 +1976,14 @@ async fn run_code_mode<W>(
             crate::codemode::activity_result(output, &call.name)
         },
     )
-    .await?;
+    .await;
+    if ctx.cancellation_token().is_cancelled() {
+        return Err(temporalio_sdk::WorkflowTermination::cancelled());
+    }
+    let report = report.map_err(workflow_error)?;
     serde_json::to_value(report)
         .map(rig::tool::ToolOutput::json)
-        .map_err(|error| error.to_string())
+        .map_err(workflow_error)
 }
 
 fn activity_options(config: &TemporalAgentConfig) -> ActivityOptions {

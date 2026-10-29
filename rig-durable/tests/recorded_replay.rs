@@ -45,6 +45,7 @@ async fn temporal_replays_recorded_retries_approval_and_steering() {
         include_bytes!("fixtures/replay/temporal-retry.json").as_slice(),
         include_bytes!("fixtures/replay/temporal-approval.json").as_slice(),
         include_bytes!("fixtures/replay/temporal-steering.json").as_slice(),
+        include_bytes!("fixtures/replay/temporal-runner-batch.json").as_slice(),
     ]
     .into_iter()
     .enumerate()

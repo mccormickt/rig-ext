@@ -21,7 +21,7 @@ native backends. Use only `durable-object` on `wasm32-unknown-unknown`.
 
 ## Persistent Rig runner
 
-Duroxide and Durable Objects use `persistent::Run`, backed by Rig 0.45's
+Duroxide, Temporal, and Durable Objects use `persistent::Run`, backed by Rig 0.45's
 `AgentRunner::resume`, custom `Serve` handlers, `EffectLogRecorder`, replay
 stamps, and by-ID `EffectLogReplayer`. The runner plans work without I/O.
 Backend adapters retain durable admission, independent settlement, approvals,
@@ -31,13 +31,16 @@ stays in `SchedulerState`.
 Each prompt retains its initial Rig seed and incrementally added effect records.
 Sparse recovery can replay a later settled call while an earlier call remains
 pending. Replay work has a local poll budget; prompt turn limits and backend
-payload limits also apply. The complete prompt log is part of the backend
-checkpoint, not a separate unbounded journal. Prompt boundaries discard it.
+payload limits also apply. SQL and Duroxide checkpoints include the complete
+prompt log; Temporal rebuilds it from command results in workflow history.
+Prompt boundaries discard the in-memory log.
 See [architecture](docs/guide.md#architecture) for storage costs and limits.
 
-Temporal still uses Rig's typed state-machine API. Its runner adoption is a
-separate step; the shared planner requires no `Send` workflow context and never
-polls backend futures. Temporal must retain SDK-owned command replay.
+Temporal SDK 1.1 rebuilds each run from workflow input and history. The shared
+planner requires no `Send` workflow context and never polls backend futures.
+SDK-owned command replay remains the execution authority; an external Rig log
+cannot replace activity or child commands. Nondeterministic-future detection
+stays enabled.
 
 This crate is pre-release. Persisted state and workflow histories are not
 compatible across crate or Rig upgrades. Use fresh executions and storage when

@@ -60,6 +60,7 @@ rig-codemode = { path = "../rig-codemode", features = ["quickjs"], optional = tr
 duroxide = { workspace = true, features = ["sqlite"] }
 rig = { workspace = true, features = ["test-utils"] }
 temporalio-client.workspace = true
+temporalio-sdk = { workspace = true, features = ["testing"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 

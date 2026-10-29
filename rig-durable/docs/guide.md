@@ -94,7 +94,7 @@ without `sqlite-vec`. Native conformance tests use the same engine with
 
 ## Temporal
 
-The Temporal integration runs Rig's `AgentRun` state machine as a workflow.
+The Temporal integration uses SDK 1.1 and Rig's shared `persistent::Run` planner.
 Each model request and each tool call is a Temporal activity. Tool calls from
 one model turn are scheduled concurrently and their results retain model
 emission order. Activity retries and timeouts use Temporal policies. Human
@@ -207,16 +207,15 @@ history, idle steering, closing, payload limits, registration validation,
 guarded and idempotent writes across an activity timeout, submission
 deduplication, follow-up and reject-if-busy admission during a tool round,
 completed-prompt compaction, a failed summary, ordered tool dispositions, and
-a failed submission closing the session. Configure a server
-with the standard Temporal environment variables before running it. The live
-continuation test also needs a disposable server with a low continuation
-threshold (default address `http://localhost:7234`, overridden by
-`TEMPORAL_CONTINUATION_ADDRESS`):
-
-```bash
-temporal server start-dev --port 7234 --headless \
-  --dynamic-config-value limit.historyCount.suggestContinueAsNew=12
-```
+a failed submission closing the session. Runner tests start a disposable server
+with `WorkflowEnvironment::start_local` and require the Temporal CLI on `PATH`.
+They cover malformed-only turns, mixed batches with repeated provider IDs,
+settled later siblings while an earlier call is blocked, worker restart, exact
+call positions and dispositions, cancellation, and fresh history replay with
+nondeterministic-future detection enabled. Configure a server
+with the standard Temporal environment variables for the other live tests.
+The continuation test starts its own disposable server with a low history
+threshold and replays each run in the resulting chain.
 
 ```bash
 TEMPORAL_ADDRESS=temporal.example.com:443 TEMPORAL_TLS=true \
@@ -494,16 +493,20 @@ Rig agent are not supported.
 
 Duroxide retains `ctx.join`; the Durable Object engine retains SQL intents,
 independent sibling settlements, alarms, and child receipt/poll protocols.
-Code-mode guest scheduling remains solely in `SchedulerState`. The Temporal
-adapter currently uses Rig's typed `AgentRun` API. Its runner integration can
-use the same synchronous planner with its local workflow context, but must
-still issue every SDK activity and child command during workflow replay.
-It must not restore an external log to skip SDK commands.
-The typed Temporal bridge answers malformed calls without executing them, but
-does not retain their detailed dispositions. Runner adoption must use
-`Run::complete_outcomes` at prompt completion to include those dispositions.
+Code-mode guest scheduling remains solely in `SchedulerState`. Temporal rebuilds
+`Run` from workflow input and issues every typed SDK activity and child command
+during replay. SDK `join_all` retains concurrent tool results in call order;
+signals and updates use workflow state and `wait_condition`. The synchronous
+planner polls only Rig's local replay handlers. It neither captures Temporal's
+local context nor polls backend command futures, and it cannot wake a workflow
+from an external source. Keep SDK nondeterministic-future detection enabled.
+No external recorder or hook I/O runs inside a workflow. Context-value scopes
+are runtime-only, not persistent storage. `Run::complete_outcomes` retains
+malformed-call dispositions at each completed prompt boundary.
 
-The initial seed and full effect requests remain in the prompt checkpoint.
+SQL and Duroxide checkpoints retain the initial seed and full effect requests.
+Temporal reconstructs this replay window from its recorded command results;
+it does not load a separate persistent Rig log.
 Replay is bounded by a poll budget based on recorded dispatches and tool calls,
 and the configured model-turn limit. A long prompt costs more storage and replay
 time; continue-as-new does not truncate its Rig log. Native single-run
