@@ -1,0 +1,25 @@
+[package]
+name = "rig-native-prototype"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Keep the experiment independent of the production adapters' Rig version.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+rig-agent = { version = "=0.45.0", default-features = false }
+rig-core = { version = "=0.45.0", default-features = false }
+rig-cassette = { version = "=0.45.0", features = ["agent"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
