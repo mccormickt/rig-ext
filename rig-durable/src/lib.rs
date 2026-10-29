@@ -110,15 +110,15 @@
 //! - Duroxide checkpoints and Temporal continue-as-new limit event-history
 //!   windows. They do not remove the transcript or deduplication receipts.
 //!
-//! # Preserve recorded histories
+//! # Execution configuration
 //!
 //! [`InvocationContract::Logical`] records configuration snapshots for new
 //! top-level Duroxide runs and is the default for new Temporal inputs.
-//! Duroxide defaults to [`InvocationContract::Legacy`] for recorded-history
-//! replay. Keep the required agent versions and tool implementations registered
-//! while their histories are live. Child and raw Duroxide starts resolve their
-//! registered configuration until a checkpoint captures a snapshot; raw callers
-//! can also supply one explicitly. The crate is unreleased at version `0.1.0`.
+//! Duroxide defaults to [`InvocationContract::Legacy`], which uses minimal
+//! payloads with application-managed replay safety. Child and raw starts resolve
+//! their registered configuration until a checkpoint captures a snapshot; raw
+//! callers can also supply one explicitly. The crate is pre-release and does not
+//! support persisted state or workflow histories across crate or Rig upgrades.
 
 pub mod activities;
 pub mod activity_types;
@@ -140,6 +140,7 @@ pub mod names;
 #[cfg(feature = "duroxide")]
 pub mod orchestration;
 pub mod outcome;
+pub mod persistent;
 pub mod policy;
 #[cfg(feature = "duroxide")]
 pub mod registry;

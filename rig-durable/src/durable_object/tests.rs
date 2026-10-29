@@ -164,6 +164,62 @@ async fn tools_and_deduplication_survive_reopen() -> Result<(), Error> {
 }
 
 #[tokio::test]
+async fn malformed_calls_keep_outcomes_and_valid_sibling_positions() -> Result<(), Error> {
+    for valid_sibling in [false, true] {
+        let mut calls = vec![rig::message::AssistantContent::ToolCall(
+            rig::message::ToolCall::from_wire(
+                "bad",
+                rig::message::ToolFunction::new(
+                    rig::message::ToolName::new("add").unwrap(),
+                    serde_json::json!("not an object"),
+                ),
+            ),
+        )];
+        if valid_sibling {
+            calls.push(rig::message::AssistantContent::ToolCall(
+                rig::message::ToolCall::from_wire(
+                    "good",
+                    rig::message::ToolFunction::new(
+                        rig::message::ToolName::new("add").unwrap(),
+                        serde_json::json!({"x":7,"y":2}),
+                    ),
+                ),
+            ));
+        }
+        let model = MockCompletionModel::from_turns([
+            MockTurn::from_contents(calls),
+            MockTurn::text("handled"),
+        ]);
+        let engine = Builder::new(model.clone()).tool(MockAddTool).build(
+            Database::new()?,
+            Clock::default(),
+            "malformed",
+        )?;
+        engine.submit(SubmitInput::new("r", "add")).await?;
+        let result = engine.wait("r").await?.unwrap();
+        assert_eq!(result.output(), "handled");
+        assert_eq!(
+            result.tool_outcomes.len(),
+            if valid_sibling { 2 } else { 1 }
+        );
+        assert_eq!(result.tool_outcomes[0].call_index, 0);
+        assert_eq!(
+            result.tool_outcomes[0].source,
+            crate::OutcomeSource::Preresolved
+        );
+        if valid_sibling {
+            assert_eq!(result.tool_outcomes[1].call_index, 1);
+            assert_eq!(
+                result.tool_outcomes[1].disposition,
+                crate::ToolDisposition::Success
+            );
+        }
+        rig::conversation::pairing::validate(&model.requests()[1].chat_history).unwrap();
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn admission_and_rollback() -> Result<(), Error> {
     let engine = Builder::new(MockCompletionModel::from_turns([MockTurn::text("ok")])).build(
         Database::new()?,
@@ -502,7 +558,7 @@ async fn compaction_precedes_queued_prompt() -> Result<(), Error> {
         MockTurn::text("summary two"),
     ]);
     let compaction = Compaction::new(
-        rig_memory::SlidingWindowMemory::last_messages(2),
+        rig_memory::recent::LastMessages(2),
         crate::ModelCompactor::new(summary.clone()),
     );
     let engine = Builder::new(model.clone()).compaction(compaction).build(
@@ -1451,16 +1507,16 @@ mod scripts {
     #[tokio::test]
     async fn near_full_outer_script_intent_does_not_abandon_sibling() -> Result<(), Error> {
         for (padding, retained) in [
-            (523300, false),
-            (523429, false),
-            (523850, false),
-            (523850, true),
+            (523268, false),
+            (523397, false),
+            (523818, false),
+            (523818, true),
         ] {
             let slow = Namespace::new("slow answer")?;
             let fast = Namespace::new("fast answer")?;
-            let returned = if padding == 523300 {
+            let returned = if padding == 523268 {
                 "'x'.repeat(10000)"
-            } else if padding == 523429 {
+            } else if padding == 523397 {
                 "await tools.fast({})"
             } else {
                 "'normal'"
@@ -1490,7 +1546,7 @@ mod scripts {
             };
             let db = Database::new()?;
             let clock = Clock::default();
-            if padding == 523429 {
+            if padding == 523397 {
                 clock.now.set(1_700_000_000_000);
             }
             let mut parent = builder(model.clone(), &slow, &fast, limits, NativeReplayPlanner)?
@@ -1500,7 +1556,7 @@ mod scripts {
                 .submit(SubmitInput::new("r", "near-full outer"))
                 .await?;
             let result = parent.drive().await;
-            if padding == 523429 {
+            if padding == 523397 {
                 result?;
                 assert!(parent.status()?.busy);
                 assert_eq!(fast.engines.borrow().len(), 1);
@@ -1518,7 +1574,7 @@ mod scripts {
                 assert_eq!(model.requests().len(), 2);
                 continue;
             }
-            if padding == 523300 {
+            if padding == 523268 {
                 result?;
                 assert!(parent.status()?.busy);
                 assert!(parent.result("r")?.is_none());
@@ -1964,7 +2020,7 @@ mod scripts {
             let create = || {
                 Builder::new(model.clone())
                     .tool_with(gate.clone(), ToolOptions::default().policy(policy.clone()))
-                    .session_history_max_bytes(8192)
+                    .session_history_max_bytes(16384)
                     .code_mode(Limits::default(), NativeReplayPlanner)
             };
             let parent = create().build(db.clone(), Clock::default(), "parent")?;
@@ -2411,6 +2467,7 @@ fn child_tool() -> rig::completion::ToolDefinition {
         name: rig::message::ToolName::new("helper").unwrap(),
         description: "Run the helper agent".into(),
         parameters: serde_json::json!({"type":"object"}),
+        annotations: Default::default(),
     }
 }
 
@@ -3002,6 +3059,64 @@ impl Tool for LargeOutput {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok("é".repeat(150_000))
     }
+}
+
+#[tokio::test]
+async fn runner_window_reserves_settlement_space_and_bounds_large_tool_results() -> Result<(), Error>
+{
+    let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let model = MockCompletionModel::from_turns([
+        MockTurn::tool_call("large", "large", serde_json::json!({})),
+        MockTurn::text("bounded answer"),
+    ]);
+    let db = Database::new()?;
+    let build = || {
+        Builder::new(model.clone())
+            .tool(LargeOutput(effects.clone()))
+            .session_history_max_bytes(16 * 1024)
+    };
+    let engine = build().build(db.clone(), Clock::default(), "bounded")?;
+    engine.submit(SubmitInput::new("r", "large result")).await?;
+    engine.drive().await?;
+    assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        engine.result("r")?.unwrap().tool_outcomes[0].disposition,
+        crate::ToolDisposition::Error
+    );
+    assert!(serde_json::to_string(&model.requests()[1].chat_history)?.contains(STORAGE_FAILURE));
+    drop(engine);
+    let engine = build().build(db, Clock::default(), "bounded")?;
+    assert_eq!(engine.wait("r").await?.unwrap().output(), "bounded answer");
+    assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(model.requests().len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_limit_does_not_cancel_admitted_tools_during_capacity_planning() -> Result<(), Error> {
+    let gate = GateTool::new();
+    gate.block.store(false, std::sync::atomic::Ordering::SeqCst);
+    let model = MockCompletionModel::from_turns([MockTurn::tool_call(
+        "gate",
+        "gate",
+        serde_json::json!({"value": 8}),
+    )]);
+    let db = Database::new()?;
+    let build = || Builder::new(model.clone()).tool(gate.clone()).max_turns(1);
+    let engine = build().build(db.clone(), Clock::default(), "limited")?;
+    engine.submit(SubmitInput::new("r", "run once")).await?;
+    assert!(matches!(engine.drive().await, Err(Error::Invalid(_))));
+    assert_eq!(gate.count(), 1);
+    assert!(matches!(
+        engine.status()?.receipts[0].state,
+        SubmissionState::Failed { .. }
+    ));
+    drop(engine);
+    let engine = build().build(db, Clock::default(), "limited")?;
+    engine.drive().await?;
+    assert_eq!(gate.count(), 1);
+    assert_eq!(model.requests().len(), 1);
+    Ok(())
 }
 
 #[tokio::test]

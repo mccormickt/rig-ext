@@ -132,13 +132,9 @@ async fn main() -> anyhow::Result<()> {
         && let rig_a2a::SendMessageResponse::Task(task) = *reply
     {
         println!("remote state: {:?}", task.status.state);
-        // An AwaitingModel run needs the issued call's response before it can
-        // advance. A host must persist that response with its pending run.
-        run.model_response(ModelTurn::from_response_parts(
-            &response,
-            Default::default(),
-            Default::default(),
-        ))?;
+        // Save the issued call's response before resuming, so the runner does
+        // not repeat it. A host persists the response with its pending run.
+        run.model_response(ModelTurn::from_policy(&response, Default::default()))?;
         run.retry_model_turn(RetryRequest::Feedback("README.md".into()))?;
         println!(
             "checkpoint: {} model turn recorded",
@@ -177,11 +173,14 @@ async fn main() -> anyhow::Result<()> {
     // tool call. Registering local tools would advertise tools that can never
     // be invoked, so the request is refused instead.
     let mut with_tools = rig_core::completion::CompletionRequest::new("hi");
-    with_tools.tools.push(rig_core::completion::ToolDefinition {
-        name: rig_core::message::ToolName::new("add")?,
-        description: "adds two numbers".to_string(),
-        parameters: serde_json::json!({}),
-    });
+    with_tools
+        .tools
+        .push(std::sync::Arc::new(rig_core::completion::ToolDefinition {
+            name: rig_core::message::ToolName::new("add")?,
+            description: "adds two numbers".to_string(),
+            parameters: serde_json::json!({}),
+            annotations: Default::default(),
+        }));
     match remote.model().completion(with_tools).await {
         Ok(_) => println!("unexpectedly accepted a tool-bearing request"),
         Err(error) => println!("refused, as intended: {error}"),

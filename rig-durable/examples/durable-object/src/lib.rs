@@ -31,7 +31,7 @@ struct Calculator;
 
 impl Transport<MockScript> for Calculator {
     fn send(&self, request: CompletionRequest, _exchange: Exchange) -> Opening<MockFrame> {
-        let has_result = matches!(request.chat_history.last(), Some(Message::User { content })
+        let has_result = matches!(request.chat_history.last().map(AsRef::as_ref), Some(Message::User { content })
             if content.iter().any(|part| matches!(part, UserContent::ToolResult(_))));
         let event = if has_result {
             MockStreamEvent::text("The tool round is complete.")

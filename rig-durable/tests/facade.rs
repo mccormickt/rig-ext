@@ -494,23 +494,17 @@ async fn caller_run_ids_are_scoped_by_agent_and_version() {
         .unwrap();
 
     assert_ne!(first_run.instance_id(), second_run.instance_id());
-    // Reconnecting to the same application identity cannot attach to an old
-    // Rig generation's run or session, even at the same application semver.
-    use sha2::{Digest, Sha256};
-    let mut old_digest = Sha256::new();
-    for part in ["first", "1.0.0", "shared-caller-id"] {
-        old_digest.update((part.len() as u64).to_be_bytes());
-        old_digest.update(part.as_bytes());
-    }
-    let old_hash = format!("{:x}", old_digest.finalize());
-    assert_ne!(first_run.instance_id(), format!("rig-agent-{old_hash}"));
     assert_ne!(
         orchestrator
             .agent("first")
             .unwrap()
             .session("shared-caller-id")
             .instance_id(),
-        format!("rig-session-{old_hash}")
+        orchestrator
+            .agent("second")
+            .unwrap()
+            .session("shared-caller-id")
+            .instance_id()
     );
     assert_eq!(first_run.wait().await.unwrap().output(), "first output");
     assert_eq!(second_run.wait().await.unwrap().output(), "second output");
@@ -774,8 +768,29 @@ async fn reconnects_to_a_run_after_runtime_restart_without_recalling_the_model_t
 #[cfg(feature = "codemode")]
 #[tokio::test]
 async fn code_mode_recovers_after_parallel_children_without_repeating_completed_work() {
-    use rig::test_utils::MockBarrierTool;
     use rig_durable::{InvocationContract, ToolPolicy};
+    struct MockBarrierTool(Arc<tokio::sync::Barrier>);
+    impl MockBarrierTool {
+        fn new(barrier: Arc<tokio::sync::Barrier>) -> Self {
+            Self(barrier)
+        }
+    }
+    impl Tool for MockBarrierTool {
+        const NAME: &'static str = "barrier_tool";
+        type Args = NoArgs;
+        type Output = &'static str;
+        type Error = Infallible;
+        fn description(&self) -> String {
+            "Wait for both children".into()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn call(&self, _: &mut ToolContext, _: NoArgs) -> Result<Self::Output, Self::Error> {
+            self.0.wait().await;
+            Ok("ready")
+        }
+    }
     struct RecordKey {
         tool: InterruptedTool,
         keys: Arc<std::sync::Mutex<Vec<String>>>,

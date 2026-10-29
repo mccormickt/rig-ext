@@ -240,22 +240,18 @@ mod tests {
     }
 
     #[test]
-    fn replays_baseline_codemode_histories_and_new_schedule_prefixes() {
+    fn replays_recorded_codemode_histories_and_new_schedule_prefixes() {
         for (bytes, agent, contract, max_in_flight) in [
             (
-                include_bytes!(
-                    "../../tests/fixtures/codemode-baseline/duroxide-codemode-children.json"
-                )
-                .as_slice(),
+                include_bytes!("../../tests/fixtures/replay/duroxide-codemode-children.json")
+                    .as_slice(),
                 "workflow",
                 InvocationContract::Logical,
                 Limits::default().max_in_flight,
             ),
             (
-                include_bytes!(
-                    "../../tests/fixtures/codemode-baseline/duroxide-codemode-race.json"
-                )
-                .as_slice(),
+                include_bytes!("../../tests/fixtures/replay/duroxide-codemode-race.json")
+                    .as_slice(),
                 "race",
                 InvocationContract::Legacy,
                 2,
@@ -277,6 +273,7 @@ mod tests {
                         name: rig::message::ToolName::new(name).unwrap(),
                         description: "Recorded nested tool".into(),
                         parameters: serde_json::json!({"type":"object"}),
+                        annotations: Default::default(),
                     },
                     route: child.map_or(ToolRoute::RigTool, |child| ToolRoute::DurableAgent {
                         orchestration_name: RuntimeNames::for_agent(child, "1.0.0").orchestration,

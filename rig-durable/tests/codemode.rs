@@ -15,7 +15,11 @@ async fn observed_completions_precede_results_that_arrive_during_planning() {
             max_in_flight: 3,
             ..Default::default()
         },
-        definitions: ToolSet::from_tools(vec![MockAddTool]).tool_definitions(),
+        definitions: ToolSet::from_tools(vec![MockAddTool])
+            .tool_definitions()
+            .into_iter()
+            .map(|definition| (*definition).clone())
+            .collect(),
     };
     let release = Notify::new();
     let report = run(
@@ -68,7 +72,11 @@ async fn planning_failure_drains_admitted_calls_and_checkpoints_their_results() 
             max_in_flight: 2,
             ..Default::default()
         },
-        definitions: ToolSet::from_tools(vec![MockAddTool]).tool_definitions(),
+        definitions: ToolSet::from_tools(vec![MockAddTool])
+            .tool_definitions()
+            .into_iter()
+            .map(|definition| (*definition).clone())
+            .collect(),
     };
     let failed = Notify::new();
     let release = Notify::new();
@@ -242,7 +250,11 @@ async fn scheduler_replans_provisional_report_after_all_admitted_work_drains() {
             max_in_flight: 1,
             ..Default::default()
         },
-        definitions: ToolSet::from_tools(vec![MockAddTool]).tool_definitions(),
+        definitions: ToolSet::from_tools(vec![MockAddTool])
+            .tool_definitions()
+            .into_iter()
+            .map(|definition| (*definition).clone())
+            .collect(),
     };
     let mut state = SchedulerState::new(
         "return await Promise.race([tools.add({x:1,y:0}),tools.add({x:2,y:0})]);".into(),

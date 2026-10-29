@@ -11,8 +11,8 @@
 //!
 //! Enable `rig-codemode` features `quickjs,mcp` and add `rig-rmcp` as a dependency.
 //! Both features require a native target.
-//! Obtain tools with [`rig_rmcp::tools_from_server`] from a connected client's
-//! definitions and peer. Keep that client connection open during execution.
+//! Obtain tools with [`rig_rmcp::McpConnection::tools`] from a connected client.
+//! Each tool keeps that client connection open during execution.
 //! Build the catalog **before** converting the tools to Rig `DynamicTool`s:
 //! the Rig definitions do not retain MCP output schemas.
 //!
@@ -48,7 +48,7 @@
 use std::collections::HashMap;
 
 use rig_core::tool::{ToolExecutionError, ToolResult};
-use rig_rmcp::McpStructuredContent;
+use rig_rmcp::McpCallToolResult;
 use rig_rmcp::rmcp::model::Tool as McpToolDefinition;
 
 use crate::catalog::{Catalog, CatalogEntry};
@@ -132,8 +132,12 @@ impl<D: HostDispatcher> OutputSchemaValidator<D> {
         if !outcome.result.is_success() {
             return outcome;
         }
-        let problem = match outcome.metadata.get::<McpStructuredContent>() {
-            Ok(Some(McpStructuredContent(value))) if validator.is_valid(&value) => return outcome,
+        let problem = match outcome
+            .metadata
+            .get::<McpCallToolResult>()
+            .map(|result| result.and_then(|result| result.0.structured_content))
+        {
+            Ok(Some(value)) if validator.is_valid(&value) => return outcome,
             Ok(Some(_)) => "structuredContent does not match",
             Ok(None) => "the result has no structuredContent",
             Err(_) => "the structuredContent could not be read",

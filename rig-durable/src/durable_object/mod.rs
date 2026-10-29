@@ -28,7 +28,6 @@ use child::ChildInvocation;
 use futures::{StreamExt, stream::FuturesUnordered};
 use rig::{
     DynModel,
-    agent::{AgentRun, PendingToolCall},
     completion::Message,
     operation::Completion,
     tool::{Tool, ToolSet},
@@ -45,6 +44,7 @@ use crate::{
     config::ConfigSnapshot,
     driver::{self, Effect},
     outcome::CallPosition,
+    persistent::{PendingToolCall, Run as AgentRun},
     submission::{Admission, DEFAULT_LEDGER_MAX_BYTES, SessionAvailability},
     tools::{ToolEntry, ToolRoute},
 };
@@ -121,7 +121,7 @@ pub struct Status {
     pub next_deadline_ms: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Session {
     id: String,
     config: ConfigSnapshot,
@@ -141,7 +141,7 @@ fn default_implementation_version() -> String {
     "1".into()
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Run {
     request_id: String,
     prompt_index: u64,
@@ -457,7 +457,8 @@ fn storage_failure_output(
     name: &str,
     interruption: Option<InterruptionReason>,
 ) -> ToolActivityOutput {
-    use rig::tool::{ToolExecutionError, ToolResult, portable::ToolResultContext};
+    use rig::tool::{ToolExecutionError, ToolResult};
+    use rig_core::tool::ToolResultContext;
     let result = match interruption {
         Some(reason) => DurableToolResult::interrupted(reason, STORAGE_FAILURE),
         None => {
@@ -552,10 +553,78 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
         self.db.transaction(|| {
             let mut session = self.load()?;
             let result = f(&mut session)?;
+            self.check_run_capacity(&session).map_err(|error| {
+                if matches!(error, Error::Limit { .. } | Error::Depth { .. }) {
+                    Error::Storage(format!(
+                        "runner settlement headroom is unavailable: {error}"
+                    ))
+                } else {
+                    error
+                }
+            })?;
             storage::write(&self.db, "session", &session, self.max_bytes)?;
             Ok(result)
         })
     }
+
+    // Reserve the complete next replay window, including a bounded result for
+    // every unresolved call. Queued submissions cannot consume this space.
+    fn check_run_capacity(&self, session: &Session) -> Result<(), Error> {
+        let Some(active) = &session.active else {
+            return Ok(());
+        };
+        let Phase::Tools { keys } = &active.phase else {
+            return Ok(());
+        };
+        let mut candidate = session.clone();
+        let run = candidate
+            .active
+            .as_mut()
+            .ok_or_else(|| Error::Invalid("active run is missing".into()))?;
+        let mut contents = Vec::new();
+        for key in keys {
+            let call = self.call(key)?;
+            let position = CallPosition {
+                prompt_index: run.prompt_index,
+                turn: run.turn,
+                call_index: call.pending.call_index,
+            };
+            let tool = &call.pending.tool_call;
+            if let Some(content) = call.pending.preresolved_result {
+                contents.push(content);
+                run.outcomes.push(ToolOutcome::denied(position, tool));
+            } else {
+                let output = call.output.unwrap_or_else(|| {
+                    storage_failure_output(
+                        &call.input.name,
+                        Some(InterruptionReason::ToolUnavailable),
+                    )
+                });
+                contents.push(driver::tool_result(tool, output.content.clone()));
+                run.outcomes
+                    .push(ToolOutcome::from_activity(position, tool, &output));
+            }
+        }
+        // A terminal runner error, such as the turn limit, is handled after
+        // actual settlements. Capacity planning must not cancel admitted work.
+        if run.agent.tool_results(contents).is_ok() {
+            run.agent
+                .complete_outcomes(run.prompt_index, &mut run.outcomes);
+            let history = run.agent.full_history();
+            let mut transcript = self.transcript()?;
+            transcript.extend_from_slice(
+                history
+                    .get(run.recorded..)
+                    .ok_or_else(|| Error::Invalid("run history moved backwards".into()))?,
+            );
+            storage::encode(&transcript, self.max_bytes)?;
+            run.recorded = history.len();
+        }
+        run.phase = Phase::Advance;
+        storage::encode(&candidate, self.max_bytes)?;
+        Ok(())
+    }
+
     pub fn transcript(&self) -> Result<Vec<Message>, Error> {
         self.db
             .exec("SELECT data FROM rig_entries ORDER BY id", &[])?
@@ -1020,12 +1089,9 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                         .ok_or_else(|| Error::Invalid("receipt is missing".into()))?;
                     let history = self.context(state)?.active_context();
                     let recorded = history.len();
-                    let mut agent = AgentRun::new(input.message)
+                    let agent = AgentRun::new(input.message)
                         .with_history(history)
                         .max_turns(config.max_turns);
-                    if let Some(choice) = config.completion.tool_choice.clone() {
-                        agent = agent.with_tool_choice(choice);
-                    }
                     state.active = Some(Run {
                         request_id: input.request_id,
                         prompt_index: receipt.prompt_index,
@@ -1107,6 +1173,7 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                 .ok_or_else(|| Error::Invalid("active run is missing".into()))?;
             match effect {
                 Effect::Model { turn, .. } => {
+                    run.agent = agent;
                     run.turn = turn;
                     run.phase = Phase::Model;
                     run.attempt = 1;
@@ -1115,7 +1182,7 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                 Effect::Tools { calls } => {
                     run.agent = agent;
                     let mut keys = Vec::new();
-                    for (index, pending) in calls.into_iter().enumerate() {
+                    for pending in calls {
                         let call = &pending.tool_call;
                         let entry = config
                             .tools
@@ -1125,7 +1192,7 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                             logical_execution_id: state.id.clone(),
                             submission_id: LogicalCallKey::submission_for_prompt(run.prompt_index),
                             model_turn: run.turn,
-                            call_index: index,
+                            call_index: pending.call_index,
                         };
                         let approval =
                             if entry.requires_approval && pending.preresolved_result.is_none() {
@@ -1147,7 +1214,7 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                                 execution_id: state.id.clone(),
                                 prompt_index: run.prompt_index,
                                 turn: run.turn,
-                                call_index: index,
+                                call_index: pending.call_index,
                                 logical_key: Some(key.clone()),
                                 attempt: Some(AttemptMetadata {
                                     backend_execution_id: state.id.clone(),
@@ -1193,6 +1260,8 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                 }
                 Effect::Done(response) => {
                     run.agent = agent;
+                    run.agent
+                        .complete_outcomes(run.prompt_index, &mut run.outcomes);
                     self.record(run)?;
                     storage::write(
                         &self.db,
@@ -1273,6 +1342,15 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
         }
     }
     async fn tools(&self, keys: &[String], config: &DurableAgentConfig) -> Result<bool, Error> {
+        self.check_run_capacity(&self.load()?).map_err(|error| {
+            if matches!(error, Error::Limit { .. } | Error::Depth { .. }) {
+                Error::Storage(format!(
+                    "runner settlement headroom is unavailable: {error}"
+                ))
+            } else {
+                error
+            }
+        })?;
         let calls = keys
             .iter()
             .map(|key| self.call(key))
@@ -1443,7 +1521,24 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                     }
                 }
             }
-            self.db.transaction(|| self.save_call(key, &call))?;
+            self.db.transaction(|| {
+                self.save_call(key, &call)?;
+                if let Err(error) = self.check_run_capacity(&self.load()?) {
+                    if !matches!(error, Error::Limit { .. } | Error::Depth { .. }) {
+                        return Err(error);
+                    }
+                    let output = call.output.as_ref().ok_or(error)?;
+                    let interruption = output
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.interruption.as_ref())
+                        .map(|value| value.reason);
+                    call.output = Some(storage_failure_output(&call.input.name, interruption));
+                    self.save_call(key, &call)?;
+                    self.check_run_capacity(&self.load()?)?;
+                }
+                Ok(())
+            })?;
             if call.output.is_none() && call.failure.is_none() && call.deadline_ms.is_some() {
                 deferred.push((key, call));
             }
@@ -1468,11 +1563,11 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                 .as_mut()
                 .ok_or_else(|| Error::Invalid("active run is missing".into()))?;
             let mut contents = Vec::new();
-            for (index, call) in calls.into_iter().enumerate() {
+            for call in calls {
                 let position = CallPosition {
                     prompt_index: run.prompt_index,
                     turn: run.turn,
-                    call_index: index,
+                    call_index: call.pending.call_index,
                 };
                 let tool = &call.pending.tool_call;
                 if let Some(content) = call.pending.preresolved_result {
@@ -1524,7 +1619,8 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
             Err(_) => return Ok(None),
         };
         child.acknowledged = true;
-        use rig::tool::{ToolExecutionError, ToolOutput, ToolResult, portable::ToolResultContext};
+        use rig::tool::{ToolExecutionError, ToolOutput, ToolResult};
+        use rig_core::tool::ToolResultContext;
         let result = match reply {
             ChildReply::Pending => return Ok(None),
             ChildReply::Completed(response) => {

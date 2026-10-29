@@ -3,19 +3,27 @@ use rig::{DynModel, completion::CompletionRequest, operation::Completion};
 use crate::streaming::{StreamItem, StreamTranscript};
 use futures::StreamExt;
 
+/// The completed response and the policy of its exact request.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CompletionOutput {
+    pub response: rig::completion::CompletionResponse,
+    pub policy: rig::run::policy::TurnPolicy,
+}
+
 /// Execute a provider request and retain the exact tool authorization sets
 /// used to validate the resulting turn.
 pub async fn complete(
     model: &DynModel<Completion>,
     request: CompletionRequest,
-) -> Result<rig::agent::ModelTurn, String> {
-    let (executable, allowed) = crate::tools::request_tool_names(&request);
+) -> Result<CompletionOutput, String> {
+    let (executable, _) = crate::tools::request_tool_names(&request);
+    let policy = rig::run::policy::TurnPolicy::new(executable, request.tool_choice.clone(), None)
+        .map_err(|error| error.to_string())?;
     let response = model
         .call(request)
         .await
         .map_err(|error| error.to_string())?;
-    let turn = rig::agent::ModelTurn::from_response_parts(&response, executable, allowed);
-    Ok(turn)
+    Ok(CompletionOutput { response, policy })
 }
 
 /// Consume the provider stream to EOF inside one activity. The transcript is

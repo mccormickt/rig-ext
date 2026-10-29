@@ -102,8 +102,8 @@ pub struct DurableAgentConfig {
     pub completion_retry: RetryPolicy,
     pub approval: ApprovalConfig,
     pub checkpoint: CheckpointConfig,
-    /// Wire contract between the orchestration and its tool activity. The
-    /// default keeps existing histories replayable.
+    /// Wire contract between the orchestration and its tool activity.
+    /// The default uses minimal payloads with application-managed replay safety.
     pub contract: InvocationContract,
     /// Compaction of the active context between completed prompts in a
     /// session. Single runs do not compact.
@@ -349,6 +349,7 @@ mod tests {
             name: rig::message::ToolName::new(name).unwrap(),
             description: String::new(),
             parameters: serde_json::json!({"type":"object"}),
+            annotations: Default::default(),
         }
     }
 

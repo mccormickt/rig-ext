@@ -42,7 +42,9 @@ driver owns the active turn. There is no post-tool steering.
 
 Schema-versioned SQL tables hold the append-only transcript, chunked run
 checkpoints, tool intents, and submission ledger. Checkpoints replace the
-active `AgentRun`; past completion requests are not retained. Model context
+active `persistent::Run`, including its initial seed and prompt-scoped Rig
+effect log. Complete requests and answers are retained until the prompt ends.
+Model context
 comes from the transcript and compaction cutoff. Compaction runs between
 prompts and uses the same validation as the native backends. Mutations reload
 SQL inside a synchronous transaction, so an uncertain write cannot leave an
@@ -244,7 +246,7 @@ handle.signal(
 
 ## Duroxide
 
-Drive Rig's serializable `AgentRun` state machine inside a Duroxide
+Drive Rig's runner through the shared `persistent::Run` planner inside a Duroxide
 orchestration. The orchestration performs no provider or tool I/O; all such work
 is registered as activities.
 
@@ -279,22 +281,11 @@ orchestration durably acknowledges that exact steering command. It returns
 checkpoints in custom status, and checkpoint policy also applies before a
 steered text-only turn starts.
 
-```text
-Orchestration (deterministic, zero IO)          Activities (all IO)
-──────────────────────────────────────          ───────────────────────────
-AgentRun::next_step()
-  ├─ CallModel{prompt, history, turn}
-  │    build CompletionRequest ────────────────► completion activity
-  │                                               model completion or stream-to-EOF
-  │    run.model_response/streamed_turn ◄──────── durable JSON result
-  │
-  ├─ CallTools{calls}
-  │    ctx.join([...]) ────────────────────────► one activity per tool call
-  │                                               ToolSet::execute / user activity
-  │    run.tool_results(results) ◄─────────────── ToolActivityOutput (JSON)
-  │
-  └─ Done(PromptResponse) ──► orchestration output
-```
+`Run::plan` returns a model request, a tool batch, or a completed response.
+Model requests run as completion activities. Tool batches run through
+Duroxide's deterministic `ctx.join`, with separate activities or child
+orchestrations. Saved activity answers enter the Rig replay window; no backend
+future enters Rig's internal tool executor.
 
 `DurableAgentBuilder` turns each Rig tool into activity-backed durable execution.
 `AgentOrchestrator` owns the Duroxide runtime, registries, provider, and client;
@@ -319,10 +310,10 @@ carries it across continue-as-new; see
 [Tool replay safety](#tool-replay-safety). Tool calls are checked against the
 exact advertised and `ToolChoice`-allowed names, and unknown calls fail closed.
 Treat changes to tool definitions, routing, prompts, retry policy, or control
-flow as orchestration version changes. Keep every version needed by live
-histories registered; replay must observe the same configuration and activity
-names. Activities themselves must be idempotent because retries can repeat
-I/O. Use `ToolInvocation` as the idempotency key for side effects.
+flow as execution configuration changes. Replay must observe the same
+configuration and activity names. Activities themselves must be idempotent
+because retries can repeat I/O. Use `ToolInvocation` as the idempotency key for
+side effects.
 
 Timeouts add durable timer events, and worker tags are part of an activity's
 event identity. Adding or changing either for a live orchestration version will
@@ -391,12 +382,11 @@ the answer; the Temporal `submit` update returns when the prompt answers.
 
 `compaction(Compaction::new(policy, compactor))` bounds the active context a
 session sends to the model with Rig's memory abstractions: a
-`rig_memory::MemoryPolicy` (`SlidingWindowMemory`, `TokenWindowMemory`, or
-your own) decides which transcript prefix leaves the active window, and a
-`rig::memory::Compactor` folds that prefix, with the prior artifact as
-`carry_over`, into a new artifact. This is the durable form of
-`rig_memory::CompactingMemory`: the policy and compactor run in one activity
-on the worker, and the workflow keeps only the watermark, so the
+`rig_memory::recent::Recent` policy (`LastMessages`, `TokenBudget`, or your own)
+selects a pair-safe retained window through `rig_memory::recent::view`.
+The durable `compaction::Compactor` folds the removed prefix, with the prior
+artifact as `carry_over`, into a serializable artifact. The policy and compactor
+run in one activity on the worker, and the workflow keeps only the watermark, so the
 `CompactionRecord` (cutoff, policy version, encoded artifact, artifact
 message, input count) survives replay and continue-as-new.
 
@@ -412,18 +402,18 @@ transcript keeps every message, and `SessionResult`/
 The compactor's artifact must implement `Serialize` and `DeserializeOwned`,
 because the workflow retains it between rounds. `ModelCompactor` is the
 crate-owned compactor: one model call summarizes the evicted window and its
-`ModelSummary` artifact records the text and usage. `rig_memory::TemplateCompactor`
-does not qualify, because its `TextSummary` artifact has no serde
-support and no public constructor.
+`ModelSummary` artifact records the text and usage. It uses Rig's
+`Summarizer::summary_text` to extract text from the response, while the backend
+retains the artifact and cutoff in its durable checkpoint.
 
 ```rust,ignore
 use rig_durable::{Compaction, ModelCompactor};
-use rig_memory::SlidingWindowMemory;
+use rig_memory::recent::LastMessages;
 
 let agent = DurableAgent::builder("support", model.clone())
     .compaction(
         Compaction::new(
-            SlidingWindowMemory::last_messages(40),
+            LastMessages(40),
             ModelCompactor::new(model.clone()),
         )
         .version("summary-v1"),
@@ -471,7 +461,7 @@ the model's `stream` to EOF and returns a provider-neutral, serde-tagged
 transcript. The transcript records each Rig part event (start, text,
 reasoning, arguments, end, and unknown items) and ends with the
 `CompletionResponse` that Rig folds from the stream. Orchestration applies that
-response deterministically through `AgentRun::streamed_turn`. Calls to tools
+response deterministically through `persistent::Run::model_response`. Calls to tools
 that are not registered or not allowed by `ToolChoice` fail closed. Rig drops a
 streamed call that never receives a name. A streamed completion counts as one
 checkpoint operation.
@@ -484,31 +474,46 @@ example.
 
 ## Architecture
 
-The backend-neutral driver plans model, tool, and done effects. It owns
-completion requests, `AgentRun` transitions, prompt-scoped approval identities
-and denials, and tool-result correlation. The native adapters use the same
-follow-up-turn steering semantics. Backend adapters schedule activities, wait
-for durable control messages, expose status, and apply backend retry and
-checkpoint rules.
+The shared `persistent::{Run, CompletionOptions, Effect, PendingToolCall}`
+contract separates pure Rig planning from backend execution. `plan` builds
+custom `Serve` handlers, resumes the initial seed through `AgentRunner`, and
+polls with a local waker until every runnable dispatch has either replayed or
+suspended. Handlers do not perform I/O or poll backend futures. Missing earlier
+answers can remain pending while later saved answers replay by dispatch ID.
+Configuration stamps, request comparison, duplicate-ID checks, and unconsumed
+record checks fail closed before new work.
 
-```text
-Rig model + ToolSet
-        │
-        ▼
-shared durable driver ── AgentRun + pure policy
-        │
-        ├── Duroxide adapter ── orchestration, events, timers, continue-as-new
-        │
-        ├── Temporal adapter ── workflow, signals, queries, activity policies
-        │
-        └── Durable Object engine ── SQL checkpoints, tool intents, alarms
-```
+`settle` appends one effect record through `EffectLogRecorder`. Model and batch
+helpers also refresh the pure plan. Backends must commit their admissions and
+settlements before executing newly planned work. Recorder callbacks hold no
+storage handle: SQL errors return through the existing transaction API, and
+native activity results remain controlled by workflow history. Rig's internal
+hooks run only deterministic tracing and tool-annotation propagation. Arbitrary
+application hooks, in-prompt memory I/O, and conversion of an already-built
+Rig agent are not supported.
 
-This boundary keeps the public API Rig-first and avoids a generic async runtime
-trait. Hooks that perform durable control belong at this driver boundary. Rig's
-current high-level `AgentRunner` hooks are not replayed because the backends
-drive `AgentRun` directly. A future Rig effect API can replace this narrow seam
-without changing backend scheduling.
+Duroxide retains `ctx.join`; the Durable Object engine retains SQL intents,
+independent sibling settlements, alarms, and child receipt/poll protocols.
+Code-mode guest scheduling remains solely in `SchedulerState`. The Temporal
+adapter currently uses Rig's typed `AgentRun` API. Its runner integration can
+use the same synchronous planner with its local workflow context, but must
+still issue every SDK activity and child command during workflow replay.
+It must not restore an external log to skip SDK commands.
+The typed Temporal bridge answers malformed calls without executing them, but
+does not retain their detailed dispositions. Runner adoption must use
+`Run::complete_outcomes` at prompt completion to include those dispositions.
+
+The initial seed and full effect requests remain in the prompt checkpoint.
+Replay is bounded by a poll budget based on recorded dispatches and tool calls,
+and the configured model-turn limit. A long prompt costs more storage and replay
+time; continue-as-new does not truncate its Rig log. Native single-run
+checkpoints have no additional crate-owned byte cap; backend payload limits
+still apply. Between prompts the log is discarded and compaction bounds the
+next seed's context. DO byte/depth limits cover the full checkpoint.
+DO admission reserves space for bounded settlements and the next
+replay window. Oversized tool results become committed failures. Retained work
+without enough space is blocked until the operator increases the cap. The
+schema's fixed row limit and JSON depth limits still apply.
 
 ## Checkpointing
 
@@ -516,18 +521,19 @@ without changing backend scheduling.
 a deterministic number of completed durable operations. A completed model
 activity and a complete tool batch each count as one operation. Checkpointing is
 disabled by default; use `CheckpointPolicy::Every(NonZeroU32)` to enable it.
-The continuation contains the complete serialized Rig `AgentRun`, generation,
+The continuation contains the complete serialized `persistent::Run`, generation,
 and model-turn metadata. The per-history-window operation count resets after a
 checkpoint. This preserves global turn limits,
 usage, pending tool calls, approval IDs, and queued approval events. An optional
 target orchestration version may be selected for the next execution.
 
 Continue-as-new bounds each Duroxide event-history window; it does not bound the
-serialized `AgentRun` or full conversation payload, which continue to grow.
+serialized prompt replay window or full conversation payload, which continue to grow.
 Checkpoint configuration and threshold changes are orchestration versioning
 boundaries. The envelope has a crate-owned format version, but Rig's `AgentRun`
-serde representation is also a persistence compatibility boundary. Keep the
-required crate and orchestration versions available while continuations live.
+serde representation is also part of the persisted state. This pre-release
+crate does not support histories or checkpoints across crate or Rig upgrades;
+start fresh executions when those formats change.
 See `examples/checkpointed_agent.rs` for an API-key-free SQLite example.
 
 Each multi-tool turn fans out through `ctx.join`. Every tool keeps its own retry

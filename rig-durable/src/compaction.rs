@@ -1,14 +1,13 @@
 //! Bound the active model context separately from the audit transcript.
 //!
-//! Compaction composes two Rig abstractions. A [`MemoryPolicy`] from
-//! `rig-memory` decides which transcript prefix leaves the active window. A
-//! [`Compactor`] from `rig::memory` folds that prefix, together with the prior
+//! Compaction composes a Rig [`Recent`] policy with a durable [`Compactor`].
+//! The policy decides which transcript prefix leaves the active window. The
+//! compactor folds that prefix, together with the prior
 //! artifact, into a new artifact. Both run inside the compaction activity, so
 //! workflow code never executes policy or model logic. The workflow owns only
 //! the durable watermark: a [`ContextState`] keeps the full transcript and one
 //! [`CompactionRecord`] that stands in for a prefix of it. This is the durable
-//! form of `rig_memory::CompactingMemory`, whose watermark lives in process
-//! memory.
+//! form of a compacted active context, with a persisted watermark.
 //!
 //! Compaction runs after a completed prompt, never inside one. The transcript
 //! itself is never shortened by compaction.
@@ -18,17 +17,27 @@ use std::{fmt, sync::Arc};
 use rig::{
     DynModel,
     completion::{CompletionRequest, Message, Usage},
-    id::ConversationId,
-    memory::{Compactor, MemoryError},
+    conversation::pairing::{PairingError as TranscriptError, validate as validate_canonical},
     operation::Completion,
-    transcript::{TranscriptError, validate_canonical},
     wasm_compat::{WasmBoxedFuture, WasmCompatSend, WasmCompatSync},
 };
-use rig_memory::MemoryPolicy;
+use rig_memory::recent::{Recent, view};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 pub const COMPACTION_FORMAT_VERSION: u32 = 1;
+
+/// An activity-side compactor whose artifact can cross a durable boundary.
+pub trait Compactor: WasmCompatSend + WasmCompatSync {
+    type Artifact: Into<Message> + WasmCompatSend + WasmCompatSync;
+
+    fn compact<'a>(
+        &'a self,
+        conversation_id: &'a str,
+        evicted: &'a [Message],
+        carry_over: Option<&'a Self::Artifact>,
+    ) -> WasmBoxedFuture<'a, Result<Self::Artifact, String>>;
+}
 
 const DEFAULT_INSTRUCTIONS: &str = "You compact conversation history for an assistant that will \
 continue the conversation. Write a concise summary that preserves user goals, decisions, facts, \
@@ -46,13 +55,13 @@ pub struct CompactionConfig {
     pub version: String,
 }
 
-/// Worker-side compaction: a [`MemoryPolicy`] chooses what leaves the active
+/// Worker-side compaction: a [`Recent`] policy chooses what leaves the active
 /// window and a [`Compactor`] folds it into an artifact.
 ///
 /// The compactor's artifact must serialize, because the workflow retains it
 /// and passes it back as `carry_over` on the next round.
 ///
-/// Use Rig's [`rig_memory::SlidingWindowMemory`] to select the retained window
+/// Use Rig's [`rig_memory::recent::LastMessages`] to select the retained window
 /// and [`ModelCompactor`] to summarize the removed prefix. Pass this value to
 /// either backend's `.compaction(...)` builder method. It applies to sessions,
 /// not independent single runs.
@@ -60,11 +69,11 @@ pub struct CompactionConfig {
 /// ```no_run
 /// use rig::{DynModel, operation::Completion};
 /// use rig_durable::{Compaction, ModelCompactor};
-/// use rig_memory::SlidingWindowMemory;
+/// use rig_memory::recent::LastMessages;
 ///
 /// fn summaries(model: DynModel<Completion>) -> Compaction {
 ///     Compaction::new(
-///         SlidingWindowMemory::last_messages(40),
+///         LastMessages(40),
 ///         ModelCompactor::new(model),
 ///     ).version("summary-v1")
 /// }
@@ -77,7 +86,7 @@ pub struct CompactionConfig {
 /// messages from the audit transcript or reduce its serialized byte count.
 #[derive(Clone)]
 pub struct Compaction {
-    policy: Arc<dyn MemoryPolicy>,
+    policy: Arc<dyn Recent>,
     compactor: Arc<dyn ErasedCompactor>,
     version: String,
 }
@@ -85,7 +94,7 @@ pub struct Compaction {
 impl Compaction {
     pub fn new<P, C>(policy: P, compactor: C) -> Self
     where
-        P: MemoryPolicy + 'static,
+        P: Recent + 'static,
         C: Compactor + 'static,
         C::Artifact: Serialize + DeserializeOwned,
     {
@@ -120,11 +129,8 @@ impl Compaction {
             return Err("compaction policy or carry-over version mismatch".into());
         }
         let absorbed = request.absorbed;
-        let (_kept, demoted) = self
-            .policy
-            .apply_with_demoted(request.transcript)
-            .map_err(|error| error.to_string())?;
-        let cutoff = demoted.len();
+        let messages: Vec<_> = request.transcript.iter().cloned().map(Arc::new).collect();
+        let cutoff = messages.len() - view(&messages, self.policy.as_ref()).len();
         if cutoff <= absorbed {
             return Ok(CompactionOutput {
                 cutoff: absorbed,
@@ -133,13 +139,17 @@ impl Compaction {
                 artifact: None,
             });
         }
-        let evicted = demoted
-            .get(absorbed..)
+        let evicted = request
+            .transcript
+            .get(absorbed..cutoff)
             .ok_or("compaction watermark exceeds demoted slice length")?;
-        let conversation_id = ConversationId::new(request.conversation_id);
         let artifact = self
             .compactor
-            .compact(&conversation_id, evicted, request.carry_over.as_ref())
+            .compact(
+                &request.conversation_id,
+                evicted,
+                request.carry_over.as_ref(),
+            )
             .await?;
         Ok(CompactionOutput {
             cutoff,
@@ -163,7 +173,7 @@ impl fmt::Debug for Compaction {
 trait ErasedCompactor: WasmCompatSend + WasmCompatSync {
     fn compact<'a>(
         &'a self,
-        conversation_id: &'a ConversationId,
+        conversation_id: &'a str,
         evicted: &'a [Message],
         carry_over: Option<&'a Value>,
     ) -> WasmBoxedFuture<'a, Result<CompactionArtifact, String>>;
@@ -176,7 +186,7 @@ where
 {
     fn compact<'a>(
         &'a self,
-        conversation_id: &'a ConversationId,
+        conversation_id: &'a str,
         evicted: &'a [Message],
         carry_over: Option<&'a Value>,
     ) -> WasmBoxedFuture<'a, Result<CompactionArtifact, String>> {
@@ -454,10 +464,10 @@ impl Compactor for ModelCompactor {
 
     fn compact<'a>(
         &'a self,
-        _conversation_id: &'a ConversationId,
+        _conversation_id: &'a str,
         evicted: &'a [Message],
         carry_over: Option<&'a Self::Artifact>,
-    ) -> WasmBoxedFuture<'a, Result<Self::Artifact, MemoryError>> {
+    ) -> WasmBoxedFuture<'a, Result<Self::Artifact, String>> {
         Box::pin(async move {
             let mut chat_history = Vec::with_capacity(evicted.len() + 3);
             chat_history.push(Message::system(self.instructions.clone()));
@@ -470,25 +480,21 @@ impl Compactor for ModelCompactor {
             chat_history.extend(evicted.iter().cloned());
             chat_history.push(Message::user(SUMMARY_PROMPT));
             let mut completion = CompletionRequest::new("");
-            completion.chat_history = chat_history;
+            completion.chat_history = chat_history.into_iter().map(Arc::new).collect();
             let response = self
                 .model
                 .call(completion)
                 .await
-                .map_err(|error| MemoryError::Backend(Box::new(error)))?;
+                .map_err(|error| error.to_string())?;
             if let Some(error) = rig::message::turn_failure(
                 &response.choice,
                 Some(&response.stop()),
                 response.finish_reason().as_ref(),
             ) {
-                return Err(MemoryError::Policy(error));
+                return Err(error);
             }
-            let text = response.text();
-            if text.trim().is_empty() {
-                return Err(MemoryError::Policy(
-                    "summarization model returned no text".into(),
-                ));
-            }
+            let text = rig_memory::Summarizer::summary_text(&response)
+                .map_err(|error| error.to_string())?;
             Ok(ModelSummary {
                 text,
                 usage: response.usage,
@@ -503,7 +509,7 @@ mod tests {
     use rig::message::{
         AssistantContent, ToolCall, ToolFunction, ToolName, ToolResultContent, UserContent,
     };
-    use rig_memory::SlidingWindowMemory;
+    use rig_memory::recent::LastMessages;
 
     use super::*;
 
@@ -560,10 +566,10 @@ mod tests {
 
         fn compact<'a>(
             &'a self,
-            _conversation_id: &'a ConversationId,
+            _conversation_id: &'a str,
             evicted: &'a [Message],
             carry_over: Option<&'a Self::Artifact>,
-        ) -> WasmBoxedFuture<'a, Result<Self::Artifact, MemoryError>> {
+        ) -> WasmBoxedFuture<'a, Result<Self::Artifact, String>> {
             Box::pin(async move {
                 let mut parts: Vec<String> = carry_over
                     .map(|prior| prior.0.clone())
@@ -595,8 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn policy_evicts_and_compactor_carries_the_prior_artifact() {
-        let compaction =
-            Compaction::new(SlidingWindowMemory::last_messages(2), JoinCompactor).version("test");
+        let compaction = Compaction::new(LastMessages(2), JoinCompactor).version("test");
         let mut state = ContextState::new(transcript());
         // 10 messages, keep 2: the window would start at the second tool
         // result, so the policy demotes through it. Cutoff 9.
@@ -716,10 +721,7 @@ mod tests {
                 .with_finish_reason(FinishReason::Other("unexpected".into())),
             MockTurn::text("updated summary"),
         ]);
-        let compaction = Compaction::new(
-            SlidingWindowMemory::last_messages(2),
-            ModelCompactor::new(model),
-        );
+        let compaction = Compaction::new(LastMessages(2), ModelCompactor::new(model));
         let mut state = ContextState::new(transcript());
         state
             .apply(compaction.run(state.request("s", "1")).await.unwrap(), "1")
@@ -744,8 +746,8 @@ mod tests {
     #[tokio::test]
     async fn version_mismatch_calls_neither_policy_nor_model() {
         struct NoPolicy;
-        impl MemoryPolicy for NoPolicy {
-            fn apply(&self, _: Vec<Message>) -> Result<Vec<Message>, MemoryError> {
+        impl Recent for NoPolicy {
+            fn start(&self, _: &[Arc<Message>]) -> usize {
                 panic!("version mismatch must precede policy execution")
             }
         }

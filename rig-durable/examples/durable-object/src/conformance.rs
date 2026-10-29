@@ -128,12 +128,12 @@ struct FixtureModel {
 
 impl Transport<MockScript> for FixtureModel {
     fn send(&self, request: CompletionRequest, _: Exchange) -> Opening<MockFrame> {
-        let has_result = matches!(request.chat_history.last(), Some(Message::User { content })
+        let has_result = matches!(request.chat_history.last().map(AsRef::as_ref), Some(Message::User { content })
             if content.iter().any(|part| matches!(part, UserContent::ToolResult(_))));
         let prompt = request
             .chat_history
             .iter()
-            .find_map(|message| match message {
+            .find_map(|message| match message.as_ref() {
                 Message::User { content } => content.iter().find_map(|part| match part {
                     UserContent::Text(text) => Some(text.text.as_str()),
                     _ => None,
@@ -664,6 +664,7 @@ impl ScriptSession {
                 }
                 .into(),
                 parameters: serde_json::json!({"type":"object","properties":{"branch":{"type":"string"},"gate":{"type":"boolean"},"pause_after_effect":{"type":"boolean"},"result_bytes":{"type":"integer"},"payload":{}},"required":["branch"],"additionalProperties":false}),
+                annotations: Default::default(),
             };
             let builder = Builder::new(Model::new(
                 MockScript::default(),

@@ -56,11 +56,10 @@ pub struct StreamTranscript {
 
 /// Apply a completed stream with the request's exact tool authorization.
 pub fn apply(
-    agent: &mut rig::agent::AgentRun,
+    agent: &mut crate::persistent::Run,
     request: &rig::completion::CompletionRequest,
     transcript: StreamTranscript,
 ) -> Result<(), String> {
-    use rig::{agent::run::StreamedTurn, completion::ResponseIdentity};
     let (executable, allowed) = crate::tools::request_tool_names(request);
     for content in &transcript.response.choice {
         if let rig::completion::AssistantContent::ToolCall(call) = content {
@@ -77,25 +76,5 @@ pub fn apply(
             }
         }
     }
-    let response = &transcript.response;
-    agent
-        .record_streamed_completion_call(
-            response.usage,
-            ResponseIdentity {
-                response_id: response.response_id().map(ToString::to_string),
-                provider_request_id: response.provider_request_id.clone(),
-            },
-            response.finish_reason(),
-            response.raw.clone(),
-        )
-        .map_err(|e| e.to_string())?;
-    agent
-        .streamed_turn(StreamedTurn {
-            head: response.head(),
-            choice: response.choice.clone(),
-            executable_tool_names: executable,
-            allowed_tool_names: allowed,
-            finish_reason: response.finish_reason(),
-        })
-        .map_err(|e| e.to_string())
+    agent.model_response(transcript.response)
 }

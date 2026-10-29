@@ -4,7 +4,7 @@
 
 #[cfg(all(feature = "temporal", feature = "codemode"))]
 #[tokio::test]
-async fn temporal_replays_baseline_codemode_history() {
+async fn temporal_replays_recorded_codemode_history() {
     use rig_durable::temporal::TemporalAgentWorkflow;
     use temporalio_client::WorkflowHistory;
     use temporalio_sdk::workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions};
@@ -16,7 +16,7 @@ async fn temporal_replays_baseline_codemode_history() {
         .unwrap()
         .replay_workflow(
             WorkflowHistory::from_json(include_bytes!(
-                "fixtures/codemode-baseline/temporal-codemode-race.json"
+                "fixtures/replay/temporal-codemode-race.json"
             ))
             .unwrap(),
         )
@@ -42,9 +42,9 @@ async fn temporal_replays_recorded_retries_approval_and_steering() {
         .unwrap();
     let replayer = WorkflowReplayer::new(options).unwrap();
     for (index, bytes) in [
-        include_bytes!("fixtures/generation-2/temporal-retry.json").as_slice(),
-        include_bytes!("fixtures/generation-2/temporal-approval.json").as_slice(),
-        include_bytes!("fixtures/generation-2/temporal-steering.json").as_slice(),
+        include_bytes!("fixtures/replay/temporal-retry.json").as_slice(),
+        include_bytes!("fixtures/replay/temporal-approval.json").as_slice(),
+        include_bytes!("fixtures/replay/temporal-steering.json").as_slice(),
     ]
     .into_iter()
     .enumerate()
@@ -81,9 +81,9 @@ async fn duroxide_replays_each_recorded_continuation_window() {
     };
     let registry = orchestration_registry(config);
     for bytes in [
-        include_bytes!("fixtures/generation-2/duroxide-continuation-1.json").as_slice(),
-        include_bytes!("fixtures/generation-2/duroxide-continuation-2.json").as_slice(),
-        include_bytes!("fixtures/generation-2/duroxide-continuation-3.json").as_slice(),
+        include_bytes!("fixtures/replay/duroxide-continuation-1.json").as_slice(),
+        include_bytes!("fixtures/replay/duroxide-continuation-2.json").as_slice(),
+        include_bytes!("fixtures/replay/duroxide-continuation-3.json").as_slice(),
     ] {
         let mut history: Vec<Event> = serde_json::from_slice(bytes).unwrap();
         let terminal = history.pop().unwrap();

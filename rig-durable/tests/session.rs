@@ -21,7 +21,7 @@ use rig_durable::{
     ModelCompactor, ModelSummary, OutcomeSource, SubmissionError, SubmissionMode, SubmissionState,
     SubmitInput, ToolDisposition, ToolOptions, ToolPolicy,
 };
-use rig_memory::SlidingWindowMemory;
+use rig_memory::recent::LastMessages;
 use serde::Deserialize;
 
 const WAIT: Duration = Duration::from_secs(15);
@@ -104,10 +104,10 @@ fn scripted_requests(model: &MockCompletionModel, expected: usize) -> Vec<Comple
     requests[..expected].to_vec()
 }
 
-fn user_texts(messages: &[Message]) -> Vec<String> {
+fn user_texts(messages: &[impl std::borrow::Borrow<Message>]) -> Vec<String> {
     messages
         .iter()
-        .flat_map(|message| match message {
+        .flat_map(|message| match message.borrow() {
             Message::User { content } => content
                 .iter()
                 .filter_map(|item| match item {
@@ -329,10 +329,10 @@ async fn follow_up_during_a_tool_round_runs_after_the_answer_and_reject_if_busy_
 const SUMMARY_PROMPT: &str = "Summarize the conversation above for an assistant that will \
 continue it. Reply with the summary only.";
 
-fn has_tool_call(messages: &[Message]) -> bool {
+fn has_tool_call(messages: &[impl std::borrow::Borrow<Message>]) -> bool {
     messages.iter().any(|message| {
         matches!(
-            message,
+            message.borrow(),
             Message::Assistant(assistant)
                 if assistant.content.iter().any(|item| matches!(item, AssistantContent::ToolCall(_)))
         )
@@ -340,10 +340,7 @@ fn has_tool_call(messages: &[Message]) -> bool {
 }
 
 fn compaction(model: &MockCompletionModel, keep: usize) -> Compaction {
-    Compaction::new(
-        SlidingWindowMemory::last_messages(keep),
-        ModelCompactor::new(model.clone()),
-    )
+    Compaction::new(LastMessages(keep), ModelCompactor::new(model.clone()))
 }
 
 const SUMMARY_HEADER: &str = "Summary of the earlier conversation:\n";
@@ -400,7 +397,7 @@ async fn compaction_keeps_the_request_canonical_and_the_transcript_complete() {
     // window at the tool result, so the policy demoted the whole exchange.
     let summary_a = &requests[2];
     assert!(matches!(
-        summary_a.chat_history.first(),
+        summary_a.chat_history.first().map(AsRef::as_ref),
         Some(Message::System { .. })
     ));
     assert_eq!(summary_a.chat_history.len(), 4);
@@ -416,7 +413,7 @@ async fn compaction_keeps_the_request_canonical_and_the_transcript_complete() {
     );
 
     let second = &requests[3];
-    rig::transcript::validate_canonical(&second.chat_history).unwrap();
+    rig::conversation::pairing::validate(&second.chat_history).unwrap();
     assert_eq!(second.chat_history.len(), 3);
     assert_eq!(
         user_texts(&second.chat_history),
@@ -440,7 +437,7 @@ async fn compaction_keeps_the_request_canonical_and_the_transcript_complete() {
     );
 
     let third = &requests[5];
-    rig::transcript::validate_canonical(&third.chat_history).unwrap();
+    rig::conversation::pairing::validate(&third.chat_history).unwrap();
     assert_eq!(third.chat_history.len(), 3);
     assert_eq!(
         user_texts(&third.chat_history),
@@ -463,7 +460,7 @@ async fn compaction_keeps_the_request_canonical_and_the_transcript_complete() {
     );
 
     let fourth = &requests[7];
-    rig::transcript::validate_canonical(&fourth.chat_history).unwrap();
+    rig::conversation::pairing::validate(&fourth.chat_history).unwrap();
     assert_eq!(fourth.chat_history.len(), 3);
     assert_eq!(
         user_texts(&fourth.chat_history),
@@ -693,7 +690,7 @@ async fn single_run_exposes_ordered_dispositions_with_equal_content() {
     let last = model.requests().last().unwrap().chat_history.clone();
     let results: Vec<String> = last
         .iter()
-        .filter_map(|message| match message {
+        .filter_map(|message| match message.as_ref() {
             Message::User { content } => content.iter().find_map(|item| match item {
                 UserContent::ToolResult(result) => Some(
                     result

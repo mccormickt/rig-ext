@@ -168,7 +168,8 @@ impl InvocationGuardStore for InMemoryGuardStore {
 pub mod conformance {
     use std::sync::Arc;
 
-    use rig::tool::{ToolOutput, ToolResult, portable::ToolResultContext};
+    use rig::tool::{ToolOutput, ToolResult};
+    use rig_core::tool::ToolResultContext;
 
     use super::*;
     use crate::{policy::MetadataRetention, result::ToolDisposition};

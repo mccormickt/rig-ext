@@ -8,7 +8,7 @@ use a2a::{
 };
 use a2a_client::{A2AClient as InnerClient, A2AClientFactory, Transport};
 use a2a_client::{jsonrpc::JsonRpcTransportFactory, rest::RestTransportFactory};
-use rig_agent::agent::{AgentBuilder, NoToolConfig};
+use rig_agent::agent::AgentBuilder;
 
 use crate::card::describe_card;
 use crate::error::{A2AError, AgentCardError};
@@ -289,7 +289,7 @@ impl A2AClient {
     ///
     /// [`Agent`]: rig_agent::agent::Agent
     /// [`Agent::into_tool`]: rig_agent::agent::Agent::into_tool
-    pub fn agent(&self) -> AgentBuilder<NoToolConfig> {
+    pub fn agent(&self) -> AgentBuilder {
         self.agent_with(self.model())
     }
 
@@ -302,14 +302,11 @@ impl A2AClient {
     /// named on the run outranks this binding either way.
     ///
     /// [`Agent`]: rig_agent::agent::Agent
-    pub fn agent_for_conversation(
-        &self,
-        id: impl Into<ConversationId>,
-    ) -> AgentBuilder<NoToolConfig> {
+    pub fn agent_for_conversation(&self, id: impl Into<ConversationId>) -> AgentBuilder {
         self.agent_with(self.model_for_conversation(id))
     }
 
-    fn agent_with(&self, model: A2AModel) -> AgentBuilder<NoToolConfig> {
+    fn agent_with(&self, model: A2AModel) -> AgentBuilder {
         model
             .agent()
             .name(&self.agent_name)

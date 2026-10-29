@@ -1,9 +1,7 @@
 //! Versioned, host-inspectable tool result retained in durable history.
 
-use rig::{
-    message::ToolResultContent,
-    tool::{ToolResult, portable::ToolResultContext},
-};
+use rig::{message::ToolResultContent, tool::ToolResult};
+use rig_core::tool::ToolResultContext;
 use serde::{Deserialize, Serialize};
 
 use crate::policy::MetadataRetention;

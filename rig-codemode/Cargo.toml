@@ -29,7 +29,7 @@ required-features = ["quickjs", "mcp"]
 [dependencies]
 jsonschema = { version = "0.58", default-features = false }
 rig-core.workspace = true
-rig-rmcp = { version = "0.44.0", default-features = false, optional = true }
+rig-rmcp = { version = "0.45.0", default-features = false, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -46,7 +46,7 @@ futures-util = { version = "0.3", optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 rig = { workspace = true, features = ["test-utils"] }
-rmcp = { version = "2", features = ["server", "client"] }
+rmcp = { version = "3.6", features = ["server", "client"] }
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 

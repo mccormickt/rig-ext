@@ -289,7 +289,7 @@ impl TemporalWorkflowState for TemporalAgentWorkflow {
 
 #[workflow_methods]
 impl TemporalAgentWorkflow {
-    #[run(name = "RigTemporalAgentG2V1")]
+    #[run(name = "RigTemporalAgentG3V1")]
     pub async fn run(
         ctx: &mut WorkflowContext<Self>,
         input: TemporalAgentInput,
@@ -627,7 +627,7 @@ impl TemporalAgentSessionWorkflow {
         }
     }
 
-    #[run(name = "RigTemporalAgentSessionG2V1")]
+    #[run(name = "RigTemporalAgentSessionG3V1")]
     pub async fn run(
         ctx: &mut WorkflowContext<Self>,
     ) -> WorkflowResult<TemporalAgentSessionResult> {
@@ -1099,7 +1099,7 @@ struct TemporalCodeModeActivities;
 #[cfg(feature = "codemode")]
 #[activities]
 impl TemporalCodeModeActivities {
-    #[activity(name = "RigTemporalCodeModeStepG2V1")]
+    #[activity(name = "RigTemporalCodeModeStepG3V1")]
     async fn code_mode_step(
         self: Arc<Self>,
         _ctx: ActivityContext,
@@ -1111,19 +1111,19 @@ impl TemporalCodeModeActivities {
 
 #[activities]
 impl TemporalActivities {
-    #[activity(name = "RigTemporalModelCompletionG2V1")]
+    #[activity(name = "RigTemporalModelCompletionG3V1")]
     async fn complete(
         self: Arc<Self>,
         _ctx: ActivityContext,
         request: CompletionRequest,
-    ) -> Result<rig::agent::ModelTurn, ActivityError> {
+    ) -> Result<activities::completion::CompletionOutput, ActivityError> {
         activities::completion::complete(&self.model, request)
             .await
             .map_err(activity_error)
     }
 
     /// Minimal invocation payloads with application-managed replay safety.
-    #[activity(name = "RigTemporalToolExecutionG2V1")]
+    #[activity(name = "RigTemporalToolExecutionG3V1")]
     async fn execute_tool(
         self: Arc<Self>,
         _ctx: ActivityContext,
@@ -1134,7 +1134,7 @@ impl TemporalActivities {
 
     /// Logical contract: the input carries the logical call key and policy;
     /// the activity adds the physical attempt Temporal reports.
-    #[activity(name = "RigTemporalToolExecutionG2V2")]
+    #[activity(name = "RigTemporalToolExecutionG3V2")]
     async fn execute_logical_tool(
         self: Arc<Self>,
         ctx: ActivityContext,
@@ -1149,7 +1149,7 @@ impl TemporalActivities {
     }
 
     /// Run the registered policy and compactor over a session transcript.
-    #[activity(name = "RigTemporalContextCompactionG2V1")]
+    #[activity(name = "RigTemporalContextCompactionG3V1")]
     async fn compact(
         self: Arc<Self>,
         _ctx: ActivityContext,
@@ -1257,6 +1257,7 @@ impl TemporalAgent {
             .map_err(|error| TemporalAgentError::InvalidConfiguration(error.to_string()))?;
         self.config.tools.push(TemporalTool {
             definition: ToolDefinition {
+                annotations: Default::default(),
                 name,
                 description: "Ask a durable child agent to complete a task.".into(),
                 parameters: serde_json::json!({"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"],"additionalProperties":false}),
@@ -1372,7 +1373,7 @@ impl TemporalAgent {
             .find(|definition| definition.name == name)
             .expect("newly added tool has a definition");
         let tool = TemporalTool {
-            definition,
+            definition: (*definition).clone(),
             requires_approval,
             policy,
             child: None,
@@ -1523,9 +1524,6 @@ where
     let mut agent = AgentRun::new(input.prompt)
         .with_history(input.history)
         .max_turns(config.max_turns);
-    if let Some(tool_choice) = config.tool_choice.clone() {
-        agent = agent.with_tool_choice(tool_choice);
-    }
     let mut prompt_index = allocate_prompt_index(ctx)?;
     let mut model_turn = 0;
 
@@ -1559,7 +1557,8 @@ where
                         TemporalAgentStatus::Tools { count: calls.len() }
                 });
                 let mut resolved = Vec::with_capacity(calls.len());
-                for (index, mut pending) in calls.into_iter().enumerate() {
+                for mut pending in calls {
+                    let index = pending.call_index;
                     let mut denied = false;
                     if pending.preresolved_result.is_none() {
                         let call = &pending.tool_call;
@@ -1599,26 +1598,25 @@ where
                         count: resolved.len(),
                     }
                 });
-                let results = join_all(resolved.into_iter().enumerate().map(
-                    |(call_index, resolved)| {
-                        execute_tool(
-                            ctx,
-                            resolved,
-                            &config,
-                            CallPosition {
-                                prompt_index,
-                                turn: model_turn,
-                                call_index,
-                            },
-                        )
-                    },
-                ))
+                let results = join_all(resolved.into_iter().map(|resolved| {
+                    let call_index = resolved.pending.call_index;
+                    execute_tool(
+                        ctx,
+                        resolved,
+                        &config,
+                        CallPosition {
+                            prompt_index,
+                            turn: model_turn,
+                            call_index,
+                        },
+                    )
+                }))
                 .await
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
                 let (results, outcomes): (Vec<_>, Vec<_>) = results.into_iter().unzip();
                 ctx.state_mut(|workflow| workflow.runtime_mut().outcomes.extend(outcomes));
-                agent.tool_results(results).map_err(workflow_error)?;
+                driver::temporal_tool_results(&mut agent, results).map_err(workflow_error)?;
             }
             driver::Effect::Done(response) => {
                 let history = agent.full_history();
@@ -1643,9 +1641,6 @@ where
                 agent = AgentRun::new(prompt)
                     .with_history(history)
                     .max_turns(config.max_turns);
-                if let Some(tool_choice) = config.tool_choice.clone() {
-                    agent = agent.with_tool_choice(tool_choice);
-                }
                 model_turn = 0;
             }
         }
@@ -1662,7 +1657,7 @@ where
 }
 
 struct ResolvedCall {
-    pending: rig::agent::PendingToolCall,
+    pending: crate::persistent::PendingToolCall,
     /// A human denied the call; `pending` carries the denial result.
     denied: bool,
 }
@@ -1694,13 +1689,13 @@ fn logical_key<W>(
 #[allow(clippy::too_many_arguments)]
 async fn await_approval<W>(
     ctx: &mut WorkflowContext<W>,
-    mut pending: rig::agent::PendingToolCall,
+    mut pending: crate::persistent::PendingToolCall,
     contract: InvocationContract,
     implementation_version: &str,
     prompt_index: u64,
     turn: usize,
     call_index: usize,
-) -> Result<(rig::agent::PendingToolCall, bool), temporalio_sdk::WorkflowTermination>
+) -> Result<(crate::persistent::PendingToolCall, bool), temporalio_sdk::WorkflowTermination>
 where
     W: TemporalWorkflowState,
 {

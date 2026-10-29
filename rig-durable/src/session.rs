@@ -10,8 +10,8 @@
 
 use std::{collections::VecDeque, time::Duration};
 
+use crate::persistent::Run as AgentRun;
 use duroxide::{Either2, OrchestrationContext};
-use rig::agent::AgentRun;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -27,7 +27,7 @@ use crate::{
     },
 };
 
-pub const SESSION_FORMAT_VERSION: u32 = 2;
+pub const SESSION_FORMAT_VERSION: u32 = 3;
 /// Duroxide queue that carries [`SessionCommand`]s.
 pub const SESSION_INBOX_QUEUE: &str = "RigSessionInboxV1";
 /// KV key of the [`SubmissionLedger`].
@@ -415,9 +415,6 @@ async fn run_prompt(
     let mut agent = AgentRun::new(input.message)
         .with_history(history)
         .max_turns(config.max_turns);
-    if let Some(tool_choice) = config.completion.tool_choice.clone() {
-        agent = agent.with_tool_choice(tool_choice);
-    }
     let mut cursor = Cursor {
         prompt_index: receipt.prompt_index,
         model_turn: 0,

@@ -53,6 +53,7 @@ impl CodeModeConfig {
 
     pub fn definition(&self) -> Result<ToolDefinition, String> {
         Ok(ToolDefinition {
+            annotations: Default::default(),
             name: rig::message::ToolName::new("codemode").map_err(|error| error.to_string())?,
             description: format!(
                 "Run a durable JavaScript async function body. Call tools with await tools[name](args). \

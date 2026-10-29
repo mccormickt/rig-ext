@@ -285,10 +285,10 @@ mod tests {
         assert!(decoded.metadata().retains("receipt"));
         assert_eq!(decoded.metadata().limit(), 512);
 
-        let legacy: ToolPolicy =
+        let without_metadata: ToolPolicy =
             serde_json::from_str(r#"{"replay_safety":"read_only","implementation_version":"1"}"#)
                 .unwrap();
-        assert_eq!(legacy.safety(), ReplaySafety::ReadOnly);
+        assert_eq!(without_metadata.safety(), ReplaySafety::ReadOnly);
         assert_eq!(
             ToolPolicy::default().safety(),
             ReplaySafety::ApplicationManaged

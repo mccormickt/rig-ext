@@ -6,11 +6,12 @@ use futures::{
     FutureExt,
     future::{LocalBoxFuture, poll_fn},
 };
-use rig::tool::{ToolExecutionError, ToolOutput, ToolResult, portable::ToolResultContext};
+use rig::tool::{ToolExecutionError, ToolOutput, ToolResult};
 use rig_codemode::{
     Catalog, CatalogEntry, Limits,
     replay::{ReplayInput, ReplayPlanner, ScriptCall},
 };
+use rig_core::tool::ToolResultContext;
 use serde::{Deserialize, Serialize};
 
 use super::{

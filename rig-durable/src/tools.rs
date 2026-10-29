@@ -174,7 +174,7 @@ pub async fn catalog_from_toolset(toolset: &ToolSet, retry: impl Into<RetryPolic
                 (
                     name,
                     ToolEntry {
-                        definition,
+                        definition: (*definition).clone(),
                         route: ToolRoute::RigTool,
                         retry: retry.clone(),
                         tag: None,
@@ -259,6 +259,7 @@ mod tests {
                 name: rig::message::ToolName::new(name).unwrap(),
                 description: String::new(),
                 parameters: serde_json::json!({}),
+                annotations: Default::default(),
             },
             format!("{name}Activity"),
             RetryPolicy::new(1),

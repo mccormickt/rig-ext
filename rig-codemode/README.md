@@ -195,8 +195,8 @@ sessions are not supported by that client.
 The `mcp` feature below integrates the native-only `rig-rmcp` client:
 
 ```rust,ignore
-let definitions = client.list_all_tools().await?;
-let mcp_tools = rig_rmcp::tools_from_server(definitions, client.peer());
+let connection = rig_rmcp::McpConnection::new(client);
+let mcp_tools = connection.tools().await?;
 let catalog = Catalog::new(mcp_tools.iter().map(McpTool::definition).map(CatalogEntry::from_mcp_definition))?;
 let dispatcher = OutputSchemaValidator::new(
     DynamicToolDispatcher::new(mcp_tools.into_iter().map(Into::into))?,
@@ -204,7 +204,7 @@ let dispatcher = OutputSchemaValidator::new(
 )?;
 ```
 
-Build catalog entries from `McpTool::definition()`; the Rig `ToolDefinition` has no output schema. `OutputSchemaValidator` reads the `McpStructuredContent` that `rig-rmcp` publishes to the result context and validates it against the declared schema. A missing or mismatching `structuredContent` becomes a failed, non-retryable call; the tool is not called again. `isError` results reject in normal mode; `.raw` mode keeps the permitted content blocks and status. Response `_meta` and the raw `CallToolResult` never reach scripts.
+Build catalog entries from `McpTool::definition()`; the Rig `ToolDefinition` has no output schema. `OutputSchemaValidator` reads `structured_content` from `McpCallToolResult` in the result context and validates it against the declared schema. A missing or mismatching `structuredContent` becomes a failed, non-retryable call; the tool is not called again. `isError` results reject in normal mode; `.raw` mode keeps the permitted content blocks and status. Response `_meta` and the raw `CallToolResult` never reach scripts.
 
 ## Examples
 

@@ -416,24 +416,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_payloads_are_byte_identical() {
-        let legacy = ToolActivityInput {
-            name: "add".into(),
-            arguments: "{}".into(),
-            invocation: ToolInvocation::legacy("run-1".into(), 0, 1, 0),
-            policy: None,
-        };
-        assert_eq!(
-            serde_json::to_string(&legacy).unwrap(),
-            r#"{"name":"add","arguments":"{}","invocation":{"execution_id":"run-1","prompt_index":0,"turn":1,"call_index":0}}"#
-        );
-        let old_output: ToolActivityOutput =
-            serde_json::from_str(r#"{"content":[{"type":"text","text":"3"}],"is_error":false}"#)
-                .unwrap();
-        assert!(old_output.result.is_none());
-    }
-
-    #[tokio::test]
     async fn equal_content_keeps_distinct_dispositions_through_execution() {
         let executor = ToolExecutor::new(Arc::new(ToolSet::from_tools(vec![Disposition])));
         let cases = [
@@ -495,7 +477,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output.result.unwrap().disposition, ToolDisposition::Error);
-        // Legacy payloads keep the old provider-error rule.
+        // An omitted policy uses application-managed replay safety.
         assert!(
             executor
                 .execute(input("disposition", provider, None))

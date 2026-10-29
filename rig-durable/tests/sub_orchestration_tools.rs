@@ -24,6 +24,7 @@ fn definition() -> ToolDefinition {
         name: rig::message::ToolName::new("child").unwrap(),
         description: "Run child".into(),
         parameters: serde_json::json!({"type":"object"}),
+        annotations: Default::default(),
     }
 }
 

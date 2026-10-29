@@ -1,9 +1,10 @@
-use rig::{agent::AgentRun, completion::Message};
+use crate::persistent::Run as AgentRun;
+use rig::completion::Message;
 use serde::{Deserialize, Serialize};
 
 use crate::{config::ConfigSnapshot, outcome::ToolOutcome};
 
-const CONTINUATION_FORMAT_VERSION: u32 = 2;
+const CONTINUATION_FORMAT_VERSION: u32 = 3;
 
 /// Persisted orchestration input.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -31,7 +32,7 @@ fn deserialize_continuation<'de, D: serde::Deserializer<'de>>(
 ) -> Result<Option<ContinuationEnvelope>, D::Error> {
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
     let Some(value) = value else { return Ok(None) };
-    if value.get("kind").and_then(serde_json::Value::as_str) != Some("v2")
+    if value.get("kind").and_then(serde_json::Value::as_str) != Some("v3")
         || value
             .get("format_version")
             .and_then(serde_json::Value::as_u64)
@@ -50,7 +51,7 @@ fn deserialize_continuation<'de, D: serde::Deserializer<'de>>(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ContinuationEnvelope {
-    V2 {
+    V3 {
         format_version: u32,
         generation: u32,
         operations: u32,
@@ -88,10 +89,6 @@ impl AgentInput {
         self
     }
 
-    pub(crate) fn is_resume(&self) -> bool {
-        self.continuation.is_some()
-    }
-
     pub(crate) fn into_run(self, max_turns: usize) -> Result<ResumedRun, String> {
         match self.continuation {
             None => Ok(ResumedRun {
@@ -103,7 +100,7 @@ impl AgentInput {
                 prompt_index: 0,
                 tool_outcomes: Vec::new(),
             }),
-            Some(ContinuationEnvelope::V2 {
+            Some(ContinuationEnvelope::V3 {
                 format_version,
                 generation,
                 operations: _,
@@ -136,7 +133,7 @@ impl AgentInput {
             prompt: Message::user(""),
             history: Vec::new(),
             snapshot,
-            continuation: Some(ContinuationEnvelope::V2 {
+            continuation: Some(ContinuationEnvelope::V3 {
                 format_version: CONTINUATION_FORMAT_VERSION,
                 generation,
                 operations,

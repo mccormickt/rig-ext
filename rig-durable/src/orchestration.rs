@@ -2,7 +2,7 @@ use std::{future::Future, pin::Pin, time::Duration};
 
 use duroxide::{Either2, OrchestrationContext};
 use rig::{
-    agent::{AgentRun, AgentRunStep, PendingToolCall, PromptResponse},
+    agent::PromptResponse,
     message::{ToolResultContent, UserContent},
 };
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ use crate::{
     identity::{AttemptMetadata, LogicalCallKey},
     names::RuntimeNames,
     outcome::{CallPosition, RetainedOutcomes, ToolOutcome},
+    persistent::{PendingToolCall, Run as AgentRun},
     streaming::apply as apply_streamed_turn,
     tools::ToolRoute,
     types::{AgentInput, ResumedRun},
@@ -54,7 +55,6 @@ pub(crate) async fn run_with_names(
     config: DurableAgentConfig,
     names: RuntimeNames,
 ) -> Result<PromptResponse, String> {
-    let is_resume = input.is_resume();
     let config = match &input.snapshot {
         Some(snapshot) => config
             .resolve(snapshot)
@@ -73,9 +73,6 @@ pub(crate) async fn run_with_names(
         prompt_index,
         mut tool_outcomes,
     } = input.into_run(config.max_turns)?;
-    if !is_resume && let Some(tool_choice) = config.completion.tool_choice.clone() {
-        agent = agent.with_tool_choice(tool_choice);
-    }
     let mut cursor = Cursor {
         prompt_index,
         model_turn: last_model_turn,
@@ -142,9 +139,6 @@ pub(crate) async fn run_with_names(
                     agent = AgentRun::new(prompt)
                         .with_history(history)
                         .max_turns(config.max_turns);
-                    if let Some(tool_choice) = config.completion.tool_choice.clone() {
-                        agent = agent.with_tool_choice(tool_choice);
-                    }
                     cursor.model_turn = 0;
                     if should_checkpoint(&agent, operations, &config) {
                         return checkpoint(
@@ -242,7 +236,8 @@ impl Engine<'_> {
             }
             driver::Effect::Tools { calls } => {
                 let mut resolved = Vec::with_capacity(calls.len());
-                for (call_index, pending) in calls.into_iter().enumerate() {
+                for pending in calls {
+                    let call_index = pending.call_index;
                     resolved.push(
                         self.resolve_approval(pending, cursor.position(call_index), decorate)
                             .await?,
@@ -255,8 +250,8 @@ impl Engine<'_> {
                 );
                 let futures: Vec<ToolFuture<'_>> = resolved
                     .into_iter()
-                    .enumerate()
-                    .map(|(call_index, resolved)| {
+                    .map(|resolved| {
+                        let call_index = resolved.pending.call_index;
                         Box::pin(self.execute_tool_call(resolved, cursor.position(call_index)))
                             as ToolFuture<'_>
                     })
@@ -274,7 +269,10 @@ impl Engine<'_> {
                 agent.tool_results(contents).map_err(|e| e.to_string())?;
                 Ok(Step::Continue)
             }
-            driver::Effect::Done(response) => Ok(Step::Done(Box::new(response))),
+            driver::Effect::Done(response) => {
+                agent.complete_outcomes(cursor.prompt_index, outcomes);
+                Ok(Step::Done(Box::new(response)))
+            }
         }
     }
 
@@ -551,9 +549,7 @@ pub(crate) fn should_checkpoint(
     if operations < threshold.get() {
         return false;
     }
-    // `is_done` becomes true only after advancing AwaitingAdvance. Probe a clone
-    // so a final text model response does not create an empty final execution.
-    !matches!(agent.clone().next_step(), Ok(AgentRunStep::Done(_)))
+    !agent.is_done()
 }
 
 async fn take_steering(

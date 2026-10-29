@@ -78,7 +78,7 @@ use std::sync::Arc;
 use a2a::{Message as A2AMessage, Part, Role, SendMessageRequest, SendMessageResponse};
 use a2a_client::{A2AClient as InnerClient, Transport};
 use futures::StreamExt;
-use rig_agent::agent::{AgentBuilder, NoToolConfig};
+use rig_agent::agent::AgentBuilder;
 use rig_core::completion::{
     AssistantContent, CompletionRequest, CompletionResponse, FinishReason, Usage,
 };
@@ -131,7 +131,7 @@ pub trait A2AModelRouteExt: Sized {
     -> Self;
 }
 
-impl<T> A2AModelRouteExt for AgentBuilder<T> {
+impl A2AModelRouteExt for AgentBuilder {
     fn a2a_model_route(
         self,
         label: impl Into<rig_agent::agent::ModelRef>,
@@ -194,7 +194,7 @@ impl A2AModel {
     ///
     /// Use this builder or [`A2AClient::agent`](crate::A2AClient::agent), not a
     /// raw erased driver, to preserve the newest prompt's message boundary.
-    pub fn agent(&self) -> AgentBuilder<NoToolConfig> {
+    pub fn agent(&self) -> AgentBuilder {
         // Rig registers the default model first. Its bus supports replacing
         // a handler with one of the same family before serving any requests.
         AgentBuilder::new(self.driver())
@@ -280,7 +280,7 @@ impl A2AModel {
             // message before Rig merges user messages across failed turns.
             let newest = request.chat_history.remove(request.chat_history.len() - 1);
             let standing = usize::from(matches!(
-                request.chat_history.first(),
+                request.chat_history.first().map(Arc::as_ref),
                 Some(RigMessage::System { .. })
             ));
             request.chat_history.truncate(standing);
@@ -349,7 +349,7 @@ impl A2AModel {
         // The leading system message is the preamble. It is standing context,
         // so it is removed from the history that is rendered below.
         let mut history = request.chat_history.into_iter().collect::<Vec<_>>();
-        if let Some(RigMessage::System { content }) = history.first() {
+        if let Some(RigMessage::System { content }) = history.first().map(Arc::as_ref) {
             push_standing_context(content.clone());
             history.remove(0);
         }
@@ -357,7 +357,7 @@ impl A2AModel {
             push_standing_context(document.to_string());
         }
 
-        let messages: &[RigMessage] = if threaded {
+        let messages: &[Arc<RigMessage>] = if threaded {
             history.last().map(std::slice::from_ref).unwrap_or_default()
         } else {
             &history
@@ -671,6 +671,7 @@ impl Wire for A2AModel {
     type Op = Completion;
     type Payload = A2APayload;
     type Frame = A2AFrame;
+    type Event = A2AFrame;
     type Decoder<'id> = A2ADecoder<'id>;
     type Reassembler = A2ADocument;
 
@@ -719,12 +720,15 @@ impl rig_core::completion::ReplayTarget for A2AModel {
     }
     fn encodes(&self, _model: &str, media: rig_core::completion::Media<'_>) -> bool {
         use rig_core::completion::Media;
-        use rig_core::message::DocumentSourceKind;
+        use rig_core::message::{DocumentData, DocumentSourceKind};
         let source = match media {
             Media::Image(image, _) => &image.data,
             Media::Audio(audio) => &audio.data,
             Media::Video(video) => &video.data,
-            Media::Document(document) => &document.data,
+            Media::Document(document) => match &document.data {
+                DocumentData::Text(_) => return true,
+                DocumentData::File(source) => source,
+            },
         };
         !matches!(
             source,
@@ -743,6 +747,7 @@ impl rig_core::completion::ReplayTarget for A2AModel {
         let OptionFields {
             reasoning,
             cache,
+            cache_key,
             service_tier,
             verbosity,
             parallel_tool_calls,
@@ -754,6 +759,7 @@ impl rig_core::completion::ReplayTarget for A2AModel {
         OptionMap {
             reasoning: Mapping::of(reasoning, unsupported),
             cache: Mapping::of(cache, |_| Mapping::unsupported("A2A has no cache setting")),
+            cache_key: Mapping::of(cache_key, |_| Mapping::unsupported("A2A has no cache key")),
             service_tier: Mapping::of(service_tier, |_| {
                 Mapping::unsupported("A2A has no service tier")
             }),
@@ -793,8 +799,11 @@ impl Serve for A2AHandler {
         use rig_core::effect::EffectKind;
         let kind = match kind {
             EffectKind::Completion { request, stream } => {
-                match self.model.prepare_request(request) {
-                    Ok(request) => EffectKind::Completion { request, stream },
+                match self.model.prepare_request(Arc::unwrap_or_clone(request)) {
+                    Ok(request) => EffectKind::Completion {
+                        request: Arc::new(request),
+                        stream,
+                    },
                     Err(error) => return Reply::Outcome(Err(error.into())),
                 }
             }
@@ -1075,8 +1084,19 @@ fn push_message_parts(parts: &mut Vec<Part>, message: &RigMessage) -> Result<(),
                     UserContent::Video(video) => {
                         message_parts.push(media_part(&video.data, video.media_type.as_ref())?)
                     }
-                    UserContent::Document(document) => message_parts
-                        .push(media_part(&document.data, document.media_type.as_ref())?),
+                    UserContent::Document(document) => match &document.data {
+                        rig_core::message::DocumentData::Text(text) => {
+                            message_parts.push(media_part(
+                                &rig_core::message::DocumentSourceKind::Raw(
+                                    text.as_bytes().to_vec(),
+                                ),
+                                document.media_type.as_ref(),
+                            )?)
+                        }
+                        rig_core::message::DocumentData::File(source) => {
+                            message_parts.push(media_part(source, document.media_type.as_ref())?)
+                        }
+                    },
                     UserContent::ToolResult(result) => {
                         for item in &result.content {
                             match item {
@@ -1155,7 +1175,6 @@ fn media_part(
                     detail: "invalid base64 media",
                 })?,
         ),
-        DocumentSourceKind::String(text) => a2a::PartContent::Raw(text.as_bytes().to_vec()),
         DocumentSourceKind::FileId(_) | DocumentSourceKind::Unknown => {
             return Err(A2AError::Unsupported {
                 what: "media",
@@ -1265,11 +1284,13 @@ mod tests {
     #[test]
     fn tools_are_rejected_rather_than_ignored() {
         let mut req = request();
-        req.tools.push(rig_core::completion::ToolDefinition {
-            name: rig_core::message::ToolName::new("add").expect("non-empty tool name"),
-            description: "adds".to_string(),
-            parameters: serde_json::json!({}),
-        });
+        req.tools
+            .push(Arc::new(rig_core::completion::ToolDefinition {
+                name: rig_core::message::ToolName::new("add").expect("non-empty tool name"),
+                description: "adds".to_string(),
+                parameters: serde_json::json!({}),
+                annotations: Default::default(),
+            }));
         let error = reject_unsupported(&req).expect_err("tools must be refused");
         assert!(error.to_string().contains("tools"), "{error}");
     }

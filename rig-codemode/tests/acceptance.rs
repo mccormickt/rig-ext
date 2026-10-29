@@ -1094,7 +1094,7 @@ async fn rig_tool_surface_maps_statuses() {
     assert_eq!(definition.parameters["required"], json!(["code"]));
 
     let output = tool
-        .execute(json!({"code": "text(await tools.json_tool()); return 'r';"}))
+        .run(json!({"code": "text(await tools.json_tool()); return 'r';"}))
         .await
         .unwrap();
     assert_eq!(
@@ -1103,7 +1103,7 @@ async fn rig_tool_surface_maps_statuses() {
     );
 
     let error = tool
-        .execute(json!({"code": "text('partial'); throw new Error('nope');"}))
+        .run(json!({"code": "text('partial'); throw new Error('nope');"}))
         .await
         .unwrap_err();
     assert_eq!(error.kind(), ToolErrorKind::Other);
@@ -1115,7 +1115,7 @@ async fn rig_tool_surface_maps_statuses() {
     );
 
     let error = tool
-        .execute(json!({"code": "while(true){}"}))
+        .run(json!({"code": "while(true){}"}))
         .await
         .unwrap_err();
     assert_eq!(error.kind(), ToolErrorKind::Timeout);
@@ -1125,7 +1125,7 @@ async fn rig_tool_surface_maps_statuses() {
         "{error:?}"
     );
 
-    let invalid = tool.execute(json!({"source": "x"})).await.unwrap_err();
+    let invalid = tool.run(json!({"source": "x"})).await.unwrap_err();
     assert_eq!(invalid.kind(), ToolErrorKind::InvalidArgs);
 }
 
@@ -1243,7 +1243,7 @@ async fn script_policy_refusal_runs_nothing() {
 
     let tool_error = codemode
         .tool()
-        .execute(json!({"code": "await tools.counter({});"}))
+        .run(json!({"code": "await tools.counter({});"}))
         .await
         .unwrap_err();
     assert_eq!(tool_error.kind(), ToolErrorKind::PermissionDenied);

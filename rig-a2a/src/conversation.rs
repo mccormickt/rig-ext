@@ -56,7 +56,7 @@ impl ExtensionOptions for Conversation {
     type Ext = Self;
 }
 
-impl<ToolState> A2AConversationExt for AgentBuilder<ToolState> {
+impl A2AConversationExt for AgentBuilder {
     fn a2a_conversation(self, id: impl Into<String>) -> Self {
         let id = id.into();
         self.conversation(id.clone())

@@ -325,7 +325,7 @@ fn tool_result_text(model: &MockCompletionModel, request: usize) -> String {
     request
         .chat_history
         .iter()
-        .filter_map(|message| match message {
+        .filter_map(|message| match message.as_ref() {
             Message::User { content } => Some(content.to_vec()),
             _ => None,
         })

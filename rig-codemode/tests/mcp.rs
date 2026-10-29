@@ -29,8 +29,8 @@ const SECRET: &str = "UNIQUE_REDACTED_SCHEMA_SECRET_82391";
 const SECRET_KEY: &str = "UNIQUE_REDACTED_PROPERTY_71503";
 
 impl ServerHandler for FakeServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::LATEST)
             .with_server_info(Implementation::new("rig-codemode-test", "0.1.0"))
     }
@@ -76,9 +76,9 @@ impl ServerHandler for FakeServer {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(match request.name.as_ref() {
+        Ok((match request.name.as_ref() {
             "answer" => CallToolResult::structured(json!({"answer": 42})),
             "wrong_shape" => CallToolResult::structured(json!({"answer": SECRET})),
             "secret_key" => CallToolResult::structured(json!({"answer": 42, (SECRET_KEY): true})),
@@ -96,13 +96,14 @@ impl ServerHandler for FakeServer {
                 ));
             }
         })
+        .into())
     }
 }
 
 struct Fixture {
     codemode: CodeMode,
     invocations: Arc<AtomicUsize>,
-    _client: rmcp::service::RunningService<rmcp::service::RoleClient, ClientInfo>,
+    _client: rig_rmcp::McpConnection,
     server_task: tokio::task::JoinHandle<()>,
 }
 
@@ -118,12 +119,12 @@ async fn fixture() -> Fixture {
             .expect("server start");
         let _ = running.waiting().await;
     });
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve((client_from_server, client_to_server))
         .await
         .expect("client connect");
-    let definitions = client.list_all_tools().await.expect("list tools");
-    let mcp_tools = rig_rmcp::tools_from_server(definitions, client.peer());
+    let client = rig_rmcp::McpConnection::new(client);
+    let mcp_tools = client.tools().await.expect("list tools");
 
     let catalog = Catalog::new(
         mcp_tools

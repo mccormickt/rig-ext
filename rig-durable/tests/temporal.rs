@@ -27,7 +27,7 @@ use rig_durable::{
         TemporalSubmission,
     },
 };
-use rig_memory::SlidingWindowMemory;
+use rig_memory::recent::LastMessages;
 use serde::Deserialize;
 use temporalio_client::{
     Client, ClientOptions, Connection, WorkflowExecuteUpdateOptions, WorkflowGetResultOptions,
@@ -423,7 +423,7 @@ async fn temporal_code_mode_out_of_order_child_race_restart_and_replay() {
                         let Some(Attributes::ActivityTaskCompletedEventAttributes(activity)) = &event.attributes else { return false; };
                         let is_plan = events.iter().any(|scheduled| {
                             scheduled.event_id == activity.scheduled_event_id
-                                && matches!(&scheduled.attributes, Some(Attributes::ActivityTaskScheduledEventAttributes(plan)) if plan.activity_type.as_ref().is_some_and(|kind| kind.name == "RigTemporalCodeModeStepG2V1"))
+                                && matches!(&scheduled.attributes, Some(Attributes::ActivityTaskScheduledEventAttributes(plan)) if plan.activity_type.as_ref().is_some_and(|kind| kind.name == "RigTemporalCodeModeStepG3V1"))
                         });
                         is_plan && activity.result.as_ref().is_some_and(|result| result.payloads.iter().any(|payload| {
                             serde_json::from_slice::<serde_json::Value>(&payload.data).is_ok_and(|value| {
@@ -1757,7 +1757,7 @@ async fn queued_prompts_and_steering_compact_before_each_next_prompt() {
     let requests = model.requests();
     assert_eq!(requests.len(), 9);
     for (index, summary) in [(3, "S1"), (5, "S2"), (7, "S3")] {
-        rig::transcript::validate_canonical(&requests[index].chat_history).unwrap();
+        rig::conversation::pairing::validate(&requests[index].chat_history).unwrap();
         assert_eq!(
             user_texts(&requests[index].chat_history)[0],
             format!("{SUMMARY_HEADER}{summary}")
@@ -1856,10 +1856,10 @@ fn update_failure_message(error: &WorkflowUpdateError) -> String {
     }
 }
 
-fn user_texts(messages: &[Message]) -> Vec<String> {
+fn user_texts(messages: &[impl std::borrow::Borrow<Message>]) -> Vec<String> {
     messages
         .iter()
-        .flat_map(|message| match message {
+        .flat_map(|message| match message.borrow() {
             Message::User { content } => content
                 .iter()
                 .filter_map(|item| match item {
@@ -1872,10 +1872,10 @@ fn user_texts(messages: &[Message]) -> Vec<String> {
         .collect()
 }
 
-fn has_tool_call(messages: &[Message]) -> bool {
+fn has_tool_call(messages: &[impl std::borrow::Borrow<Message>]) -> bool {
     messages.iter().any(|message| {
         matches!(
-            message,
+            message.borrow(),
             Message::Assistant(assistant)
                 if assistant.content.iter().any(|item| matches!(item, AssistantContent::ToolCall(_)))
         )
@@ -2048,10 +2048,7 @@ async fn temporal_follow_up_during_a_tool_round_runs_after_the_answer_and_reject
 }
 
 fn compaction(model: &MockCompletionModel, keep: usize) -> Compaction {
-    Compaction::new(
-        SlidingWindowMemory::last_messages(keep),
-        ModelCompactor::new(model.clone()),
-    )
+    Compaction::new(LastMessages(keep), ModelCompactor::new(model.clone()))
 }
 
 const SUMMARY_HEADER: &str = "Summary of the earlier conversation:\n";
@@ -2093,7 +2090,7 @@ async fn temporal_compaction_keeps_the_request_canonical_and_the_transcript_comp
     // window at the tool result, so the policy demoted the whole exchange.
     let summary_a = &requests[2];
     assert!(matches!(
-        summary_a.chat_history.first(),
+        summary_a.chat_history.first().map(AsRef::as_ref),
         Some(Message::System { .. })
     ));
     assert_eq!(summary_a.chat_history.len(), 4);
@@ -2109,7 +2106,7 @@ async fn temporal_compaction_keeps_the_request_canonical_and_the_transcript_comp
     );
 
     let second = &requests[3];
-    rig::transcript::validate_canonical(&second.chat_history).unwrap();
+    rig::conversation::pairing::validate(&second.chat_history).unwrap();
     assert_eq!(second.chat_history.len(), 3);
     assert_eq!(
         user_texts(&second.chat_history),
@@ -2128,7 +2125,7 @@ async fn temporal_compaction_keeps_the_request_canonical_and_the_transcript_comp
     );
 
     let third = &requests[5];
-    rig::transcript::validate_canonical(&third.chat_history).unwrap();
+    rig::conversation::pairing::validate(&third.chat_history).unwrap();
     assert_eq!(third.chat_history.len(), 3);
     assert_eq!(
         user_texts(&third.chat_history),
@@ -2150,7 +2147,7 @@ async fn temporal_compaction_keeps_the_request_canonical_and_the_transcript_comp
     );
 
     let fourth = &requests[7];
-    rig::transcript::validate_canonical(&fourth.chat_history).unwrap();
+    rig::conversation::pairing::validate(&fourth.chat_history).unwrap();
     assert_eq!(
         user_texts(&fourth.chat_history),
         [

@@ -342,7 +342,7 @@ impl HostDispatcher for DynamicToolDispatcher {
             }
             let mut context = invocation.context.for_dispatch();
             let result = tool_result(
-                tool.execute_with(&mut context, invocation.arguments.clone())
+                tool.run_with(&mut context, invocation.arguments.clone())
                     .await,
             );
             let result = match &self.result_policy {

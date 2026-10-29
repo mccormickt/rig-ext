@@ -2,7 +2,7 @@
 
 use rig_core::{
     http_client::StatusCode,
-    test_utils::{MockHttpResponse, RecordingHttpClient},
+    test_utils::{MockHttpResponse, RecordingHttpClient, SequencedHttpClient},
     tool::ToolErrorKind,
 };
 use rig_typesafeai::JevConfig;
@@ -59,7 +59,7 @@ async fn preserves_native_answers_and_projects_only_model_and_usage() {
             input_questions["urgent"]["criteria"] = Value::Null;
         }
         let output = tool
-            .execute(json!({"state": state, "questions": input_questions}))
+            .run(json!({"state": state, "questions": input_questions}))
             .await
             .unwrap();
         assert_eq!(
@@ -114,7 +114,7 @@ async fn direct_calls_reject_invalid_arguments_without_provider_io() {
         inputs.push(input);
     }
     for input in inputs {
-        let error = tool.execute(input.clone()).await.unwrap_err();
+        let error = tool.run(input.clone()).await.unwrap_err();
         assert_eq!(error.kind(), ToolErrorKind::InvalidArgs, "{input}");
     }
     assert!(http.requests().is_empty());
@@ -123,12 +123,6 @@ async fn direct_calls_reject_invalid_arguments_without_provider_io() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn provider_failures_and_invalid_answers_are_redacted_not_retried() {
-    let http = RecordingHttpClient::default();
-    let tool = evaluation_tool(
-        JevConfig::new("host-only-token")
-            .connect(http.clone())
-            .evaluation(),
-    );
     let mut responses = vec![
         MockHttpResponse::error(
             StatusCode::TOO_MANY_REQUESTS,
@@ -148,10 +142,16 @@ async fn provider_failures_and_invalid_answers_are_redacted_not_retried() {
             .to_string(),
         ));
     }
-    for (index, response) in responses.into_iter().enumerate() {
-        http.set_response(response);
+    let count = responses.len();
+    let http = SequencedHttpClient::new(responses);
+    let tool = evaluation_tool(
+        JevConfig::new("host-only-token")
+            .connect(http.clone())
+            .evaluation(),
+    );
+    for index in 0..count {
         let error = tool
-            .execute(json!({"state": "outage", "questions": {
+            .run(json!({"state": "outage", "questions": {
                 "urgent": {"type": "noul", "instructions": "Act now?"}
             }}))
             .await
@@ -188,7 +188,7 @@ async fn host_question_budgets_are_not_baked_into_the_adapter() {
         RecordingHttpClient::new(json!({"model": "fixture", "answers": answers}).to_string());
     let tool = evaluation_tool(JevConfig::new("unused").connect(http).evaluation());
     let output = tool
-        .execute(json!({"state": [], "questions": questions}))
+        .run(json!({"state": [], "questions": questions}))
         .await
         .unwrap();
     assert_eq!(
@@ -234,7 +234,7 @@ async fn local_model_keeps_rc_state_across_an_await() {
     let calls = Rc::new(Cell::new(0));
     let tool = evaluation_tool(LocalModel(calls.clone()));
     let output = tool
-        .execute(json!({"state": "ready", "questions": {
+        .run(json!({"state": "ready", "questions": {
             "ready": {"type": "noul", "instructions": "Ready?"}
         }}))
         .await

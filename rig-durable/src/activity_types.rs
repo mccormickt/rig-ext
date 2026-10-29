@@ -11,9 +11,8 @@ use crate::{
 
 /// Selects the wire contract between an orchestration and its tool activity.
 ///
-/// Changing the contract of a registered orchestration version changes its
-/// activity names and payloads, so existing histories can no longer replay.
-/// Select the contract per version and keep old versions registered.
+/// The contract fixes activity names and payloads for an execution. Select it
+/// before starting work; replay requires the same contract.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InvocationContract {

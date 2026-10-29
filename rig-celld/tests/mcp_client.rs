@@ -212,14 +212,14 @@ async fn result_validation_and_code_mode_keep_failures_and_metadata_private() {
         ));
     }
     let dynamic = tool.into_dynamic_tool();
-    let output = dynamic.execute(json!({})).await.unwrap();
+    let output = dynamic.run(json!({})).await.unwrap();
     assert_eq!(output.as_json(), Some(&json!({"answer": 37})));
-    let mixed = dynamic.execute(json!({"mode": "mixed"})).await.unwrap();
+    let mixed = dynamic.run(json!({"mode": "mixed"})).await.unwrap();
     let mixed = serde_json::to_string(&mixed).unwrap();
     assert!(!mixed.contains("secret"));
     assert!(mixed.contains("application-data"));
     assert!(mixed.contains("test://record") && mixed.contains("test://link"));
-    let error = dynamic.execute(json!({"mode": "error"})).await.unwrap_err();
+    let error = dynamic.run(json!({"mode": "error"})).await.unwrap_err();
     assert_eq!(error.kind(), ToolErrorKind::Other);
     assert_eq!(error.retryable(), Some(false));
     assert!(
@@ -347,7 +347,7 @@ async fn dynamic_context_passes_only_explicit_idempotency_key() {
         })
         .unwrap();
     assert_eq!(
-        tool.execute_with(&mut context, json!({}))
+        tool.run_with(&mut context, json!({}))
             .await
             .unwrap()
             .as_json(),

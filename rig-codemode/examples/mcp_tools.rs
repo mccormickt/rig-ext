@@ -21,8 +21,8 @@ use serde_json::json;
 struct WeatherServer;
 
 impl ServerHandler for WeatherServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("weather", "0.1.0"))
     }
 
@@ -58,7 +58,7 @@ impl ServerHandler for WeatherServer {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         let city = request
             .arguments
             .as_ref()
@@ -70,15 +70,16 @@ impl ServerHandler for WeatherServer {
             "Lisbon" => (21.5, "sunny"),
             // Violates the declared schema on purpose.
             "Atlantis" => {
-                return Ok(CallToolResult::structured(
-                    json!({"city": city, "high_c": "warm"}),
-                ));
+                return Ok(
+                    CallToolResult::structured(json!({"city": city, "high_c": "warm"})).into(),
+                );
             }
             _ => (12.0, "rain"),
         };
         Ok(CallToolResult::structured(json!({
             "city": city, "high_c": high, "conditions": conditions
-        })))
+        }))
+        .into())
     }
 }
 
@@ -94,12 +95,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = running.waiting().await;
         }
     });
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve((client_from_server, client_to_server))
         .await?;
 
-    let definitions = client.list_all_tools().await?;
-    let mcp_tools = rig_rmcp::tools_from_server(definitions, client.peer());
+    let client = rig_rmcp::McpConnection::new(client);
+    let mcp_tools = client.tools().await?;
     // Build the catalog from the MCP definitions: the Rig `ToolDefinition`
     // produced by `DynamicTool::try_from` has no output schema.
     let catalog = Catalog::new(

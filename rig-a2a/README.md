@@ -149,10 +149,10 @@ Applications can parse and validate the completed text locally instead.
 `AgentRun` is the serializable state machine, not a transport or persistence
 backend. Use `agent.resume(restored_run).provider_option(saved_options)` to
 resume a ready checkpoint through the normal runner, or supply model/tool IO
-from your own driver. A run in `AwaitingModel` cannot be resumed directly:
-feed the issued call's recovered response through `model_response` first.
-Setting provider options does not reissue a pending call. Persist the response
-and pending run together; if the response was lost, the host must reconcile the
+from your own driver. Rig 0.45 reissues a model request when the restored run is
+in `AwaitingModel`. To avoid repeating an issued request, feed its recovered
+response through `model_response` before resuming. Persist the response and
+pending run together; if the response was lost, the host must reconcile the
 remote task before deciding whether another request is safe.
 
 An accepted-turn checkpoint resumes without repeating that model call. A
@@ -264,19 +264,19 @@ upstream transport limit, not an authentication guarantee.
 
 ## Released API baseline and source review
 
-Reviewed against released packages on 2026-10-13:
+Protocol review: 2026-10-13. Rig API migration: 2026-10-28.
 
 | Component | Release | Integration decision |
 | --- | --- | --- |
-| Rig | [0.44.0](https://github.com/0xPlaygrounds/rig/releases/tag/v0.44.0) | Keep the released `Wire` + `Transport` driver; the old `CompletionModel` trait is no longer the extension point. |
+| Rig | [0.45.0](https://github.com/0xPlaygrounds/rig/releases/tag/v0.45.0) | Keep the released `Wire` + `Transport` driver; the old `CompletionModel` trait is no longer the extension point. |
 | A2A specification | [1.0.1](https://github.com/a2aproject/A2A/releases/tag/v1.0.1) | Wire version is `1.0`; patch releases do not change negotiation. |
 | LF core/client/server | [0.4.1](https://docs.rs/a2a-lf/0.4.1/a2a/), [0.2.8](https://docs.rs/a2a-client-lf/0.2.8/a2a_client/), [0.5.2](https://docs.rs/a2a-server-lf/0.5.2/a2a_server/) | Upgrade together to keep one set of protocol types and obtain streaming/error, tenant, task-state, and artifact-reduction fixes. |
 
 The authoritative Rig contracts are the version-pinned docs for
-[AgentRunner](https://docs.rs/rig-agent/0.44.0/rig_agent/agent/runner/struct.AgentRunner.html),
-[AgentRun](https://docs.rs/rig-agent/0.44.0/rig_agent/run/struct.AgentRun.html),
-[Wire](https://docs.rs/rig-core/0.44.0/rig_core/wire/trait.Wire.html), and
-[ReplayTarget](https://docs.rs/rig-core/0.44.0/rig_core/completion/trait.ReplayTarget.html).
+[AgentRunner](https://docs.rs/rig-agent/0.45.0/rig_agent/agent/runner/struct.AgentRunner.html),
+[AgentRun](https://docs.rs/rig-agent/0.45.0/rig_agent/run/struct.AgentRun.html),
+[Wire](https://docs.rs/rig-core/0.45.0/rig_core/wire/trait.Wire.html), and
+[ReplayTarget](https://docs.rs/rig-core/0.45.0/rig_core/completion/trait.ReplayTarget.html).
 Old `rig` library URLs can show stale `CompletionModel` documentation. Upstream
 `main` also changes the serialized run format and turn-policy types; this crate
 does not depend on unreleased APIs or promise cross-version run compatibility.

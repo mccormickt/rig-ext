@@ -368,6 +368,7 @@ impl DurableAgentBuilder {
         let child_metadata = child.metadata.clone();
         self.routed_tools.insert(durable_agent_tool(
             ToolDefinition {
+                annotations: Default::default(),
                 name: rig::message::ToolName::new(tool_name).map_err(|error| {
                     AgentOrchestratorError::InvalidToolPolicy(error.to_string())
                 })?,
@@ -400,7 +401,7 @@ impl DurableAgentBuilder {
                 .remove(definition.name.as_str())
                 .unwrap_or_default();
             self.routed_tools.insert(ToolEntry {
-                definition,
+                definition: (*definition).clone(),
                 route: crate::ToolRoute::RigTool,
                 retry: options.retry,
                 tag: options.tag,

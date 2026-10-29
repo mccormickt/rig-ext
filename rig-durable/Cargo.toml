@@ -36,7 +36,9 @@ required-features = ["codemode", "sqlite"]
 duroxide = { workspace = true, optional = true }
 futures = "0.3"
 rig.workspace = true
+rig-core.workspace = true
 rig-memory.workspace = true
+rig-cassette.workspace = true
 rig-codemode = { path = "../rig-codemode", optional = true }
 rig-celld = { path = "../rig-celld", features = ["storage"], optional = true }
 worker = { workspace = true, optional = true }

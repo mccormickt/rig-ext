@@ -19,6 +19,30 @@ safety and idempotency policy.
 Backend features are independent. Enable `temporal` with defaults to use both
 native backends. Use only `durable-object` on `wasm32-unknown-unknown`.
 
+## Persistent Rig runner
+
+Duroxide and Durable Objects use `persistent::Run`, backed by Rig 0.45's
+`AgentRunner::resume`, custom `Serve` handlers, `EffectLogRecorder`, replay
+stamps, and by-ID `EffectLogReplayer`. The runner plans work without I/O.
+Backend adapters retain durable admission, independent settlement, approvals,
+retry timers, child protocols, and invocation guards. Code-mode scheduling
+stays in `SchedulerState`.
+
+Each prompt retains its initial Rig seed and incrementally added effect records.
+Sparse recovery can replay a later settled call while an earlier call remains
+pending. Replay work has a local poll budget; prompt turn limits and backend
+payload limits also apply. The complete prompt log is part of the backend
+checkpoint, not a separate unbounded journal. Prompt boundaries discard it.
+See [architecture](docs/guide.md#architecture) for storage costs and limits.
+
+Temporal still uses Rig's typed state-machine API. Its runner adoption is a
+separate step; the shared planner requires no `Send` workflow context and never
+polls backend futures. Temporal must retain SDK-owned command replay.
+
+This crate is pre-release. Persisted state and workflow histories are not
+compatible across crate or Rig upgrades. Use fresh executions and storage when
+the persistence format changes.
+
 ## Guides
 
 - Backends: [Duroxide](docs/guide.md#duroxide), [Temporal](docs/guide.md#temporal),
@@ -44,6 +68,10 @@ Most [native examples](examples) use controlled models and need no API key.
 `durable_agent` uses OpenAI and requires `OPENAI_API_KEY`.
 The [Durable Object example](examples/durable-object/README.md) runs on celld
 or Wrangler without `sqlite-vec`.
+
+The isolated [Rig-native replay prototype](examples/rig-native/README.md) uses
+Rig 0.45's runner and effect logs with a SQLite approval and intent journal.
+Its process-restart tests are separate from the production backend tests below.
 
 ```sh
 cargo test --locked -p rig-durable --all-features

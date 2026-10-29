@@ -413,7 +413,7 @@ fn tool_result_texts(model: &MockCompletionModel) -> Vec<String> {
         .requests()
         .iter()
         .flat_map(|request| request.chat_history.iter().cloned())
-        .filter_map(|message| match message {
+        .filter_map(|message| match Arc::unwrap_or_clone(message) {
             RigMessage::User { content } => Some(content),
             _ => None,
         })
@@ -592,17 +592,22 @@ async fn threaded_turns_send_standing_context_once() {
     let model = remote.model_for_conversation("user-42");
 
     let mut turn = text_request("turn 1");
-    turn.chat_history
-        .insert(0, rig_core::message::Message::system("You are terse."));
+    turn.chat_history.insert(
+        0,
+        rig_core::message::Message::system("You are terse.").into(),
+    );
     turn.documents = vec![document("handbook", "the standing handbook")];
     model.completion(turn).await.expect("turn 1 should succeed");
 
     // Turn 2 repeats the same preamble and document, as Rig rebuilds them for
     // every request, and additionally retrieves one new document.
     let mut turn = text_request("turn 2");
-    turn.chat_history.insert(0, RigMessage::user("turn 1"));
     turn.chat_history
-        .insert(0, rig_core::message::Message::system("You are terse."));
+        .insert(0, RigMessage::user("turn 1").into());
+    turn.chat_history.insert(
+        0,
+        rig_core::message::Message::system("You are terse.").into(),
+    );
     turn.documents = vec![
         document("handbook", "the standing handbook"),
         document("retrieved", "freshly retrieved passage"),
@@ -685,8 +690,8 @@ async fn threaded_requests_keep_only_the_original_newest_multipart_message() {
                     }
                 } else {
                     let mut request = CompletionRequest::new(newest.clone());
-                    request.chat_history = history.clone();
-                    request.chat_history.push(newest.clone());
+                    request.chat_history = history.iter().cloned().map(Arc::new).collect();
+                    request.chat_history.push(Arc::new(newest.clone()));
                     request.additional_params = Some(params.clone());
                     if streaming {
                         let mut stream = remote.model().stream(request).unwrap();
@@ -762,7 +767,7 @@ async fn explicit_context_does_not_read_or_replace_a_bound_conversation() {
         let mut request = text_request(&format!("turn {index}"));
         request
             .chat_history
-            .insert(0, RigMessage::system("You are terse."));
+            .insert(0, RigMessage::system("You are terse.").into());
         request.documents = vec![document("handbook", "the standing handbook")];
         if let Some(context) = context {
             request.additional_params = Some(serde_json::json!({
@@ -959,11 +964,12 @@ async fn model_rejects_requests_a2a_cannot_carry() {
     let model = client.model();
 
     let mut with_tools = text_request("hi");
-    with_tools.tools.push(ToolDefinition {
+    with_tools.tools.push(Arc::new(ToolDefinition {
         name: rig_core::message::ToolName::new("add").expect("non-empty tool name"),
         description: "adds".to_string(),
         parameters: serde_json::json!({}),
-    });
+        annotations: Default::default(),
+    }));
     let error = model
         .completion(with_tools)
         .await
@@ -1580,8 +1586,8 @@ async fn routing_away_from_a2a_keeps_the_selected_models_history() {
     assert_eq!(response.to_string(), "local answer");
     let requests = mock.requests();
     let history = &requests[0].chat_history;
-    assert!(history.iter().any(|message| matches!(message, RigMessage::User { content } if content.iter().any(|part| matches!(part, UserContent::Text(text) if text.text.contains("old question"))))));
-    assert!(history.iter().any(|message| matches!(message, RigMessage::Assistant(message) if message.content.iter().any(|part| matches!(part, rig_core::message::AssistantContent::Text(text) if text.text == "old answer")))));
+    assert!(history.iter().any(|message| matches!(message.as_ref(), RigMessage::User { content } if content.iter().any(|part| matches!(part, UserContent::Text(text) if text.text.contains("old question"))))));
+    assert!(history.iter().any(|message| matches!(message.as_ref(), RigMessage::Assistant(message) if message.content.iter().any(|part| matches!(part, rig_core::message::AssistantContent::Text(text) if text.text == "old answer")))));
 }
 
 #[tokio::test]
@@ -1762,7 +1768,7 @@ async fn multimodal_input_and_direct_events_keep_bytes_mime_types_and_order() {
                 ..Default::default()
             }),
             UserContent::Document(MediaDocument {
-                data: Source::String("plain document".into()),
+                data: rig_core::message::DocumentData::Text("plain document".into()),
                 media_type: Some(DocumentMediaType::TXT),
                 ..Default::default()
             }),
@@ -1870,21 +1876,23 @@ async fn a_restored_agent_run_can_resume_remote_work_with_a_fresh_client() {
             panic!("expected a pending model call")
         };
         let pending = serde_json::to_vec(&run).unwrap();
+        // Rig reissues a pending model call. The remote rejects this unknown
+        // task, so it cannot consume the scripted response for the real task.
         let error = client
             .agent()
             .build()
             .resume(serde_json::from_slice(&pending).unwrap())
-            .provider_option(rig_a2a::A2AOptions::default().task("does-not-reissue"))
+            .provider_option(rig_a2a::A2AOptions::default().task("missing-task"))
             .run()
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("model response is pending"),
+            error.to_string().contains("task not found: missing-task"),
             "{error}"
         );
         assert!(
             recorded.lock().unwrap().is_empty(),
-            "AwaitingModel must not resend the pending call"
+            "an unknown task must not reach the remote executor"
         );
 
         let response = client
@@ -1902,8 +1910,7 @@ async fn a_restored_agent_run_can_resume_remote_work_with_a_fresh_client() {
         };
         // A host persists the pending run and the response to its issued call.
         // The A2A completion advertises no local tools.
-        let turn =
-            ModelTurn::from_response_parts(&response, Default::default(), Default::default());
+        let turn = ModelTurn::from_policy(&response, Default::default());
         let saved_turn = serde_json::to_vec(&turn).unwrap();
         let mut run: AgentRun = serde_json::from_slice(&pending).unwrap();
         run.model_response(serde_json::from_slice(&saved_turn).unwrap())
@@ -2108,8 +2115,10 @@ async fn system_instructions_are_sent_once() {
 
     for model in [remote.model(), remote.model_for_conversation("user-42")] {
         let mut turn = text_request("hello");
-        turn.chat_history
-            .insert(0, rig_core::message::Message::system("You are terse."));
+        turn.chat_history.insert(
+            0,
+            rig_core::message::Message::system("You are terse.").into(),
+        );
         model.completion(turn).await.expect("completion succeeds");
     }
 
@@ -2656,7 +2665,11 @@ async fn oracle_later_hooks_control_the_sent_multipart_prompt() {
                 return DispatchAction::Proceed;
             };
             let mut request = request.clone();
-            if let Some(RigMessage::User { content }) = request.chat_history.last_mut() {
+            if let Some(RigMessage::User { content }) = Arc::make_mut(&mut request)
+                .chat_history
+                .last_mut()
+                .map(Arc::make_mut)
+            {
                 for part in content {
                     if let UserContent::Text(text) = part {
                         text.text = text.text.replace("private-token", "[redacted]");

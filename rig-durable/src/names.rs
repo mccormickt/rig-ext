@@ -3,18 +3,18 @@
 use crate::activity_types::InvocationContract;
 
 /// Crate-owned persistence generation, independent of application semver.
-pub const PERSISTENCE_GENERATION: u32 = 2;
-pub const ORCHESTRATION: &str = "RigDurableAgentG2V1";
-pub const COMPLETION_ACTIVITY: &str = "RigModelCompletionG2V1";
-pub const STREAMING_COMPLETION_ACTIVITY: &str = "RigModelStreamingCompletionG2V1";
+pub const PERSISTENCE_GENERATION: u32 = 3;
+pub const ORCHESTRATION: &str = "RigDurableAgentG3V1";
+pub const COMPLETION_ACTIVITY: &str = "RigModelCompletionG3V1";
+pub const STREAMING_COMPLETION_ACTIVITY: &str = "RigModelStreamingCompletionG3V1";
 /// Tool activity under [`InvocationContract::Legacy`].
-pub const TOOL_ACTIVITY: &str = "RigToolExecutionG2V1";
+pub const TOOL_ACTIVITY: &str = "RigToolExecutionG3V1";
 /// Tool activity under [`InvocationContract::Logical`].
-pub const LOGICAL_TOOL_ACTIVITY: &str = "RigToolExecutionG2V2";
+pub const LOGICAL_TOOL_ACTIVITY: &str = "RigToolExecutionG3V2";
 /// Long-lived session orchestration.
-pub const SESSION_ORCHESTRATION: &str = "RigDurableAgentSessionG2V1";
+pub const SESSION_ORCHESTRATION: &str = "RigDurableAgentSessionG3V1";
 /// Summarization activity used by completed-prompt compaction.
-pub const COMPACTION_ACTIVITY: &str = "RigContextCompactionG2V1";
+pub const COMPACTION_ACTIVITY: &str = "RigContextCompactionG3V1";
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeNames {
