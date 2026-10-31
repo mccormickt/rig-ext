@@ -29,13 +29,29 @@ pub struct StepInput {
     pub history: Vec<SettledCall>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CodeModeConfig {
     pub limits: Limits,
     pub definitions: Vec<ToolDefinition>,
+    /// Planner and durable host projection identity captured at construction.
+    pub runtime_identity: String,
 }
 
 impl CodeModeConfig {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn native(limits: Limits, definitions: Vec<ToolDefinition>) -> Self {
+        use rig_codemode::replay::NativeReplayPlanner;
+        Self {
+            limits,
+            definitions,
+            runtime_identity: Self::runtime_identity(&NativeReplayPlanner),
+        }
+    }
+
+    pub fn runtime_identity(planner: &dyn rig_codemode::replay::ReplayPlanner) -> String {
+        format!("{}/rig-durable/projection-v1", planner.runtime_identity())
+    }
+
     fn catalog(&self) -> Result<Catalog, String> {
         let catalog = Catalog::new(self.definitions.iter().map(CatalogEntry::from_definition))
             .map_err(|error| error.to_string())?;
@@ -46,6 +62,9 @@ impl CodeModeConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.runtime_identity.is_empty() {
+            return Err("missing code-mode runtime identity".into());
+        }
         self.limits.validate().map_err(|error| error.to_string())?;
         self.catalog()?;
         Ok(())
@@ -74,15 +93,21 @@ impl CodeModeConfig {
     /// Native QuickJS convenience planner. Portable adapters supply a planner.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn step(&self, input: StepInput) -> Result<ScriptStep, String> {
-        rig_codemode::replay::step(
-            &input.code,
-            &self.catalog()?,
-            self.limits,
-            &input.admitted,
-            &input.history,
-        )
-        .await
-        .map_err(|error| error.to_string())
+        use rig_codemode::replay::{NativeReplayPlanner, ReplayInput, ReplayPlanner};
+        let planner = NativeReplayPlanner;
+        if self.runtime_identity != Self::runtime_identity(&planner) {
+            return Err("incompatible code-mode runtime identity".into());
+        }
+        planner
+            .plan(ReplayInput {
+                code: &input.code,
+                catalog: &self.catalog()?,
+                limits: self.limits,
+                admitted: &input.admitted,
+                history: &input.history,
+            })
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -381,9 +406,7 @@ pub(crate) fn activity_result(
     output: crate::ToolActivityOutput,
     name: &str,
 ) -> Result<ToolResult, String> {
-    let durable = output
-        .result
-        .ok_or("tool activity omitted its durable result")?;
+    let durable = output.result;
     Ok(durable.result.unwrap_or_else(|| {
         ToolResult::failed(
             ToolExecutionError::other(crate::result::interrupted_feedback(name))

@@ -46,11 +46,11 @@ async fn rig_first_prompt_tools_streaming_and_versions() {
         policy: CheckpointPolicy::Every(NonZeroU32::new(1).unwrap()),
         target_version: None,
     })
-    .tool(MockAddTool)
+    .tool(MockAddTool, rig_durable::ToolPolicy::application_managed())
     .build()
     .unwrap();
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
-    let orchestrator = AgentOrchestrator::builder(store)
+    let orchestrator = AgentOrchestrator::builder(store, "test-store")
         .register(v1)
         .unwrap()
         .register(v2)
@@ -92,14 +92,14 @@ async fn approval_is_managed_through_the_run_handle() {
     )
     .tool_with(
         MockAddTool,
-        ToolOptions::default()
+        ToolOptions::new(rig_durable::ToolPolicy::application_managed())
             .retry(RetryPolicy::new(1))
             .require_approval(),
     )
     .build()
     .unwrap();
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
-    let orchestrator = AgentOrchestrator::builder(store.clone())
+    let orchestrator = AgentOrchestrator::builder(store.clone(), "test-store")
         .register(definition)
         .unwrap()
         .start()
@@ -118,13 +118,13 @@ async fn approval_is_managed_through_the_run_handle() {
     )
     .tool_with(
         MockAddTool,
-        ToolOptions::default()
+        ToolOptions::new(rig_durable::ToolPolicy::application_managed())
             .retry(RetryPolicy::new(1))
             .require_approval(),
     )
     .build()
     .unwrap();
-    let orchestrator = AgentOrchestrator::builder(store)
+    let orchestrator = AgentOrchestrator::builder(store, "test-store")
         .register(recovered)
         .unwrap()
         .start()
@@ -159,7 +159,7 @@ async fn next_approval_times_out_with_running_non_json_custom_status() {
         })
         .build();
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
-    let orchestrator = AgentOrchestrator::builder(store)
+    let orchestrator = AgentOrchestrator::builder(store, "test-store")
         .register(definition)
         .unwrap()
         .merge_orchestrations(raw)
@@ -236,7 +236,7 @@ async fn steering_runs_as_a_follow_up_turn_before_completion() {
     .build()
     .unwrap();
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
-    let orchestrator = AgentOrchestrator::builder(store)
+    let orchestrator = AgentOrchestrator::builder(store, "test-store")
         .register(definition)
         .unwrap()
         .start()
@@ -273,7 +273,7 @@ async fn checkpoint_policy_applies_before_a_steered_turn() {
     .build()
     .unwrap();
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
-    let orchestrator = AgentOrchestrator::builder(store)
+    let orchestrator = AgentOrchestrator::builder(store, "test-store")
         .register(definition)
         .unwrap()
         .start()
@@ -311,7 +311,7 @@ async fn steering_rejects_a_completed_run() {
     .build()
     .unwrap();
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
-    let orchestrator = AgentOrchestrator::builder(store)
+    let orchestrator = AgentOrchestrator::builder(store, "test-store")
         .register(definition)
         .unwrap()
         .start()
@@ -357,7 +357,7 @@ async fn durable_sub_agent_is_registered_and_called_as_a_tool() {
     .build()
     .unwrap();
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
-    let orchestrator = AgentOrchestrator::builder(store)
+    let orchestrator = AgentOrchestrator::builder(store, "test-store")
         .register(parent)
         .unwrap()
         .start()
@@ -378,7 +378,7 @@ async fn durable_sub_agent_is_registered_and_called_as_a_tool() {
 }
 
 #[tokio::test]
-async fn logical_child_uses_versioned_registration_until_its_first_checkpoint() {
+async fn typed_child_retains_parent_captured_settings_across_continuation() {
     let child = DurableAgent::builder(
         "child",
         MockCompletionModel::from_turns([
@@ -386,9 +386,8 @@ async fn logical_child_uses_versioned_registration_until_its_first_checkpoint() 
             MockTurn::text("report"),
         ]),
     )
-    .invocation_contract(rig_durable::InvocationContract::Logical)
     .preamble("registered child config")
-    .tool(MockAddTool)
+    .tool(MockAddTool, rig_durable::ToolPolicy::application_managed())
     .checkpoint(CheckpointConfig {
         policy: CheckpointPolicy::Every(NonZeroU32::new(1).unwrap()),
         target_version: None,
@@ -402,13 +401,12 @@ async fn logical_child_uses_versioned_registration_until_its_first_checkpoint() 
             MockTurn::text("done"),
         ]),
     )
-    .invocation_contract(rig_durable::InvocationContract::Logical)
     .sub_agent("child", child)
     .unwrap()
     .build()
     .unwrap();
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
-    let orchestrator = AgentOrchestrator::builder(store)
+    let orchestrator = AgentOrchestrator::builder(store, "test-store")
         .register(parent)
         .unwrap()
         .start()
@@ -434,7 +432,10 @@ async fn logical_child_uses_versioned_registration_until_its_first_checkpoint() 
         })
         .unwrap();
     let input: rig_durable::AgentInput = serde_json::from_str(input).unwrap();
-    assert!(input.snapshot.is_none());
+    assert_eq!(
+        input.snapshot.unwrap().preamble.as_deref(),
+        Some("registered child config")
+    );
     let instances = orchestrator.client().list_all_instances().await.unwrap();
     assert_eq!(instances.len(), 2);
     let child_id = instances
@@ -458,6 +459,56 @@ async fn logical_child_uses_versioned_registration_until_its_first_checkpoint() 
 }
 
 #[tokio::test]
+async fn complete_start_input_bounds_reject_before_model_io() {
+    let model = MockCompletionModel::from_turns([MockTurn::text("unused")]);
+    let mut child = DurableAgent::builder("leaf", model.clone())
+        .build()
+        .unwrap();
+    for index in 0..24 {
+        child = DurableAgent::builder(format!("nested-{index}"), model.clone())
+            .sub_agent("child", child)
+            .unwrap()
+            .build()
+            .unwrap();
+    }
+    let runtime = AgentOrchestrator::builder(
+        Arc::new(SqliteProvider::new_in_memory().await.unwrap()),
+        "bounded-store",
+    )
+    .register(child)
+    .unwrap()
+    .register(
+        DurableAgent::builder("wide", model.clone())
+            .build()
+            .unwrap(),
+    )
+    .unwrap()
+    .start()
+    .await
+    .unwrap();
+    let wide = runtime
+        .agent("wide")
+        .unwrap()
+        .start("x".repeat(1024 * 1024))
+        .await;
+    assert!(matches!(wide, Err(AgentOrchestratorError::Run(error)) if error.contains("1 MiB")));
+    let deep = runtime.agent("nested-23").unwrap().start("go").await;
+    assert!(
+        matches!(deep, Err(AgentOrchestratorError::Run(error)) if error.contains("64 JSON containers"))
+    );
+    assert!(model.requests().is_empty());
+    assert!(
+        runtime
+            .client()
+            .list_all_instances()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    runtime.shutdown(None).await;
+}
+
+#[tokio::test]
 async fn caller_run_ids_are_scoped_by_agent_and_version() {
     let first = DurableAgent::builder(
         "first",
@@ -472,7 +523,7 @@ async fn caller_run_ids_are_scoped_by_agent_and_version() {
     .build()
     .unwrap();
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
-    let orchestrator = AgentOrchestrator::builder(store)
+    let orchestrator = AgentOrchestrator::builder(store, "test-store")
         .register(first)
         .unwrap()
         .register(second)
@@ -532,7 +583,7 @@ async fn invalid_version_compositions_fail_before_runtime_start() {
     .build()
     .unwrap();
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
-    let builder = AgentOrchestrator::builder(store)
+    let builder = AgentOrchestrator::builder(store, "test-store")
         .register(approval_v1)
         .unwrap();
     assert!(matches!(
@@ -552,7 +603,7 @@ async fn invalid_version_compositions_fail_before_runtime_start() {
     .unwrap();
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
     assert!(matches!(
-        AgentOrchestrator::builder(store)
+        AgentOrchestrator::builder(store, "test-store")
             .register(missing_target)
             .unwrap()
             .start()
@@ -573,7 +624,7 @@ async fn checkpoint_can_move_a_run_to_a_registered_agent_version() {
     )
     .version("1.0.0")
     .unwrap()
-    .tool(MockAddTool)
+    .tool(MockAddTool, rig_durable::ToolPolicy::application_managed())
     .checkpoint(CheckpointConfig {
         policy: CheckpointPolicy::Every(NonZeroU32::new(1).unwrap()),
         target_version: Some("2.0.0".into()),
@@ -586,11 +637,11 @@ async fn checkpoint_can_move_a_run_to_a_registered_agent_version() {
     )
     .version("2.0.0")
     .unwrap()
-    .tool(MockAddTool)
+    .tool(MockAddTool, rig_durable::ToolPolicy::application_managed())
     .build()
     .unwrap();
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
-    let orchestrator = AgentOrchestrator::builder(store)
+    let orchestrator = AgentOrchestrator::builder(store, "test-store")
         .register(v1)
         .unwrap()
         .register(v2)
@@ -618,7 +669,10 @@ fn approval_enabled_agents_are_rejected_as_sub_agents() {
         "approved-child",
         MockCompletionModel::from_turns([MockTurn::text("child")]),
     )
-    .tool_with(MockAddTool, ToolOptions::default().require_approval())
+    .tool_with(
+        MockAddTool,
+        ToolOptions::new(rig_durable::ToolPolicy::application_managed()).require_approval(),
+    )
     .build()
     .unwrap();
     let result = DurableAgent::builder(
@@ -686,7 +740,8 @@ async fn reconnects_to_a_run_after_runtime_restart_without_recalling_the_model_t
                 block: true,
                 entered: entered.clone(),
             },
-            ToolOptions::default().retry(RetryPolicy::new(1)),
+            ToolOptions::new(rig_durable::ToolPolicy::application_managed())
+                .retry(RetryPolicy::new(1)),
         )
         .build()
         .unwrap();
@@ -699,7 +754,7 @@ async fn reconnects_to_a_run_after_runtime_restart_without_recalling_the_model_t
     let worker_store = store.clone();
     let first_orchestrator = worker_runtime
         .spawn(async move {
-            AgentOrchestrator::builder(worker_store)
+            AgentOrchestrator::builder(worker_store, "test-store")
                 .register(first)
                 .unwrap()
                 .runtime_options(RuntimeOptions {
@@ -736,11 +791,12 @@ async fn reconnects_to_a_run_after_runtime_restart_without_recalling_the_model_t
                 block: false,
                 entered: Arc::new(tokio::sync::Notify::new()),
             },
-            ToolOptions::default().retry(RetryPolicy::new(1)),
+            ToolOptions::new(rig_durable::ToolPolicy::application_managed())
+                .retry(RetryPolicy::new(1)),
         )
         .build()
         .unwrap();
-    let second_orchestrator = AgentOrchestrator::builder(store)
+    let second_orchestrator = AgentOrchestrator::builder(store, "test-store")
         .register(recovered)
         .unwrap()
         .runtime_options(RuntimeOptions {
@@ -768,7 +824,7 @@ async fn reconnects_to_a_run_after_runtime_restart_without_recalling_the_model_t
 #[cfg(feature = "codemode")]
 #[tokio::test]
 async fn code_mode_recovers_after_parallel_children_without_repeating_completed_work() {
-    use rig_durable::{InvocationContract, ToolPolicy};
+    use rig_durable::ToolPolicy;
     struct MockBarrierTool(Arc<tokio::sync::Barrier>);
     impl MockBarrierTool {
         fn new(barrier: Arc<tokio::sync::Barrier>) -> Self {
@@ -815,7 +871,7 @@ async fn code_mode_recovers_after_parallel_children_without_repeating_completed_
             self.keys
                 .lock()
                 .unwrap()
-                .push(invocation.logical_key.unwrap().digest());
+                .push(invocation.logical_key.digest());
             self.tool.call(context, args).await
         }
     }
@@ -837,7 +893,10 @@ async fn code_mode_recovers_after_parallel_children_without_repeating_completed_
         MockTurn::tool_call("barrier", "barrier_tool", serde_json::json!({})),
         MockTurn::text("backup"),
     ]);
-    let review_model = MockCompletionModel::from_turns([MockTurn::text("approved")]);
+    let review_model = MockCompletionModel::from_turns([
+        MockTurn::tool_call("review-add", "add", serde_json::json!({"x": 3, "y": 8})),
+        MockTurn::text("approved"),
+    ]);
     let parent_model = MockCompletionModel::from_turns([
         MockTurn::tool_call("script", "codemode", serde_json::json!({"code":code})),
         MockTurn::text("complete"),
@@ -848,11 +907,13 @@ async fn code_mode_recovers_after_parallel_children_without_repeating_completed_
     let build = |block| {
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         DurableAgent::builder("workflow", parent_model.clone())
-            .invocation_contract(InvocationContract::Logical)
             .sub_agent(
                 "research",
                 DurableAgent::builder("researcher", research_model.clone())
-                    .tool(MockBarrierTool::new(barrier.clone()))
+                    .tool(
+                        MockBarrierTool::new(barrier.clone()),
+                        rig_durable::ToolPolicy::application_managed(),
+                    )
                     .build()
                     .unwrap(),
             )
@@ -860,7 +921,10 @@ async fn code_mode_recovers_after_parallel_children_without_repeating_completed_
             .sub_agent(
                 "assess",
                 DurableAgent::builder("assessor", assess_model.clone())
-                    .tool(MockBarrierTool::new(barrier))
+                    .tool(
+                        MockBarrierTool::new(barrier),
+                        rig_durable::ToolPolicy::application_managed(),
+                    )
                     .build()
                     .unwrap(),
             )
@@ -868,6 +932,20 @@ async fn code_mode_recovers_after_parallel_children_without_repeating_completed_
             .sub_agent(
                 "review",
                 DurableAgent::builder("reviewer", review_model.clone())
+                    .preamble(if block {
+                        "captured reviewer"
+                    } else {
+                        "changed reviewer"
+                    })
+                    .tool(MockAddTool, ToolPolicy::read_only())
+                    .checkpoint(CheckpointConfig {
+                        policy: if block {
+                            CheckpointPolicy::Every(NonZeroU32::new(1).unwrap())
+                        } else {
+                            CheckpointPolicy::Disabled
+                        },
+                        target_version: None,
+                    })
                     .build()
                     .unwrap(),
             )
@@ -881,11 +959,15 @@ async fn code_mode_recovers_after_parallel_children_without_repeating_completed_
                     },
                     keys: keys.clone(),
                 },
-                ToolOptions::default()
+                ToolOptions::new(rig_durable::ToolPolicy::application_managed())
                     .retry(RetryPolicy::new(1))
                     .policy(ToolPolicy::read_only()),
             )
-            .code_mode(rig_codemode::Limits::default())
+            .code_mode(rig_codemode::Limits {
+                max_calls: if block { 64 } else { 1 },
+                max_in_flight: if block { 8 } else { 1 },
+                ..Default::default()
+            })
             .build()
             .unwrap()
     };
@@ -894,7 +976,7 @@ async fn code_mode_recovers_after_parallel_children_without_repeating_completed_
         worker_lock_timeout: Duration::from_secs(1),
         ..Default::default()
     };
-    let first = AgentOrchestrator::builder(store.clone())
+    let first = AgentOrchestrator::builder(store.clone(), "test-store")
         .register(build(true))
         .unwrap()
         .runtime_options(options.clone())
@@ -914,7 +996,7 @@ async fn code_mode_recovers_after_parallel_children_without_repeating_completed_
     assert_eq!(assess_model.requests().len(), 2);
     assert_eq!(review_model.requests().len(), 0);
     first.shutdown(Some(0)).await;
-    let second = AgentOrchestrator::builder(store.clone())
+    let second = AgentOrchestrator::builder(store.clone(), "test-store")
         .register(build(false))
         .unwrap()
         .runtime_options(options)
@@ -941,7 +1023,30 @@ async fn code_mode_recovers_after_parallel_children_without_repeating_completed_
     }
     assert_eq!(research_model.requests().len(), 2);
     assert_eq!(assess_model.requests().len(), 2);
-    assert_eq!(review_model.requests().len(), 1);
+    assert_eq!(review_model.requests().len(), 2);
+    for request in review_model.requests() {
+        let request = serde_json::to_string(&request).unwrap();
+        assert!(request.contains("captured reviewer"));
+        assert!(!request.contains("changed reviewer"));
+    }
+    let instances = second.client().list_all_instances().await.unwrap();
+    let mut continued_review = false;
+    for instance in instances {
+        let history = second
+            .client()
+            .read_execution_history(&instance, 1)
+            .await
+            .unwrap();
+        if matches!(&history[0].kind, duroxide::EventKind::OrchestrationStarted { name, .. } if name.ends_with("::agent::reviewer"))
+        {
+            assert_eq!(
+                second.client().list_executions(&instance).await.unwrap(),
+                [1, 2, 3]
+            );
+            continued_review = true;
+        }
+    }
+    assert!(continued_review);
     let review_request = serde_json::to_string(&review_model.requests()[0]).unwrap();
     assert!(review_request.contains("staged rollout|backup"));
     let requests = parent_model.requests();
@@ -1025,7 +1130,8 @@ async fn code_mode_fast_result_advances_script_and_drains_race_loser() {
                 followed: followed.clone(),
                 calls: calls.clone(),
             },
-            ToolOptions::default().retry(RetryPolicy::new(1)),
+            ToolOptions::new(rig_durable::ToolPolicy::application_managed())
+                .retry(RetryPolicy::new(1)),
         )
         .code_mode(rig_codemode::Limits {
             max_in_flight: 2,
@@ -1034,7 +1140,7 @@ async fn code_mode_fast_result_advances_script_and_drains_race_loser() {
         .build()
         .unwrap();
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
-    let runtime = AgentOrchestrator::builder(store.clone())
+    let runtime = AgentOrchestrator::builder(store.clone(), "test-store")
         .register(definition)
         .unwrap()
         .start()

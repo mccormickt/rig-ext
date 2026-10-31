@@ -17,12 +17,10 @@ pub const DEFAULT_METADATA_MAX_BYTES: usize = 16 * 1024;
 ///
 /// This is a declaration about the tool implementation, not something the
 /// crate infers from a name, description, or MCP annotation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplaySafety {
     /// Retries may repeat the tool; the application owns idempotency.
-    /// This is the default policy.
-    #[default]
     ApplicationManaged,
     /// The tool performs no external write. It can run again, but once an
     /// attempt's result is durably recorded replay uses that result.
@@ -118,20 +116,13 @@ impl MetadataRetention {
 /// assert!(!policy.metadata().retains("authorization"));
 /// ```
 ///
-/// Use `.tool_with(tool, ToolOptions::default().policy(policy))` on Duroxide
-/// with the logical contract, or `.tool_with_policy(tool, policy)` on Temporal.
+/// Pass the policy to `.tool(tool, policy)` on either native backend.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolPolicy {
     replay_safety: ReplaySafety,
     implementation_version: String,
     #[serde(default)]
     metadata: MetadataRetention,
-}
-
-impl Default for ToolPolicy {
-    fn default() -> Self {
-        Self::new(ReplaySafety::ApplicationManaged)
-    }
 }
 
 impl ToolPolicy {
@@ -149,6 +140,11 @@ impl ToolPolicy {
         Self::new(ReplaySafety::ReadOnly)
     }
 
+    /// The application explicitly owns safety when an attempt repeats.
+    pub fn application_managed() -> Self {
+        Self::new(ReplaySafety::ApplicationManaged)
+    }
+
     pub fn idempotent() -> Self {
         Self::new(ReplaySafety::Idempotent)
     }
@@ -162,9 +158,9 @@ impl ToolPolicy {
         self
     }
 
-    /// Identify the tool implementation. Approval decisions and invocation
-    /// claims are bound to it, and a retained configuration snapshot rejects
-    /// a worker whose registration has a different version.
+    /// Declare the tool implementation version. Approval decisions and claims
+    /// bind to this declaration. New execution requires a matching worker
+    /// declaration; recovery of a recorded result does not.
     pub fn implementation_version(mut self, version: impl Into<String>) -> Self {
         self.implementation_version = version.into();
         self
@@ -275,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_round_trips_and_defaults_to_application_managed() {
+    fn policy_round_trips_with_explicit_safety() {
         let policy = ToolPolicy::interrupt_on_uncertain()
             .implementation_version("2026.1")
             .retain_metadata(MetadataRetention::none().key("receipt").max_bytes(512));
@@ -290,7 +286,7 @@ mod tests {
                 .unwrap();
         assert_eq!(without_metadata.safety(), ReplaySafety::ReadOnly);
         assert_eq!(
-            ToolPolicy::default().safety(),
+            ToolPolicy::application_managed().safety(),
             ReplaySafety::ApplicationManaged
         );
     }

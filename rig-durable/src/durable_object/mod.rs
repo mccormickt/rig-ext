@@ -37,9 +37,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ApprovalDecision, ApprovalRequest, AttemptMetadata, Compaction, CompactionRecord,
     CompletionMode, CompletionSettings, ContextState, DurableAgentConfig, DurableResponse,
-    DurableToolResult, InterruptionReason, InvocationContract, LogicalCallKey, RetryPolicy,
-    Submission, SubmissionLedger, SubmissionState, SubmitInput, ToolActivityInput,
-    ToolActivityOutput, ToolExecutor, ToolInvocation, ToolOptions, ToolOutcome,
+    DurableToolResult, InterruptionReason, LogicalCallKey, RetryPolicy, Submission,
+    SubmissionLedger, SubmissionState, SubmitInput, ToolActivityInput, ToolActivityOutput,
+    ToolExecutor, ToolInvocation, ToolOptions, ToolOutcome,
     activities::completion,
     config::ConfigSnapshot,
     driver::{self, Effect},
@@ -201,10 +201,7 @@ impl Builder {
         Self {
             model: model.into(),
             tools: ToolSet::default(),
-            config: DurableAgentConfig {
-                contract: InvocationContract::Logical,
-                ..Default::default()
-            },
+            config: DurableAgentConfig::default(),
             implementation_version: "1".into(),
             children: BTreeMap::new(),
             #[cfg(feature = "codemode")]
@@ -289,8 +286,8 @@ impl Builder {
         self.compaction = Some(value);
         self
     }
-    pub fn tool<T: Tool + 'static>(self, tool: T) -> Self {
-        self.tool_with(tool, ToolOptions::default())
+    pub fn tool<T: Tool + 'static>(self, tool: T, policy: crate::ToolPolicy) -> Self {
+        self.tool_with(tool, ToolOptions::new(policy))
     }
     pub fn tool_with<T: Tool + 'static>(mut self, tool: T, options: ToolOptions) -> Self {
         let definition = rig::tool::tool_definition(&tool);
@@ -483,11 +480,7 @@ fn bounded_call_output(
     finished.output = Some(output.clone());
     match storage::encode(&finished, storage::ROW_BYTES) {
         Err(Error::Limit { .. } | Error::Depth { .. }) => {
-            let interruption = output
-                .result
-                .as_ref()
-                .and_then(|result| result.interruption.as_ref())
-                .map(|i| i.reason);
+            let interruption = output.result.interruption.as_ref().map(|i| i.reason);
             let output = storage_failure_output(&call.input.name, interruption);
             finished.output = Some(output.clone());
             storage::encode(&finished, storage::ROW_BYTES).map_err(call_capacity_error)?;
@@ -519,9 +512,7 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
         finished.started = false;
         finished.attempt = u32::MAX;
         finished.deadline_ms = Some(u64::MAX);
-        if let Some(attempt) = &mut finished.input.invocation.attempt {
-            attempt.activity_attempt = Some(u32::MAX);
-        }
+        finished.input.invocation.attempt.activity_attempt = Some(u32::MAX);
         for interruption in [None, Some(InterruptionReason::ToolUnavailable)] {
             finished.output = Some(storage_failure_output(&call.input.name, interruption));
             storage::encode(&finished, storage::ROW_BYTES).map_err(call_capacity_error)?;
@@ -1215,13 +1206,14 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                                 prompt_index: run.prompt_index,
                                 turn: run.turn,
                                 call_index: pending.call_index,
-                                logical_key: Some(key.clone()),
-                                attempt: Some(AttemptMetadata {
+                                logical_key: key.clone(),
+                                attempt: AttemptMetadata {
                                     backend_execution_id: state.id.clone(),
                                     activity_attempt: Some(1),
-                                }),
+                                },
                             },
-                            policy: Some(entry.policy.clone()),
+                            policy: entry.policy.clone(),
+                            runtime_identity: None,
                         };
                         let digest = crate::identity::arguments_digest(
                             &serde_json::Value::Object(call.function.arguments.clone()),
@@ -1351,13 +1343,30 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                 error
             }
         })?;
-        let calls = keys
+        let mut calls = keys
             .iter()
             .map(|key| self.call(key))
             .collect::<Result<Vec<_>, _>>()?;
-        for call in &calls {
+        for (_key, call) in keys.iter().zip(&mut calls) {
+            self.executor
+                .validate_invocation(&call.input)
+                .map_err(|error| Error::Incompatible(error.to_string()))?;
+            let digest =
+                crate::identity::arguments_digest(&serde_json::from_str(&call.input.arguments)?)?;
+            if digest != call.digest {
+                return Err(Error::Invalid(
+                    "tool intent argument digest mismatch".into(),
+                ));
+            }
+            if call.output.is_some() || call.pending.preresolved_result.is_some() {
+                continue;
+            }
             #[cfg(feature = "codemode")]
-            self.check_script_registration(call)?;
+            if let Some(output) = self.check_script_registration(call)? {
+                call.output = Some(output);
+                self.db.transaction(|| self.save_call(_key, call))?;
+                continue;
+            }
             self.check_call_capacity(call)?;
         }
         if let Some(error) = calls.iter().find_map(|call| call.failure.clone()) {
@@ -1375,9 +1384,7 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
         let execute = |key, mut call: Call| async move {
             call.started = true;
             call.deadline_ms = None;
-            if let Some(attempt) = &mut call.input.invocation.attempt {
-                attempt.activity_attempt = Some(call.attempt);
-            }
+            call.input.invocation.attempt.activity_attempt = Some(call.attempt);
             self.db.transaction(|| self.save_call(key, &call))?;
             #[cfg(feature = "codemode")]
             if self.script.is_some() && call.input.name == "codemode" {
@@ -1390,6 +1397,7 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                 self.executor
                     .execute_committed(call.input.clone())
                     .await
+                    .map_err(|error| error.to_string())
                     .map(Some)
             };
             Ok::<_, Error>((key, result, call))
@@ -1403,33 +1411,8 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                 self.db.transaction(|| self.save_call(key, &call))?;
                 continue;
             }
-            let policy = call
-                .input
-                .policy
-                .as_ref()
-                .ok_or_else(|| Error::Invalid("tool intent has no policy".into()))?;
-            let registered = self
-                .config
-                .tools
-                .get(&call.input.name)
-                .ok_or_else(|| Error::Incompatible("tool registration is missing".into()))?;
-            if policy.version() != registered.policy.version() {
-                return Err(Error::Incompatible(
-                    "tool implementation version mismatch".into(),
-                ));
-            }
-            let digest =
-                crate::identity::arguments_digest(&serde_json::from_str(&call.input.arguments)?)?;
-            if digest != call.digest {
-                return Err(Error::Invalid(
-                    "tool intent argument digest mismatch".into(),
-                ));
-            }
-            if call.started
-                && (!policy.safety().permits_repeat()
-                    || !registered.policy.safety().permits_repeat()
-                    || policy.safety() != registered.policy.safety())
-            {
+            let policy = &call.input.policy;
+            if call.started && call.child.is_none() && !policy.safety().permits_repeat() {
                 call.output = Some(ToolActivityOutput::from_result(
                     &call.input.name,
                     DurableToolResult::interrupted(
@@ -1439,6 +1422,26 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                 ));
                 self.db.transaction(|| self.save_call(key, &call))?;
                 continue;
+            }
+            let registered = self
+                .config
+                .tools
+                .get(&call.input.name)
+                .ok_or_else(|| Error::Incompatible("tool registration is missing".into()))?;
+            if policy.version() != registered.policy.version()
+                || policy.safety() != registered.policy.safety()
+            {
+                return Err(Error::Incompatible(
+                    "tool safety or implementation version mismatch".into(),
+                ));
+            }
+            let external = call.child.is_none();
+            #[cfg(feature = "codemode")]
+            let external = external && !(self.script.is_some() && call.input.name == "codemode");
+            if external {
+                self.executor
+                    .validate_execution(&call.input)
+                    .map_err(|error| Error::Incompatible(error.to_string()))?;
             }
             if call
                 .deadline_ms
@@ -1530,8 +1533,8 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                     let output = call.output.as_ref().ok_or(error)?;
                     let interruption = output
                         .result
+                        .interruption
                         .as_ref()
-                        .and_then(|result| result.interruption.as_ref())
                         .map(|value| value.reason);
                     call.output = Some(storage_failure_output(&call.input.name, interruption));
                     self.save_call(key, &call)?;

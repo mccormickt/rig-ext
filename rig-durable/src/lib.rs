@@ -30,15 +30,14 @@
 //! # #[cfg(feature = "sqlite")]
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! use rig::providers::openai::{self, OpenAI};
-//! use rig_durable::{AgentOrchestrator, DurableAgent, InvocationContract};
+//! use rig_durable::{AgentOrchestrator, DurableAgent};
 //!
 //! let model = OpenAI::from_env()?.completion(openai::GPT_4O_MINI);
 //! let definition = DurableAgent::builder("assistant", model)
-//!     .invocation_contract(InvocationContract::Logical)
 //!     .preamble("Answer briefly and state any uncertainty.")
 //!     .max_turns(8)
 //!     .build()?;
-//! let orchestrator = AgentOrchestrator::sqlite("sqlite://agents.db?mode=rwc")
+//! let orchestrator = AgentOrchestrator::sqlite("sqlite://agents.db?mode=rwc", "support/production")
 //!     .await?
 //!     .register(definition)?
 //!     .start()
@@ -58,8 +57,7 @@
 //! # Add a Rig tool
 //!
 //! A durable tool implements the standard Rig trait. Register this tool with
-//! `.tool(Add)` on either backend's builder. Use `.tool_with` on Duroxide or
-//! `.tool_with_policy` on Temporal to declare [`ToolPolicy::read_only`].
+//! `.tool(Add, ToolPolicy::read_only())` on either backend's builder.
 //!
 //! ```
 //! use std::convert::Infallible;
@@ -112,13 +110,14 @@
 //!
 //! # Execution configuration
 //!
-//! [`InvocationContract::Logical`] records configuration snapshots for new
-//! top-level Duroxide runs and is the default for new Temporal inputs.
-//! Duroxide defaults to [`InvocationContract::Legacy`], which uses minimal
-//! payloads with application-managed replay safety. Child and raw starts resolve
-//! their registered configuration until a checkpoint captures a snapshot; raw
-//! callers can also supply one explicitly. The crate is pre-release and does not
-//! support persisted state or workflow histories across crate or Rig upgrades.
+//! All native tool calls carry logical identity, attempt metadata, and an explicit
+//! policy. Managed starts retain complete configuration, including typed children
+//! and code-mode definitions. Duroxide requires a stable application/store scope;
+//! use a different scope for independent stores. Raw starts must supply their own
+//! scope and capture configuration with `AgentInput::with_snapshot`.
+//! The `guard-sqlite` feature supplies an independent local SQLite guard for either
+//! native backend. It does not enable Duroxide. The crate is pre-release and does
+//! not support persisted state or histories across crate or Rig upgrades.
 
 pub mod activities;
 pub mod activity_types;
@@ -156,12 +155,12 @@ pub mod tools;
 #[cfg(feature = "duroxide")]
 pub mod types;
 
-pub use activities::tool::ToolExecutor;
+pub use activities::tool::{
+    InvocationConfigurationError, ToolActivityResult, ToolExecutionFailure, ToolExecutor,
+};
 #[cfg(feature = "duroxide")]
 pub use activity_types::StreamingCompletionOutput;
-pub use activity_types::{
-    InvocationContract, ToolActivityInput, ToolActivityOutput, ToolInvocation,
-};
+pub use activity_types::{ToolActivityInput, ToolActivityOutput, ToolInvocation};
 pub use approval::{ApprovalDecision, ApprovalRequest};
 pub use compaction::{
     Compaction, CompactionArtifact, CompactionConfig, CompactionRecord, ContextState,
@@ -290,8 +289,13 @@ mod tests {
             MockTurn::text("The answer is 42."),
         ]);
         let tools = ToolSet::from_tools(vec![MockAddTool]);
-        let catalog = catalog_from_toolset(&tools, RetryPolicy::new(1)).await;
-        let activities = activity_registry(model, tools);
+        let catalog = catalog_from_toolset(
+            &tools,
+            RetryPolicy::new(1),
+            crate::ToolPolicy::application_managed(),
+        )
+        .await;
+        let activities = activity_registry(model, tools, &catalog);
         let orchestrations = orchestration_registry(DurableAgentConfig {
             tools: catalog,
             ..Default::default()
@@ -305,7 +309,7 @@ mod tests {
             .start_orchestration_typed(
                 "rig-tool-run",
                 ORCHESTRATION,
-                AgentInput::new("What is 20 + 22?"),
+                AgentInput::new("What is 20 + 22?").with_scope("raw-test-store"),
             )
             .await
             .unwrap();
@@ -323,7 +327,12 @@ mod tests {
     async fn approved_tool_executes_exactly_once() {
         let count = Arc::new(AtomicUsize::new(0));
         let tools = ToolSet::from_tools(vec![CountingAdd(count.clone())]);
-        let mut catalog = catalog_from_toolset(&tools, RetryPolicy::new(1)).await;
+        let mut catalog = catalog_from_toolset(
+            &tools,
+            RetryPolicy::new(1),
+            crate::ToolPolicy::application_managed(),
+        )
+        .await;
         catalog.0.get_mut("add").unwrap().requires_approval = true;
         let config = DurableAgentConfig {
             tools: catalog,
@@ -337,13 +346,17 @@ mod tests {
         let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
         let runtime = runtime::Runtime::start_with_store(
             store.clone(),
-            activity_registry(model, tools),
+            activity_registry(model, tools, &config.tools),
             orchestration_registry(config.clone()),
         )
         .await;
         let client = Client::new(store);
         client
-            .start_orchestration_typed("approved", ORCHESTRATION, AgentInput::new("add"))
+            .start_orchestration_typed(
+                "approved",
+                ORCHESTRATION,
+                AgentInput::new("add").with_scope("raw-test-store"),
+            )
             .await
             .unwrap();
         let request = wait_for_approval(&client, "approved").await;
@@ -372,7 +385,12 @@ mod tests {
     async fn denied_tool_is_not_executed_and_model_continues() {
         let count = Arc::new(AtomicUsize::new(0));
         let tools = ToolSet::from_tools(vec![CountingAdd(count.clone())]);
-        let mut catalog = catalog_from_toolset(&tools, RetryPolicy::new(1)).await;
+        let mut catalog = catalog_from_toolset(
+            &tools,
+            RetryPolicy::new(1),
+            crate::ToolPolicy::application_managed(),
+        )
+        .await;
         catalog.0.get_mut("add").unwrap().requires_approval = true;
         let config = DurableAgentConfig {
             tools: catalog,
@@ -386,13 +404,17 @@ mod tests {
         let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
         let runtime = runtime::Runtime::start_with_store(
             store.clone(),
-            activity_registry(model, tools),
+            activity_registry(model, tools, &config.tools),
             orchestration_registry(config.clone()),
         )
         .await;
         let client = Client::new(store);
         client
-            .start_orchestration_typed("denied", ORCHESTRATION, AgentInput::new("add"))
+            .start_orchestration_typed(
+                "denied",
+                ORCHESTRATION,
+                AgentInput::new("add").with_scope("raw-test-store"),
+            )
             .await
             .unwrap();
         let request = wait_for_approval(&client, "denied").await;
@@ -422,7 +444,12 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let arguments = serde_json::json!({"x": 8, "y": 9});
         let tools = ToolSet::from_tools(vec![CountingAdd(count.clone())]);
-        let mut catalog = catalog_from_toolset(&tools, RetryPolicy::new(1)).await;
+        let mut catalog = catalog_from_toolset(
+            &tools,
+            RetryPolicy::new(1),
+            crate::ToolPolicy::application_managed(),
+        )
+        .await;
         catalog.0.get_mut("add").unwrap().requires_approval = true;
         let config = DurableAgentConfig {
             tools: catalog,
@@ -436,13 +463,17 @@ mod tests {
         let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
         let runtime = runtime::Runtime::start_with_store(
             store.clone(),
-            activity_registry(model, tools),
+            activity_registry(model, tools, &config.tools),
             orchestration_registry(config.clone()),
         )
         .await;
         let client = Client::new(store);
         client
-            .start_orchestration_typed("early", ORCHESTRATION, AgentInput::new("add"))
+            .start_orchestration_typed(
+                "early",
+                ORCHESTRATION,
+                AgentInput::new("add").with_scope("raw-test-store"),
+            )
             .await
             .unwrap();
         client
@@ -460,7 +491,14 @@ mod tests {
             .await
             .unwrap();
         let digest = Sha256::digest(serde_json::to_vec(&arguments).unwrap());
-        let approval_id = format!("prompt-0-turn-1-call-0-call-early-{digest:x}");
+        let key = crate::LogicalCallKey {
+            logical_execution_id: "14:raw-test-store;5:early".into(),
+            submission_id: "prompt-0".into(),
+            model_turn: 1,
+            call_index: 0,
+        };
+        let binding = format!("{}\n{digest:x}\n1", key.canonical());
+        let approval_id = format!("approval-v2-{:x}", Sha256::digest(binding.as_bytes()));
         client
             .enqueue_event_typed(
                 "early",

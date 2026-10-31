@@ -11,13 +11,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         MockTurn::text("The final answer is 43."),
     ]);
     let definition = DurableAgent::builder("checkpointed-calculator", model)
-        .tool(MockAddTool)
+        .tool(MockAddTool, rig_durable::ToolPolicy::application_managed())
         .checkpoint(CheckpointConfig {
             policy: CheckpointPolicy::Every(NonZeroU32::MIN),
             target_version: None,
         })
         .build()?;
-    let orchestrator = AgentOrchestrator::sqlite("sqlite::memory:")
+    let orchestrator = AgentOrchestrator::sqlite("sqlite::memory:", "example-store")
         .await?
         .register(definition)?
         .start()

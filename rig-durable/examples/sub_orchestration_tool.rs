@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .sub_agent("research_weather", child)?
     .build()?;
-    let orchestrator = AgentOrchestrator::sqlite("sqlite::memory:")
+    let orchestrator = AgentOrchestrator::sqlite("sqlite::memory:", "example-store")
         .await?
         .register(parent)?
         .start()

@@ -24,8 +24,8 @@ use rig::{
     tool::{Tool, ToolContext, ToolExecutionError, ToolSet},
 };
 use rig_durable::{
-    AgentOrchestrator, AgentOrchestratorError, ApprovalRequest, CheckpointConfig, CheckpointPolicy,
-    DurableAgent, DurableToolResult, InMemoryGuardStore, InterruptionReason, InvocationContract,
+    AgentOrchestrator, AgentOrchestratorError, ApprovalRequest, AttemptMetadata, CheckpointConfig,
+    CheckpointPolicy, DurableAgent, DurableToolResult, InMemoryGuardStore, InterruptionReason,
     InvocationGuardStore, LogicalCallKey, ToolActivityInput, ToolDisposition, ToolExecutor,
     ToolInvocation, ToolOptions, ToolPolicy,
     guard::{ClaimOutcome, ClaimRecord, ClaimRequest, GuardError, SettleOutcome},
@@ -271,7 +271,7 @@ impl Worker {
             .unwrap();
         let orchestrator = runtime
             .spawn(async move {
-                AgentOrchestrator::builder(store)
+                AgentOrchestrator::builder(store, "test-store")
                     .register(agent)
                     .unwrap()
                     .runtime_options(options)
@@ -311,9 +311,7 @@ impl Drop for Worker {
 }
 
 fn logical_agent(name: &str, model: MockCompletionModel) -> rig_durable::DurableAgentBuilder {
-    DurableAgent::builder(name, model)
-        .invocation_contract(InvocationContract::Logical)
-        .max_turns(4)
+    DurableAgent::builder(name, model).max_turns(4)
 }
 
 /// Text the model received as tool results in `request`.
@@ -399,7 +397,7 @@ async fn read_only_tool_retries_after_an_interrupted_attempt() {
         "read-only",
         EffectTool::new(&ledger, &probe).hold_first(),
         EffectTool::new(&ledger, &probe),
-        ToolOptions::default()
+        ToolOptions::new(rig_durable::ToolPolicy::application_managed())
             .retry(RetryPolicy::new(1))
             .policy(ToolPolicy::read_only()),
         None,
@@ -422,7 +420,7 @@ async fn idempotent_tool_records_one_effect_across_interrupted_attempts() {
         "idempotent",
         EffectTool::new(&ledger, &probe).idempotent().hold_first(),
         EffectTool::new(&ledger, &probe).idempotent(),
-        ToolOptions::default()
+        ToolOptions::new(rig_durable::ToolPolicy::application_managed())
             .retry(RetryPolicy::new(1))
             .policy(ToolPolicy::idempotent()),
         None,
@@ -433,10 +431,7 @@ async fn idempotent_tool_records_one_effect_across_interrupted_attempts() {
     assert_eq!(probe.calls(), 2, "both attempts reached the service");
     let effects = ledger.effects();
     assert_eq!(effects.len(), 1, "one logical key, one effect");
-    let key = effects[0]
-        .logical_key
-        .clone()
-        .expect("logical key supplied");
+    let key = effects[0].logical_key.clone();
     assert_eq!(key.submission_id, "prompt-0");
     assert!(tool_result_text(&model, 0).contains("order=applied"));
 }
@@ -450,7 +445,7 @@ async fn guarded_tool_is_not_repeated_and_reports_uncertainty() {
         "guarded",
         EffectTool::new(&ledger, &probe).hold_first(),
         EffectTool::new(&ledger, &probe),
-        ToolOptions::default()
+        ToolOptions::new(rig_durable::ToolPolicy::application_managed())
             .retry(RetryPolicy::new(1))
             .policy(ToolPolicy::interrupt_on_uncertain()),
         Some(guard.clone()),
@@ -464,7 +459,7 @@ async fn guarded_tool_is_not_repeated_and_reports_uncertainty() {
     assert!(feedback.contains("was interrupted"), "{feedback}");
     assert!(!feedback.contains("applied"), "{feedback}");
     assert!(!feedback.contains("failed"), "{feedback}");
-    let key = probe.invocations()[0].logical_key.clone().unwrap();
+    let key = probe.invocations()[0].logical_key.clone();
     let record = guard.get(&key).await.unwrap().expect("claim retained");
     assert!(
         matches!(record.state, rig_durable::guard::ClaimState::Claimed),
@@ -483,7 +478,7 @@ async fn claim_committed_then_worker_dies_before_io() {
         die_after_claim: AtomicBool::new(true),
         claimed: Arc::clone(&claimed),
     });
-    let options = ToolOptions::default()
+    let options = ToolOptions::new(rig_durable::ToolPolicy::application_managed())
         .retry(RetryPolicy::new(1))
         .policy(ToolPolicy::interrupt_on_uncertain());
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
@@ -540,6 +535,66 @@ async fn claim_committed_then_worker_dies_before_io() {
 }
 
 #[tokio::test]
+async fn independent_store_scopes_separate_guard_and_external_idempotency_keys() {
+    let ledger = Ledger::default();
+    let probe = Probe::default();
+    let guard = Arc::new(InMemoryGuardStore::new());
+    for scope in ["payments/east", "payments/west"] {
+        let definition = DurableAgent::builder(
+            "payments",
+            MockCompletionModel::from_turns([tool_call("same-arguments"), MockTurn::text("done")]),
+        )
+        .tool(
+            EffectTool::new(&ledger, &probe).idempotent(),
+            ToolPolicy::interrupt_on_uncertain(),
+        )
+        .invocation_guard(guard.clone())
+        .checkpoint(CheckpointConfig {
+            policy: CheckpointPolicy::Every(1.try_into().unwrap()),
+            target_version: None,
+        })
+        .build()
+        .unwrap();
+        let runtime = AgentOrchestrator::builder(
+            Arc::new(SqliteProvider::new_in_memory().await.unwrap()),
+            scope,
+        )
+        .register(definition)
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+        let run = runtime
+            .agent("payments")
+            .unwrap()
+            .start_with_id("shared-run", "pay")
+            .await
+            .unwrap();
+        assert_eq!(run.wait().await.unwrap().output(), "done");
+        runtime.shutdown(None).await;
+    }
+    let effects = ledger.effects();
+    assert_eq!(effects.len(), 2);
+    assert_ne!(effects[0].logical_key, effects[1].logical_key);
+    assert_ne!(
+        effects[0].logical_key.digest(),
+        effects[1].logical_key.digest()
+    );
+    for invocation in effects {
+        assert!(invocation.execution_id.ends_with(":2"));
+        assert!(matches!(
+            guard
+                .get(&invocation.logical_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            rig_durable::guard::ClaimState::Settled { .. }
+        ));
+    }
+}
+
+#[tokio::test]
 async fn duplicate_workers_race_for_one_claim_and_no_takeover_repeats_the_write() {
     let ledger = Ledger::default();
     let probe = Probe::default();
@@ -549,6 +604,7 @@ async fn duplicate_workers_race_for_one_claim_and_no_takeover_repeats_the_write(
             ToolExecutor::new(Arc::new(ToolSet::from_tools(vec![
                 EffectTool::new(&ledger, &probe).hold_first(),
             ])))
+            .with_registered_policies([(TOOL.into(), ToolPolicy::interrupt_on_uncertain())])
             .with_guard(Some(Arc::clone(&guard))),
         )
     };
@@ -560,15 +616,19 @@ async fn duplicate_workers_race_for_one_claim_and_no_takeover_repeats_the_write(
             prompt_index: 0,
             turn: 1,
             call_index: 0,
-            logical_key: Some(LogicalCallKey {
+            logical_key: LogicalCallKey {
                 logical_execution_id: "exec".into(),
                 submission_id: "prompt-0".into(),
                 model_turn: 1,
                 call_index: 0,
-            }),
-            attempt: None,
+            },
+            attempt: AttemptMetadata {
+                backend_execution_id: "exec:1".into(),
+                activity_attempt: Some(1),
+            },
         },
-        policy: Some(ToolPolicy::interrupt_on_uncertain()),
+        policy: ToolPolicy::interrupt_on_uncertain(),
+        runtime_identity: None,
     };
 
     let first_worker = worker();
@@ -577,7 +637,7 @@ async fn duplicate_workers_race_for_one_claim_and_no_takeover_repeats_the_write(
     probe.entered().await;
 
     let second = worker().execute(input.clone()).await.unwrap();
-    let second = second.result.unwrap();
+    let second = second.result;
     assert_eq!(second.disposition, ToolDisposition::Interrupted);
     assert_eq!(
         second.interruption.unwrap().reason,
@@ -587,16 +647,16 @@ async fn duplicate_workers_race_for_one_claim_and_no_takeover_repeats_the_write(
     tokio::time::sleep(Duration::from_millis(200)).await;
     let late = worker().execute(input.clone()).await.unwrap();
     assert_eq!(
-        late.result.unwrap().disposition,
+        late.result.disposition,
         ToolDisposition::Interrupted,
         "waiting does not expire the claim"
     );
 
     probe.release.notify_one();
-    let first = first.await.unwrap().unwrap().result.unwrap();
+    let first = first.await.unwrap().unwrap().result;
     assert_eq!(first.disposition, ToolDisposition::Success);
 
-    let after_settle = worker().execute(input).await.unwrap().result.unwrap();
+    let after_settle = worker().execute(input).await.unwrap().result;
     assert_eq!(after_settle.disposition, ToolDisposition::Success);
     assert_eq!(probe.calls(), 1, "one worker ran the tool");
     assert_eq!(ledger.effects().len(), 1);
@@ -619,7 +679,7 @@ async fn explicit_non_retryable_error_is_recorded_and_retryable_error_is_retried
             logical_agent(name, model.clone())
                 .tool_with(
                     EffectTool::new(&ledger, &probe).fail_first(error),
-                    ToolOptions::default()
+                    ToolOptions::new(rig_durable::ToolPolicy::application_managed())
                         .retry(RetryPolicy::new(3))
                         .policy(ToolPolicy::read_only()),
                 )
@@ -663,7 +723,7 @@ async fn two_submissions_use_distinct_logical_keys_and_retries_keep_theirs() {
                     fail_calls: 1,
                     ..EffectTool::new(&ledger, &probe)
                 },
-                ToolOptions::default()
+                ToolOptions::new(rig_durable::ToolPolicy::application_managed())
                     .retry(RetryPolicy::new(2))
                     .policy(ToolPolicy::read_only()),
             )
@@ -694,7 +754,7 @@ async fn two_submissions_use_distinct_logical_keys_and_retries_keep_theirs() {
     );
     let keys: Vec<LogicalCallKey> = invocations
         .iter()
-        .map(|invocation| invocation.logical_key.clone().unwrap())
+        .map(|invocation| invocation.logical_key.clone())
         .collect();
     assert_eq!(keys[0].submission_id, "prompt-0");
     assert_eq!(keys[1].submission_id, "prompt-1");
@@ -702,7 +762,7 @@ async fn two_submissions_use_distinct_logical_keys_and_retries_keep_theirs() {
     assert_eq!(keys[1], keys[2], "the retry keeps its submission's key");
     let attempts: Vec<Option<u32>> = invocations
         .iter()
-        .map(|invocation| invocation.attempt.as_ref().unwrap().activity_attempt)
+        .map(|invocation| invocation.attempt.activity_attempt)
         .collect();
     assert_eq!(attempts, [Some(1), Some(1), Some(2)]);
 }
@@ -712,7 +772,7 @@ async fn continue_as_new_keeps_logical_identity_and_worker_upgrade_fails_closed(
     let ledger = Ledger::default();
     let probe = Probe::default();
     let options = |version: &str| {
-        ToolOptions::default()
+        ToolOptions::new(rig_durable::ToolPolicy::application_managed())
             .retry(RetryPolicy::new(1))
             .policy(ToolPolicy::read_only().implementation_version(version))
     };
@@ -745,8 +805,15 @@ async fn continue_as_new_keeps_logical_identity_and_worker_upgrade_fails_closed(
         "the tool runs in the continued execution: {}",
         invocation.execution_id
     );
-    let key = invocation.logical_key.clone().unwrap();
-    assert_eq!(key.logical_execution_id, run.instance_id());
+    let key = invocation.logical_key.clone();
+    assert_eq!(
+        key.logical_execution_id,
+        format!(
+            "10:test-store;{}:{}",
+            run.instance_id().len(),
+            run.instance_id()
+        )
+    );
     assert_eq!(key.submission_id, "prompt-0");
     first.die();
 
@@ -783,7 +850,7 @@ async fn continue_as_new_keeps_logical_identity_and_worker_upgrade_fails_closed(
 async fn approval_is_not_repeated_after_restart_and_binds_to_arguments() {
     let ledger = Ledger::default();
     let probe = Probe::default();
-    let options = ToolOptions::default()
+    let options = ToolOptions::new(rig_durable::ToolPolicy::application_managed())
         .retry(RetryPolicy::new(1))
         .policy(ToolPolicy::read_only())
         .require_approval();
@@ -877,22 +944,19 @@ async fn approval_is_not_repeated_after_restart_and_binds_to_arguments() {
 }
 
 #[tokio::test]
-async fn builder_rejects_policies_the_contract_or_worker_cannot_honor() {
+async fn builder_requires_a_guard_only_for_guarded_tools() {
     let ledger = Ledger::default();
     let probe = Probe::default();
-    let legacy = DurableAgent::builder(
-        "legacy",
+    let read_only = DurableAgent::builder(
+        "read-only",
         MockCompletionModel::from_turns([MockTurn::text("done")]),
     )
     .tool_with(
         EffectTool::new(&ledger, &probe),
-        ToolOptions::default().policy(ToolPolicy::read_only()),
+        ToolOptions::new(ToolPolicy::read_only()),
     )
     .build();
-    assert!(matches!(
-        legacy,
-        Err(AgentOrchestratorError::InvocationContractRequired(name)) if name == TOOL
-    ));
+    assert!(read_only.is_ok());
 
     let unguarded = logical_agent(
         "unguarded",
@@ -900,7 +964,7 @@ async fn builder_rejects_policies_the_contract_or_worker_cannot_honor() {
     )
     .tool_with(
         EffectTool::new(&ledger, &probe),
-        ToolOptions::default().policy(ToolPolicy::interrupt_on_uncertain()),
+        ToolOptions::new(ToolPolicy::interrupt_on_uncertain()),
     )
     .build();
     assert!(matches!(

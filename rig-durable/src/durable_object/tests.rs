@@ -107,11 +107,9 @@ async fn tools_and_deduplication_survive_reopen() -> Result<(), Error> {
             .with_response_id("answer-response")
             .with_finish_reason(rig::completion::FinishReason::Stop),
     ]);
-    let engine = Builder::new(model.clone()).tool(MockAddTool).build(
-        db.clone(),
-        Clock::default(),
-        "session",
-    )?;
+    let engine = Builder::new(model.clone())
+        .tool(MockAddTool, crate::ToolPolicy::application_managed())
+        .build(db.clone(), Clock::default(), "session")?;
     let input = SubmitInput::new("r1", "add 7 and 12");
     let receipt = engine.submit(input.clone()).await?;
     assert_eq!(receipt.prompt_index, 0);
@@ -142,10 +140,9 @@ async fn tools_and_deduplication_survive_reopen() -> Result<(), Error> {
         assert_eq!(assistant.stop.as_ref(), Some(&stop));
     }
     drop(engine);
-    let reopened =
-        Builder::new(model.clone())
-            .tool(MockAddTool)
-            .build(db, Clock::default(), "session")?;
+    let reopened = Builder::new(model.clone())
+        .tool(MockAddTool, crate::ToolPolicy::application_managed())
+        .build(db, Clock::default(), "session")?;
     assert_eq!(
         reopened.submit(input).await?.state,
         SubmissionState::Answered
@@ -190,11 +187,9 @@ async fn malformed_calls_keep_outcomes_and_valid_sibling_positions() -> Result<(
             MockTurn::from_contents(calls),
             MockTurn::text("handled"),
         ]);
-        let engine = Builder::new(model.clone()).tool(MockAddTool).build(
-            Database::new()?,
-            Clock::default(),
-            "malformed",
-        )?;
+        let engine = Builder::new(model.clone())
+            .tool(MockAddTool, crate::ToolPolicy::application_managed())
+            .build(Database::new()?, Clock::default(), "malformed")?;
         engine.submit(SubmitInput::new("r", "add")).await?;
         let result = engine.wait("r").await?.unwrap();
         assert_eq!(result.output(), "handled");
@@ -349,10 +344,7 @@ async fn uncertain_tools_obey_both_policies_after_restart() -> Result<(), Error>
             MockTurn::text("done"),
         ]);
         let engine = Builder::new(model.clone())
-            .tool_with(
-                gate.clone(),
-                ToolOptions::default().policy(ToolPolicy::default().replay_safety(stored)),
-            )
+            .tool_with(gate.clone(), ToolOptions::new(ToolPolicy::new(stored)))
             .build(db.clone(), Clock::default(), "crash")?;
         engine.submit(SubmitInput::new("request", "go")).await?;
         {
@@ -368,11 +360,14 @@ async fn uncertain_tools_obey_both_policies_after_restart() -> Result<(), Error>
         drop(engine);
         gate.block.store(false, std::sync::atomic::Ordering::SeqCst);
         let engine = Builder::new(model.clone())
-            .tool_with(
-                gate.clone(),
-                ToolOptions::default().policy(ToolPolicy::default().replay_safety(current)),
-            )
+            .tool_with(gate.clone(), ToolOptions::new(ToolPolicy::new(current)))
             .build(db, Clock::default(), "crash")?;
+        if stored.permits_repeat() && stored != current {
+            assert!(matches!(engine.drive().await, Err(Error::Incompatible(_))));
+            assert_eq!(gate.count(), 1);
+            assert!(engine.result("request")?.is_none());
+            continue;
+        }
         let result = engine
             .wait("request")
             .await?
@@ -397,11 +392,9 @@ async fn submissions_and_alarm_interleave_without_another_driver() -> Result<(),
         MockTurn::text("first answer"),
         MockTurn::text("second answer"),
     ]);
-    let engine = Builder::new(model.clone()).tool(gate.clone()).build(
-        Database::new()?,
-        clock.clone(),
-        "s",
-    )?;
+    let engine = Builder::new(model.clone())
+        .tool(gate.clone(), crate::ToolPolicy::application_managed())
+        .build(Database::new()?, clock.clone(), "s")?;
     engine.submit(SubmitInput::new("one", "first")).await?;
     let driving = engine.drive();
     tokio::pin!(driving);
@@ -455,8 +448,10 @@ async fn approvals_survive_restart_and_denial_never_runs() -> Result<(), Error> 
             MockTurn::text("done"),
         ]);
         let builder = || {
-            Builder::new(model.clone())
-                .tool_with(gate.clone(), ToolOptions::default().require_approval())
+            Builder::new(model.clone()).tool_with(
+                gate.clone(),
+                ToolOptions::new(crate::ToolPolicy::application_managed()).require_approval(),
+            )
         };
         let engine = builder().build(db.clone(), Clock::default(), "s")?;
         engine.submit(SubmitInput::new("r", "go")).await?;
@@ -741,8 +736,11 @@ mod scripts {
                 Limits::default(),
                 NativeReplayPlanner,
             )?
-            .tool(Mark(Arc::new(AtomicBool::new(false))))
-            .tool(DeepOutput)
+            .tool(
+                Mark(Arc::new(AtomicBool::new(false))),
+                crate::ToolPolicy::application_managed(),
+            )
+            .tool(DeepOutput, crate::ToolPolicy::application_managed())
             .build(db.clone(), clock.clone(), "parent")?;
             parent.submit(SubmitInput::new("r", "deep payload")).await?;
             parent.drive().await?;
@@ -759,8 +757,11 @@ mod scripts {
                 Limits::default(),
                 NativeReplayPlanner,
             )?
-            .tool(Mark(Arc::new(AtomicBool::new(false))))
-            .tool(DeepOutput)
+            .tool(
+                Mark(Arc::new(AtomicBool::new(false))),
+                crate::ToolPolicy::application_managed(),
+            )
+            .tool(DeepOutput, crate::ToolPolicy::application_managed())
             .build(db, clock.clone(), "parent")?;
             clock.now.set(2000);
             parent.drive().await?;
@@ -1298,11 +1299,11 @@ mod scripts {
             let parent = Builder::new(model.clone())
                 .tool_with(
                     gate.clone(),
-                    ToolOptions::default().policy(crate::ToolPolicy::read_only()),
+                    ToolOptions::new(crate::ToolPolicy::read_only()),
                 )
                 .tool_with(
                     SizedOutput(count.clone()),
-                    ToolOptions::default().policy(crate::ToolPolicy::read_only()),
+                    ToolOptions::new(crate::ToolPolicy::read_only()),
                 )
                 .session_history_max_bytes(if history_limit {
                     32768
@@ -1397,7 +1398,7 @@ mod scripts {
 
     #[tokio::test]
     async fn checkpoint_boundary_keeps_live_effects_across_result_delivery() -> Result<(), Error> {
-        for bytes in [29184usize, 29185, 30000] {
+        for (bytes, accepted) in [(28 * 1024usize, true), (30 * 1024, false)] {
             let gate = GateTool::new();
             let code = format!(
                 "await tools.mark({{}}); const slow=tools.gate({{}}); await tools.sized({bytes}); return await slow;"
@@ -1405,12 +1406,15 @@ mod scripts {
             let parent = Builder::new(model(&code))
                 .tool_with(
                     gate.clone(),
-                    ToolOptions::default().policy(crate::ToolPolicy::read_only()),
+                    ToolOptions::new(crate::ToolPolicy::read_only()),
                 )
-                .tool(Mark(Arc::new(AtomicBool::new(false))))
+                .tool(
+                    Mark(Arc::new(AtomicBool::new(false))),
+                    crate::ToolPolicy::application_managed(),
+                )
                 .tool_with(
                     SizedOutput(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
-                    ToolOptions::default().policy(crate::ToolPolicy::read_only()),
+                    ToolOptions::new(crate::ToolPolicy::read_only()),
                 )
                 .session_history_max_bytes(32768)
                 .code_mode(Limits::default(), NativeReplayPlanner)
@@ -1427,7 +1431,7 @@ mod scripts {
                         && let Some(value) = state.input().history.iter().find(|h| h.call.ordinal == 2) { return Ok(value.result.is_success()); }
                 }
             }).await.unwrap();
-            assert_eq!(observed?, bytes < 30000);
+            assert_eq!(observed?, accepted, "result bytes: {bytes}");
             assert!(parent.result("r")?.is_none());
             assert_eq!(gate.count(), 1);
             gate.release.notify_one();
@@ -1452,8 +1456,8 @@ mod scripts {
             };
             let model = model(code);
             let parent = Builder::new(model.clone())
-                .tool(gate.clone())
-                .tool(mark.clone())
+                .tool(gate.clone(), crate::ToolPolicy::application_managed())
+                .tool(mark.clone(), crate::ToolPolicy::application_managed())
                 .session_history_max_bytes(32768)
                 .code_mode(Limits::default(), NativeReplayPlanner)
                 .build(Database::new()?, ManualWake::default(), "parent")?;
@@ -1682,9 +1686,9 @@ mod scripts {
             let parent = Builder::new(model.clone())
                 .tool_with(
                     gate.clone(),
-                    ToolOptions::default().policy(crate::ToolPolicy::read_only()),
+                    ToolOptions::new(crate::ToolPolicy::read_only()),
                 )
-                .tool(mark.clone())
+                .tool(mark.clone(), crate::ToolPolicy::application_managed())
                 .sub_agent(definition("fast"), fast.handle())?
                 .code_mode(Limits::default(), NativeReplayPlanner)
                 .build(Database::new()?, wake.clone(), "parent")?;
@@ -1770,17 +1774,15 @@ mod scripts {
         let parent = Builder::new(model)
             .tool_with(
                 old.clone(),
-                ToolOptions::default()
-                    .policy(crate::ToolPolicy::read_only())
-                    .retry(RetryPolicy::new(2).with_backoff(
-                        crate::retry::BackoffStrategy::Fixed {
-                            delay: std::time::Duration::from_millis(2000),
-                        },
-                    )),
+                ToolOptions::new(crate::ToolPolicy::read_only()).retry(
+                    RetryPolicy::new(2).with_backoff(crate::retry::BackoffStrategy::Fixed {
+                        delay: std::time::Duration::from_millis(2000),
+                    }),
+                ),
             )
             .tool_with(
                 newer.clone(),
-                ToolOptions::default().policy(crate::ToolPolicy::read_only()),
+                ToolOptions::new(crate::ToolPolicy::read_only()),
             )
             .code_mode(Limits::default(), NativeReplayPlanner)
             .build(Database::new()?, wake.clone(), "parent")?;
@@ -1853,8 +1855,8 @@ mod scripts {
             "return await Promise.all([tools.add({x:1,y:2}),tools.add({x:7,y:11}),tools.gate({}),tools.add({x:13,y:19})]);",
         );
         let parent = Builder::new(model)
-            .tool(MockAddTool)
-            .tool(gate.clone())
+            .tool(MockAddTool, crate::ToolPolicy::application_managed())
+            .tool(gate.clone(), crate::ToolPolicy::application_managed())
             .code_mode(
                 Limits {
                     max_in_flight: 3,
@@ -1915,7 +1917,7 @@ mod scripts {
         let clock = Clock::default();
         let create = || {
             Builder::new(model.clone())
-                .tool(gate.clone())
+                .tool(gate.clone(), crate::ToolPolicy::application_managed())
                 .sub_agent(definition("fast"), fast.handle())
                 .map(|builder| builder.code_mode(Limits::default(), NativeReplayPlanner))
         };
@@ -1946,6 +1948,7 @@ mod scripts {
         Admission,
         EffectResult,
         Delivery,
+        Report,
     }
     #[derive(Clone)]
     struct CrashSql {
@@ -1973,14 +1976,17 @@ mod scripts {
                 }
             }
             if self.armed.get()
-                && matches!(self.window, Window::Delivery)
+                && matches!(self.window, Window::Delivery | Window::Report)
                 && query.starts_with("INSERT INTO rig_runs")
                 && params[0].starts_with("script:")
             {
                 let record: Value = serde_json::from_str(&params[2])?;
-                if record["scheduler"]["input"]["history"]
-                    .as_array()
-                    .is_some_and(|items| !items.is_empty())
+                if (matches!(self.window, Window::Delivery)
+                    && record["scheduler"]["input"]["history"]
+                        .as_array()
+                        .is_some_and(|items| !items.is_empty()))
+                    || (matches!(self.window, Window::Report)
+                        && record["scheduler"]["action"].get("Complete").is_some())
                 {
                     self.armed.set(false);
                     self.db.1.set(true);
@@ -2001,6 +2007,7 @@ mod scripts {
             (Window::EffectResult, false, 1),
             (Window::EffectResult, true, 2),
             (Window::Delivery, false, 1),
+            (Window::Report, false, 1),
         ] {
             let gate = GateTool::new();
             gate.block.store(false, Ordering::SeqCst);
@@ -2019,7 +2026,7 @@ mod scripts {
             };
             let create = || {
                 Builder::new(model.clone())
-                    .tool_with(gate.clone(), ToolOptions::default().policy(policy.clone()))
+                    .tool_with(gate.clone(), ToolOptions::new(policy.clone()))
                     .session_history_max_bytes(16384)
                     .code_mode(Limits::default(), NativeReplayPlanner)
             };
@@ -2043,7 +2050,12 @@ mod scripts {
                 assert!(blocked.status()?.busy);
                 assert!(!blocked.status()?.closed);
             }
-            let parent = create().build(db.clone(), Clock::default(), "parent")?;
+            let registration = if matches!(window, Window::Report) {
+                Builder::new(model.clone()).code_mode(Limits::default(), DriftPlanner)
+            } else {
+                create()
+            };
+            let parent = registration.build(db.clone(), Clock::default(), "parent")?;
             parent.drive().await?;
             assert_eq!(gate.count(), expected_count);
             let state = parent.script_state(&parent_key(0))?.unwrap();
@@ -2196,7 +2208,7 @@ async fn implementation_version_change_preserves_approved_and_queued_work() -> R
     let engine = Builder::new(model.clone())
         .tool_with(
             gate.clone(),
-            ToolOptions::default()
+            ToolOptions::new(crate::ToolPolicy::application_managed())
                 .require_approval()
                 .policy(crate::ToolPolicy::read_only().implementation_version("v1")),
         )
@@ -2213,7 +2225,7 @@ async fn implementation_version_change_preserves_approved_and_queued_work() -> R
     let engine = Builder::new(model.clone())
         .tool_with(
             gate.clone(),
-            ToolOptions::default()
+            ToolOptions::new(crate::ToolPolicy::application_managed())
                 .require_approval()
                 .policy(crate::ToolPolicy::read_only().implementation_version("v2")),
         )
@@ -2227,7 +2239,7 @@ async fn implementation_version_change_preserves_approved_and_queued_work() -> R
     let engine = Builder::new(model.clone())
         .tool_with(
             gate.clone(),
-            ToolOptions::default()
+            ToolOptions::new(crate::ToolPolicy::application_managed())
                 .require_approval()
                 .policy(crate::ToolPolicy::read_only().implementation_version("v1")),
         )
@@ -2270,13 +2282,11 @@ async fn returned_tool_failures_keep_deadline_and_attempt_count() -> Result<(), 
         "fail",
         serde_json::json!({}),
     )]);
-    let options = ToolOptions::default()
-        .policy(crate::ToolPolicy::read_only())
-        .retry(
-            RetryPolicy::new(2).with_backoff(crate::retry::BackoffStrategy::Fixed {
-                delay: std::time::Duration::from_secs(5),
-            }),
-        );
+    let options = ToolOptions::new(crate::ToolPolicy::read_only()).retry(
+        RetryPolicy::new(2).with_backoff(crate::retry::BackoffStrategy::Fixed {
+            delay: std::time::Duration::from_secs(5),
+        }),
+    );
     let engine = Builder::new(model.clone())
         .tool_with(tool.clone(), options.clone())
         .build(db.clone(), clock.clone(), "s")?;
@@ -2319,11 +2329,11 @@ async fn streaming_parallel_results_commit_separately_and_keep_emission_order() 
         ],
         vec![E::text("done"), E::final_response_with_default_usage()],
     ]);
-    let options = ToolOptions::default().policy(crate::ToolPolicy::read_only());
+    let options = ToolOptions::new(crate::ToolPolicy::read_only());
     let engine = Builder::new(model.clone())
         .completion_mode(CompletionMode::Streaming)
         .tool_with(gate.clone(), options.clone())
-        .tool(MockAddTool)
+        .tool(MockAddTool, crate::ToolPolicy::application_managed())
         .build(db.clone(), Clock::default(), "s")?;
     engine.submit(SubmitInput::new("r", "question")).await?;
     {
@@ -2352,7 +2362,7 @@ async fn streaming_parallel_results_commit_separately_and_keep_emission_order() 
     let engine = Builder::new(model.clone())
         .completion_mode(CompletionMode::Streaming)
         .tool_with(gate.clone(), options)
-        .tool(MockAddTool)
+        .tool(MockAddTool, crate::ToolPolicy::application_managed())
         .build(db, Clock::default(), "s")?;
     let result = engine
         .wait("r")
@@ -2625,7 +2635,7 @@ async fn ordinary_child_full_call_capacity_drains_and_reopens() -> Result<(), Er
             .find(|call| call.input.name == "helper")
             .unwrap();
         assert!(finished.output.is_some());
-        let durable = finished.output.as_ref().unwrap().result.as_ref().unwrap();
+        let durable = &finished.output.as_ref().unwrap().result;
         assert_eq!(durable.result.as_ref().unwrap().is_success(), !oversized);
         if oversized {
             let error = durable.result.as_ref().unwrap().error().unwrap();
@@ -3072,7 +3082,10 @@ async fn runner_window_reserves_settlement_space_and_bounds_large_tool_results()
     let db = Database::new()?;
     let build = || {
         Builder::new(model.clone())
-            .tool(LargeOutput(effects.clone()))
+            .tool(
+                LargeOutput(effects.clone()),
+                crate::ToolPolicy::application_managed(),
+            )
             .session_history_max_bytes(16 * 1024)
     };
     let engine = build().build(db.clone(), Clock::default(), "bounded")?;
@@ -3102,7 +3115,11 @@ async fn turn_limit_does_not_cancel_admitted_tools_during_capacity_planning() ->
         serde_json::json!({"value": 8}),
     )]);
     let db = Database::new()?;
-    let build = || Builder::new(model.clone()).tool(gate.clone()).max_turns(1);
+    let build = || {
+        Builder::new(model.clone())
+            .tool(gate.clone(), crate::ToolPolicy::application_managed())
+            .max_turns(1)
+    };
     let engine = build().build(db.clone(), Clock::default(), "limited")?;
     engine.submit(SubmitInput::new("r", "run once")).await?;
     assert!(matches!(engine.drive().await, Err(Error::Invalid(_))));
@@ -3130,7 +3147,10 @@ async fn oversized_completed_child_reply_is_terminal_and_full_result_is_retained
             })
             .chain([MockTurn::text("short answer")]),
     );
-    let child_builder = Builder::new(child_model.clone()).tool(LargeOutput(effects.clone()));
+    let child_builder = Builder::new(child_model.clone()).tool(
+        LargeOutput(effects.clone()),
+        crate::ToolPolicy::application_managed(),
+    );
     let definition = child_builder.child_definition()?;
     let transport = LocalChild {
         engine: Rc::new(child_builder.build(Database::new()?, Clock::default(), "child")?),

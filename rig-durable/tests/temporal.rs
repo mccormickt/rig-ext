@@ -18,9 +18,9 @@ use rig::{
     tool::{Tool, ToolContext, ToolExecutionError},
 };
 use rig_durable::{
-    ApprovalDecision, Compaction, InMemoryGuardStore, InvocationContract, InvocationGuardStore,
-    LogicalCallKey, ModelCompactor, ModelSummary, OutcomeSource, SubmissionMode, SubmissionState,
-    SubmitInput, ToolDisposition, ToolInvocation, ToolOutcome, ToolPolicy,
+    ApprovalDecision, Compaction, InMemoryGuardStore, InvocationGuardStore, LogicalCallKey,
+    ModelCompactor, ModelSummary, OutcomeSource, SubmissionMode, SubmissionState, SubmitInput,
+    ToolDisposition, ToolInvocation, ToolOutcome, ToolPolicy,
     temporal::{
         TemporalAgent, TemporalAgentError, TemporalAgentInput, TemporalAgentSessionSnapshot,
         TemporalAgentSessionWorkflow, TemporalAgentStatus, TemporalAgentWorkflow,
@@ -185,15 +185,21 @@ async fn temporal_runner_sparse_batch_restart_and_malformed_outcomes() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let make_agent = || {
         TemporalAgent::new(model.clone())
-            .tool(BlockingLookup {
-                started: started.clone(),
-                release: release.clone(),
-            })
-            .tool(FlakyLookup {
-                attempts: attempts.clone(),
-                fail_until: 0,
-                invocations: invocations.clone(),
-            })
+            .tool(
+                BlockingLookup {
+                    started: started.clone(),
+                    release: release.clone(),
+                },
+                rig_durable::ToolPolicy::application_managed(),
+            )
+            .tool(
+                FlakyLookup {
+                    attempts: attempts.clone(),
+                    fail_until: 0,
+                    invocations: invocations.clone(),
+                },
+                rig_durable::ToolPolicy::application_managed(),
+            )
     };
     let queue = format!("runner-batch-{}", uuid::Uuid::new_v4());
     let agent = make_agent();
@@ -303,7 +309,7 @@ async fn temporal_runner_sparse_batch_restart_and_malformed_outcomes() {
     );
     let mut indices = before
         .iter()
-        .map(|call| call.logical_key.as_ref().unwrap().call_index)
+        .map(|call| call.logical_key.call_index)
         .collect::<Vec<_>>();
     indices.sort_unstable();
     assert_eq!(indices, (2..37).collect::<Vec<_>>());
@@ -374,9 +380,9 @@ async fn temporal_runner_cancellation_during_approval_and_tools() {
         };
         let agent = TemporalAgent::new(model.clone());
         let agent = if route == "approval" {
-            agent.approval_tool(tool)
+            agent.approval_tool(tool, rig_durable::ToolPolicy::application_managed())
         } else {
-            agent.tool(tool)
+            agent.tool(tool, rig_durable::ToolPolicy::application_managed())
         };
         #[cfg(feature = "codemode")]
         let agent = if route == "codemode" {
@@ -466,7 +472,7 @@ fn temporal_code_mode_snapshots_catalog_and_registers_independent_child() {
         .preamble("child instructions");
     let agent = TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::text("done")]))
         .code_mode(rig_codemode::Limits::default())
-        .tool(MockAddTool)
+        .tool(MockAddTool, rig_durable::ToolPolicy::application_managed())
         .sub_agent("research", &child, "child-queue")
         .unwrap();
     let input = agent.input("task");
@@ -511,7 +517,7 @@ fn temporal_code_mode_rejects_approval_and_invalid_limits() {
     let mut options = WorkerOptions::new("invalid-code-mode").build();
     assert!(matches!(
         make()
-            .approval_tool(MockAddTool)
+            .approval_tool(MockAddTool, ToolPolicy::read_only())
             .code_mode(Default::default())
             .register(&mut options),
         Err(TemporalAgentError::InvalidConfiguration(_))
@@ -522,14 +528,14 @@ fn temporal_code_mode_rejects_approval_and_invalid_limits() {
     };
     assert!(matches!(
         make()
-            .tool(MockAddTool)
+            .tool(MockAddTool, ToolPolicy::read_only())
             .code_mode(limits)
             .register(&mut options),
         Err(TemporalAgentError::InvalidConfiguration(_))
     ));
     let child = make();
     assert!(make().sub_agent("codemode", &child, "child").is_err());
-    let child = make().approval_tool(MockAddTool);
+    let child = make().approval_tool(MockAddTool, rig_durable::ToolPolicy::application_managed());
     assert!(make().sub_agent("child", &child, "child").is_err());
 }
 
@@ -555,11 +561,14 @@ async fn temporal_code_mode_planning_failure_stops_the_coordinator() {
     let agent = TemporalAgent::new(model.clone())
         .code_mode(Default::default())
         .activity_max_attempts(1)
-        .tool(FlakyLookup {
-            attempts: attempts.clone(),
-            fail_until: 0,
-            invocations: invocations.clone(),
-        });
+        .tool(
+            FlakyLookup {
+                attempts: attempts.clone(),
+                fail_until: 0,
+                invocations: invocations.clone(),
+            },
+            rig_durable::ToolPolicy::application_managed(),
+        );
     let input = agent.input("run script");
     let suffix = uuid::Uuid::new_v4();
     let queue = format!("rig-code-mode-failure-{suffix}");
@@ -659,10 +668,13 @@ async fn temporal_code_mode_out_of_order_child_race_restart_and_replay() {
         MockTurn::tool_call("slow", "blocking_lookup", serde_json::json!({"key":"slow"})),
         MockTurn::text("slow"),
     ]))
-    .tool(BlockingLookup {
-        started: started.clone(),
-        release: release.clone(),
-    });
+    .tool(
+        BlockingLookup {
+            started: started.clone(),
+            release: release.clone(),
+        },
+        rig_durable::ToolPolicy::application_managed(),
+    );
     let script = r#"
         const slow = tools.child({prompt: "slow"});
         const fast = tools.probe({key: "fast"});
@@ -683,14 +695,17 @@ async fn temporal_code_mode_out_of_order_child_race_restart_and_replay() {
     let make_parent = || {
         TemporalAgent::new(model.clone())
             .code_mode(Default::default())
-            .tool(CodeModeProbe {
-                invocations: invocations.clone(),
-                followup: followup.clone(),
-                loser_started: loser_started.clone(),
-                loser_release: loser_release.clone(),
-                loser_finished: loser_finished.clone(),
-            })
-            .tool(Disposition)
+            .tool(
+                CodeModeProbe {
+                    invocations: invocations.clone(),
+                    followup: followup.clone(),
+                    loser_started: loser_started.clone(),
+                    loser_release: loser_release.clone(),
+                    loser_finished: loser_finished.clone(),
+                },
+                rig_durable::ToolPolicy::application_managed(),
+            )
+            .tool(Disposition, rig_durable::ToolPolicy::application_managed())
             .sub_agent("child", &child, child_queue.clone())
             .unwrap()
     };
@@ -785,14 +800,12 @@ async fn temporal_code_mode_out_of_order_child_race_restart_and_replay() {
             "restart must not rerun settled calls or change their identity"
         );
         assert_eq!(after.len(), 4);
-        assert_eq!(after[0].1.logical_key.as_ref().unwrap().call_index, 1);
-        assert_eq!(after[1].1.logical_key.as_ref().unwrap().call_index, 2);
+        assert_eq!(after[0].1.logical_key.call_index, 1);
+        assert_eq!(after[1].1.logical_key.call_index, 2);
         assert!(
             after[0]
                 .1
                 .logical_key
-                .as_ref()
-                .unwrap()
                 .logical_execution_id
                 .ends_with("/codemode/0/1/0")
         );
@@ -866,7 +879,7 @@ async fn temporal_code_mode_out_of_order_child_race_restart_and_replay() {
 fn temporal_agent_builds_reusable_inputs_and_registers_a_worker() {
     let agent = TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::text("done")]))
         .preamble("Use tools when needed.")
-        .tool(MockAddTool);
+        .tool(MockAddTool, rig_durable::ToolPolicy::application_managed());
 
     let first = agent.input("first");
     let second = agent.input("second");
@@ -879,6 +892,15 @@ fn temporal_agent_builds_reusable_inputs_and_registers_a_worker() {
     assert_ne!(first.prompt, second.prompt);
     let session = agent.session_input(Vec::new());
     assert_eq!(session.config.tools[0].definition.name, "add");
+
+    let mut unsupported = serde_json::to_value(first).unwrap();
+    let field = if cfg!(feature = "codemode") {
+        "unavailable_capability"
+    } else {
+        "code_mode"
+    };
+    unsupported["config"][field] = serde_json::json!({});
+    assert!(serde_json::from_value::<TemporalAgentInput>(unsupported).is_err());
 
     let mut options = WorkerOptions::new("rig-temporal-test").build();
     agent.register(&mut options).unwrap();
@@ -953,7 +975,7 @@ async fn temporal_session_accepts_multiple_prompts_and_closes() {
 #[test]
 fn temporal_approval_is_opt_in_per_tool() {
     let agent = TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::text("done")]))
-        .approval_tool(MockAddTool);
+        .approval_tool(MockAddTool, rig_durable::ToolPolicy::application_managed());
 
     let input = agent.input("add");
     assert!(input.config.tools[0].requires_approval);
@@ -967,7 +989,7 @@ async fn temporal_server_executes_model_and_tool_activities() {
         MockTurn::tool_call("call-1", "add", serde_json::json!({"x": 20, "y": 22})),
         MockTurn::text("The answer is 42."),
     ]))
-    .tool(MockAddTool);
+    .tool(MockAddTool, rig_durable::ToolPolicy::application_managed());
     let input = agent.input("What is 20 + 22?");
     let mut options = WorkerOptions::new("rig-temporal-live-test").build();
     agent.register(&mut options).unwrap();
@@ -1010,11 +1032,14 @@ async fn temporal_retries_tools_with_stable_invocation_identity() {
         MockTurn::text("available"),
     ]))
     .activity_max_attempts(3)
-    .tool(FlakyLookup {
-        attempts: Arc::clone(&attempts),
-        fail_until: 1,
-        invocations: Arc::clone(&invocations),
-    });
+    .tool(
+        FlakyLookup {
+            attempts: Arc::clone(&attempts),
+            fail_until: 1,
+            invocations: Arc::clone(&invocations),
+        },
+        rig_durable::ToolPolicy::application_managed(),
+    );
     let input = agent.input("check service");
     let task_queue = format!("rig-temporal-retry-test-{}", uuid::Uuid::new_v4());
     let mut options = WorkerOptions::new(task_queue.clone()).build();
@@ -1065,23 +1090,12 @@ async fn temporal_retries_tools_with_stable_invocation_identity() {
             invocation.prompt_index,
             invocation.turn,
             invocation.call_index,
-            invocation
-                .logical_key
-                .clone()
-                .expect("logical contract supplies a key"),
+            invocation.logical_key.clone(),
         )
     };
     assert_eq!(logical(&invocations[0]), logical(&invocations[1]));
-    assert_eq!(
-        invocations[0].logical_key.as_ref().unwrap().submission_id,
-        "prompt-0"
-    );
-    let attempt = |invocation: &ToolInvocation| {
-        invocation
-            .attempt
-            .as_ref()
-            .and_then(|attempt| attempt.activity_attempt)
-    };
+    assert_eq!(invocations[0].logical_key.submission_id, "prompt-0");
+    let attempt = |invocation: &ToolInvocation| invocation.attempt.activity_attempt;
     assert_eq!(attempt(&invocations[0]), Some(1));
     assert_eq!(attempt(&invocations[1]), Some(2));
 }
@@ -1097,11 +1111,14 @@ async fn temporal_fails_after_tool_retries_are_exhausted() {
         serde_json::json!({"key": "service"}),
     )]))
     .activity_max_attempts(2)
-    .tool(FlakyLookup {
-        attempts: Arc::clone(&attempts),
-        fail_until: usize::MAX,
-        invocations: Arc::new(Mutex::new(Vec::new())),
-    });
+    .tool(
+        FlakyLookup {
+            attempts: Arc::clone(&attempts),
+            fail_until: usize::MAX,
+            invocations: Arc::new(Mutex::new(Vec::new())),
+        },
+        rig_durable::ToolPolicy::application_managed(),
+    );
     let input = agent.input("check service");
     let task_queue = format!("rig-temporal-exhausted-test-{}", uuid::Uuid::new_v4());
     let mut options = WorkerOptions::new(task_queue.clone()).build();
@@ -1151,11 +1168,14 @@ async fn temporal_approval_executes_only_approved_tools() {
         ),
         MockTurn::text("denied"),
     ]))
-    .approval_tool(FlakyLookup {
-        attempts: Arc::clone(&attempts),
-        fail_until: 0,
-        invocations: Arc::new(Mutex::new(Vec::new())),
-    });
+    .approval_tool(
+        FlakyLookup {
+            attempts: Arc::clone(&attempts),
+            fail_until: 0,
+            invocations: Arc::new(Mutex::new(Vec::new())),
+        },
+        rig_durable::ToolPolicy::application_managed(),
+    );
     let approved_input = agent.input("approve lookup");
     let denied_input = agent.input("deny lookup");
     let task_queue = format!("rig-temporal-approval-test-{}", uuid::Uuid::new_v4());
@@ -1356,10 +1376,13 @@ async fn temporal_session_serializes_updates_and_drains_active_steering_on_close
         MockTurn::text("first answer"),
         MockTurn::text("steered answer"),
     ]))
-    .tool(BlockingLookup {
-        started: Arc::clone(&started),
-        release: Arc::clone(&release),
-    });
+    .tool(
+        BlockingLookup {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        },
+        rig_durable::ToolPolicy::application_managed(),
+    );
     let input = agent.session_input(Vec::new());
     let task_queue = format!("rig-temporal-control-test-{}", uuid::Uuid::new_v4());
     let mut options = WorkerOptions::new(task_queue.clone()).build();
@@ -1530,7 +1553,7 @@ impl Tool for LedgerWrite {
         args: LookupArgs,
     ) -> Result<Self::Output, Self::Error> {
         let invocation = context.require::<ToolInvocation>().unwrap();
-        let logical_key = invocation.logical_key.as_ref().unwrap().digest();
+        let logical_key = invocation.logical_key.digest();
         let first = {
             let mut ledger = self.ledger.lock().unwrap();
             if ledger.iter().any(|entry| entry == &logical_key) {
@@ -1548,15 +1571,11 @@ impl Tool for LedgerWrite {
 }
 
 #[test]
-fn temporal_registration_fails_closed_on_missing_contract_or_guard() {
-    let legacy = TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::text("done")]))
-        .invocation_contract(InvocationContract::Legacy)
+fn temporal_registration_requires_a_guard_only_for_guarded_tools() {
+    let read_only = TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::text("done")]))
         .tool_with_policy(MockAddTool, ToolPolicy::read_only());
-    let mut options = WorkerOptions::new("rig-temporal-legacy-policy").build();
-    assert!(matches!(
-        legacy.register(&mut options),
-        Err(TemporalAgentError::InvocationContractRequired(name)) if name == "add"
-    ));
+    let mut options = WorkerOptions::new("rig-temporal-read-only").build();
+    read_only.register(&mut options).unwrap();
 
     let unguarded = TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::text("done")]))
         .tool_with_policy(MockAddTool, ToolPolicy::interrupt_on_uncertain());
@@ -1574,23 +1593,21 @@ fn temporal_registration_fails_closed_on_missing_contract_or_guard() {
 }
 
 #[test]
-fn temporal_input_requires_an_explicit_invocation_contract() {
+fn temporal_input_requires_an_explicit_tool_policy() {
     let agent = TemporalAgent::new(MockCompletionModel::from_turns([MockTurn::text("done")]))
-        .tool(MockAddTool);
+        .tool(MockAddTool, rig_durable::ToolPolicy::application_managed());
     let fresh = agent.input("hello");
-    assert_eq!(fresh.config.contract, InvocationContract::Logical);
-
     let mut input = serde_json::to_value(&fresh).unwrap();
-    input["config"]
+    input["config"]["tools"][0]
         .as_object_mut()
         .unwrap()
-        .remove("contract")
-        .expect("new inputs carry the contract");
+        .remove("policy")
+        .expect("tool inputs carry the policy");
     assert!(
         serde_json::from_value::<TemporalAgentInput>(input)
             .unwrap_err()
             .to_string()
-            .contains("missing field `contract`")
+            .contains("missing field `policy`")
     );
 }
 
@@ -1870,11 +1887,14 @@ async fn continuation_preserves_failed_compaction_and_execution_chain_identity()
     let agent = TemporalAgent::new(model)
         .activity_max_attempts(1)
         .compaction(compaction(&summaries, 1))
-        .tool(FlakyLookup {
-            attempts: Arc::new(AtomicUsize::new(0)),
-            fail_until: 0,
-            invocations: invocations.clone(),
-        });
+        .tool(
+            FlakyLookup {
+                attempts: Arc::new(AtomicUsize::new(0)),
+                fail_until: 0,
+                invocations: invocations.clone(),
+            },
+            rig_durable::ToolPolicy::application_managed(),
+        );
     let input = agent.session_input(Vec::new());
     let queue = format!("continue-{}", uuid::Uuid::new_v4());
     let id = queue.clone();
@@ -1985,13 +2005,13 @@ async fn continuation_preserves_failed_compaction_and_execution_chain_identity()
     env.shutdown().await.unwrap();
     let calls = invocations.lock().unwrap();
     assert_eq!(calls.len(), 2);
-    let first = calls[0].logical_key.as_ref().unwrap();
-    let second = calls[1].logical_key.as_ref().unwrap();
+    let first = &calls[0].logical_key;
+    let second = &calls[1].logical_key;
     assert_eq!(first.logical_execution_id, second.logical_execution_id);
     assert_ne!(first.submission_id, second.submission_id);
     assert_ne!(
-        calls[0].attempt.as_ref().unwrap().backend_execution_id,
-        calls[1].attempt.as_ref().unwrap().backend_execution_id
+        calls[0].attempt.backend_execution_id,
+        calls[1].attempt.backend_execution_id
     );
     assert_eq!(summaries.requests().len(), 2);
 }
@@ -2008,10 +2028,13 @@ async fn failed_prompt_cancels_an_already_admitted_follow_up() {
     let release = Arc::new(Notify::new());
     let agent = TemporalAgent::new(model.clone())
         .activity_max_attempts(1)
-        .tool(BlockingLookup {
-            started: started.clone(),
-            release: release.clone(),
-        });
+        .tool(
+            BlockingLookup {
+                started: started.clone(),
+                release: release.clone(),
+            },
+            rig_durable::ToolPolicy::application_managed(),
+        );
     with_session(agent, "failed-prompt-queued", |handle| async move {
         let active = handle.execute_update(
             TemporalAgentSessionWorkflow::prompt,
@@ -2069,10 +2092,13 @@ async fn queued_prompts_and_steering_compact_before_each_next_prompt() {
     let agent = TemporalAgent::new(model.clone())
         .activity_max_attempts(1)
         .compaction(compaction(&model, 1))
-        .tool(BlockingLookup {
-            started: started.clone(),
-            release: release.clone(),
-        });
+        .tool(
+            BlockingLookup {
+                started: started.clone(),
+                release: release.clone(),
+            },
+            rig_durable::ToolPolicy::application_managed(),
+        );
     with_session(agent, "queued-compaction", |handle| async move {
         let active = handle.execute_update(
             TemporalAgentSessionWorkflow::prompt,
@@ -2313,10 +2339,13 @@ async fn temporal_follow_up_during_a_tool_round_runs_after_the_answer_and_reject
     let release = Arc::new(Notify::new());
     let agent = TemporalAgent::new(model.clone())
         .activity_max_attempts(1)
-        .tool(BlockingLookup {
-            started: Arc::clone(&started),
-            release: Arc::clone(&release),
-        });
+        .tool(
+            BlockingLookup {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            },
+            rig_durable::ToolPolicy::application_managed(),
+        );
     let result = with_session(agent, "rig-temporal-follow-up-test", |handle| async move {
         let first = submit(&handle, SubmitInput::new("req-1", "first"));
         tokio::pin!(first);
@@ -2425,7 +2454,7 @@ async fn temporal_compaction_keeps_the_request_canonical_and_the_transcript_comp
     ]);
     let agent = TemporalAgent::new(model.clone())
         .activity_max_attempts(1)
-        .tool(MockAddTool)
+        .tool(MockAddTool, rig_durable::ToolPolicy::application_managed())
         .compaction(compaction(&model, 2).version("test-1"));
     let result = with_session(agent, "rig-temporal-compaction-test", |handle| async move {
         assert_eq!(prompt(&handle, "one").await, "answer one");
@@ -2628,7 +2657,6 @@ fn disposition_agent() -> TemporalAgent {
         ),
         MockTurn::text("done"),
     ]))
-    .invocation_contract(InvocationContract::Logical)
     .activity_max_attempts(1)
     .max_turns(4)
     .tool_with_policy(Disposition, ToolPolicy::read_only())

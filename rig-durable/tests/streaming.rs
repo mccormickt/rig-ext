@@ -22,11 +22,16 @@ async fn run(
     retry: RetryPolicy,
     instance: &str,
 ) -> (Result<PromptResponse, String>, usize) {
-    let catalog = catalog_from_toolset(&tools, RetryPolicy::new(1)).await;
+    let catalog = catalog_from_toolset(
+        &tools,
+        RetryPolicy::new(1),
+        rig_durable::ToolPolicy::application_managed(),
+    )
+    .await;
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
     let runtime = runtime::Runtime::start_with_store(
         store.clone(),
-        activity_registry(model.clone(), tools),
+        activity_registry(model.clone(), tools, &catalog),
         orchestration_registry(DurableAgentConfig {
             tools: catalog,
             completion_mode: CompletionMode::Streaming,
@@ -37,7 +42,11 @@ async fn run(
     .await;
     let client = Client::new(store);
     client
-        .start_orchestration_typed(instance, ORCHESTRATION, AgentInput::new("test"))
+        .start_orchestration_typed(
+            instance,
+            ORCHESTRATION,
+            AgentInput::new("test").with_scope("raw-test-store"),
+        )
         .await
         .unwrap();
     let result = client
@@ -285,11 +294,16 @@ async fn checkpointing_streamed_turns_does_not_repeat_provider_calls() {
         ],
     ]);
     let tools = ToolSet::from_tools(vec![MockAddTool]);
-    let catalog = catalog_from_toolset(&tools, RetryPolicy::new(1)).await;
+    let catalog = catalog_from_toolset(
+        &tools,
+        RetryPolicy::new(1),
+        rig_durable::ToolPolicy::application_managed(),
+    )
+    .await;
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
     let runtime = runtime::Runtime::start_with_store(
         store.clone(),
-        activity_registry(model.clone(), tools),
+        activity_registry(model.clone(), tools, &catalog),
         orchestration_registry(DurableAgentConfig {
             tools: catalog,
             completion_mode: CompletionMode::Streaming,
@@ -303,7 +317,11 @@ async fn checkpointing_streamed_turns_does_not_repeat_provider_calls() {
     .await;
     let client = Client::new(store);
     client
-        .start_orchestration_typed("stream-checkpoint", ORCHESTRATION, AgentInput::new("add"))
+        .start_orchestration_typed(
+            "stream-checkpoint",
+            ORCHESTRATION,
+            AgentInput::new("add").with_scope("raw-test-store"),
+        )
         .await
         .unwrap();
     let response = client

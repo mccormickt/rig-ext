@@ -8,7 +8,8 @@ use rig::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    activity_types::{InvocationContract, ToolActivityInput, ToolActivityOutput, ToolInvocation},
+    activities::tool::ToolActivityResult,
+    activity_types::{ToolActivityInput, ToolInvocation},
     approval::ApprovalDecision,
     config::{CheckpointPolicy, CompletionMode, ConfigSnapshot, DurableAgentConfig},
     driver::{self, CompletionOptions},
@@ -55,17 +56,17 @@ pub(crate) async fn run_with_names(
     config: DurableAgentConfig,
     names: RuntimeNames,
 ) -> Result<PromptResponse, String> {
+    crate::config::encode_execution(&input)?;
+    let execution_scope = input.execution_scope.clone();
+    let logical_execution_id =
+        LogicalCallKey::scoped_execution(&execution_scope, &ctx.instance_id())?;
     let config = match &input.snapshot {
         Some(snapshot) => config
             .resolve(snapshot)
             .map_err(|error| error.to_string())?,
         None => config,
     };
-    let snapshot = match (input.snapshot.clone(), config.contract) {
-        (Some(snapshot), _) => Some(snapshot),
-        (None, InvocationContract::Logical) => Some(config.snapshot()),
-        (None, InvocationContract::Legacy) => None,
-    };
+    let snapshot = Some(input.snapshot.clone().unwrap_or_else(|| config.snapshot()));
     let ResumedRun {
         mut agent,
         generation,
@@ -81,6 +82,7 @@ pub(crate) async fn run_with_names(
         ctx: &ctx,
         config: &config,
         names: &names,
+        logical_execution_id: &logical_execution_id,
     };
     let mut operations = 0;
     let mut last_steering_id = ctx
@@ -109,6 +111,7 @@ pub(crate) async fn run_with_names(
                         tool_outcomes,
                         &config,
                         snapshot.as_ref(),
+                        &execution_scope,
                         &decorate,
                     )
                     .await;
@@ -149,6 +152,7 @@ pub(crate) async fn run_with_names(
                             tool_outcomes,
                             &config,
                             snapshot.as_ref(),
+                            &execution_scope,
                             &decorate,
                         )
                         .await;
@@ -188,6 +192,7 @@ pub(crate) struct Engine<'a> {
     pub ctx: &'a OrchestrationContext,
     pub config: &'a DurableAgentConfig,
     pub names: &'a RuntimeNames,
+    pub logical_execution_id: &'a str,
 }
 
 impl Engine<'_> {
@@ -308,19 +313,11 @@ impl Engine<'_> {
             ));
         }
 
-        let request = match config.contract {
-            InvocationContract::Legacy => driver::approval_request(
-                call,
-                position.prompt_index,
-                position.turn,
-                position.call_index,
-            )?,
-            InvocationContract::Logical => driver::logical_approval_request(
-                call,
-                &self.logical_key(position),
-                entry.policy.version(),
-            )?,
-        };
+        let request = driver::logical_approval_request(
+            call,
+            &self.logical_key(position),
+            entry.policy.version(),
+        )?;
         let mut status = serde_json::json!({"phase":"approval","request":request});
         decorate(&mut status);
         let status = status.to_string();
@@ -384,47 +381,37 @@ impl Engine<'_> {
                 let name = call.function.name.to_string();
                 let execution_id = format!("{}:{}", ctx.instance_id(), ctx.execution_id());
                 let payload = |attempt: u32| {
-                    let invocation = match config.contract {
-                        InvocationContract::Legacy => ToolInvocation::legacy(
-                            execution_id.clone(),
-                            position.prompt_index,
-                            position.turn,
-                            position.call_index,
-                        ),
-                        InvocationContract::Logical => ToolInvocation {
-                            execution_id: execution_id.clone(),
-                            prompt_index: position.prompt_index,
-                            turn: position.turn,
-                            call_index: position.call_index,
-                            logical_key: Some(self.logical_key(position)),
-                            attempt: Some(AttemptMetadata {
-                                backend_execution_id: execution_id.clone(),
-                                activity_attempt: Some(attempt),
-                            }),
+                    let invocation = ToolInvocation {
+                        execution_id: execution_id.clone(),
+                        prompt_index: position.prompt_index,
+                        turn: position.turn,
+                        call_index: position.call_index,
+                        logical_key: self.logical_key(position),
+                        attempt: AttemptMetadata {
+                            backend_execution_id: execution_id.clone(),
+                            activity_attempt: Some(attempt),
                         },
-                    };
-                    let policy = match config.contract {
-                        InvocationContract::Legacy => None,
-                        InvocationContract::Logical => Some(entry.policy.clone()),
                     };
                     serde_json::to_string(&ToolActivityInput {
                         name: name.clone(),
                         arguments: arguments.clone(),
                         invocation,
-                        policy,
+                        policy: entry.policy.clone(),
+                        runtime_identity: None,
                     })
                     .map_err(|e| e.to_string())
                 };
                 let raw = schedule_with_retry(
                     ctx,
-                    self.names.tool_activity(config.contract),
+                    &self.names.tool_activity,
                     payload,
                     entry.retry.clone(),
                     entry.tag.as_deref(),
                 )
                 .await?;
-                let output =
-                    serde_json::from_str::<ToolActivityOutput>(&raw).map_err(|e| e.to_string())?;
+                let output = serde_json::from_str::<ToolActivityResult>(&raw)
+                    .map_err(|e| e.to_string())?
+                    .map_err(|error| error.to_string())?;
                 let outcome = ToolOutcome::from_activity(position, &call, &output);
                 (output.content, outcome)
             }
@@ -479,6 +466,7 @@ impl Engine<'_> {
             ToolRoute::DurableAgent {
                 orchestration_name,
                 version,
+                snapshot,
             } => {
                 let prompt = call
                     .function
@@ -491,8 +479,11 @@ impl Engine<'_> {
                             call.function.name
                         )
                     })?;
-                let input =
-                    serde_json::to_string(&AgentInput::new(prompt)).map_err(|e| e.to_string())?;
+                let input = crate::config::encode_execution(
+                    &AgentInput::new(prompt)
+                        .with_scope(self.logical_key(position).canonical())
+                        .with_snapshot(*snapshot.clone()),
+                )?;
                 let raw = ctx
                     .schedule_sub_orchestration_versioned(
                         orchestration_name,
@@ -507,6 +498,32 @@ impl Engine<'_> {
                     ToolOutcome::routed(position, &call),
                 )
             }
+            #[cfg(feature = "codemode")]
+            ToolRoute::CodeMode {
+                orchestration_name,
+                version,
+                snapshot,
+            } => {
+                let script: crate::codemode::ScriptInput =
+                    serde_json::from_str(&arguments).map_err(|error| error.to_string())?;
+                let input = crate::codemode::duroxide::ExecutionInput {
+                    code: script.code,
+                    parent: self.logical_key(position),
+                    definition: *snapshot.clone(),
+                };
+                let payload = crate::config::encode_execution(&input)?;
+                let raw = ctx
+                    .schedule_sub_orchestration_versioned(
+                        orchestration_name,
+                        Some(version.clone()),
+                        payload,
+                    )
+                    .await?;
+                let content = serde_json::from_str(&raw)
+                    .map(ToolResultContent::json)
+                    .map_err(|error| error.to_string())?;
+                (vec![content], ToolOutcome::routed(position, &call))
+            }
         };
 
         Ok((driver::tool_result(&call, content), outcome))
@@ -514,7 +531,7 @@ impl Engine<'_> {
 
     fn logical_key(&self, position: CallPosition) -> LogicalCallKey {
         LogicalCallKey {
-            logical_execution_id: self.ctx.instance_id(),
+            logical_execution_id: self.logical_execution_id.to_owned(),
             submission_id: LogicalCallKey::submission_for_prompt(position.prompt_index),
             model_turn: position.turn,
             call_index: position.call_index,
@@ -586,6 +603,7 @@ async fn checkpoint(
     tool_outcomes: Vec<ToolOutcome>,
     config: &DurableAgentConfig,
     snapshot: Option<&ConfigSnapshot>,
+    execution_scope: &str,
     decorate: &(dyn Fn(&mut serde_json::Value) + Sync),
 ) -> Result<PromptResponse, String> {
     let generation = generation
@@ -604,8 +622,9 @@ async fn checkpoint(
         cursor.prompt_index,
         snapshot.cloned(),
         tool_outcomes,
-    );
-    let payload = serde_json::to_string(&input).map_err(|error| error.to_string())?;
+    )
+    .with_scope(execution_scope);
+    let payload = crate::config::encode_execution(&input)?;
     let raw = match &config.checkpoint.target_version {
         Some(version) => ctx.continue_as_new_versioned(version, payload).await?,
         None => ctx.continue_as_new(payload).await?,

@@ -25,7 +25,7 @@ use thiserror::Error;
 
 use crate::{
     AgentInput, ApprovalDecision, ApprovalRequest, CheckpointConfig, CompletionMode,
-    CompletionSettings, DurableAgentConfig, InvocationContract, RetryPolicy, ToolOptions,
+    CompletionSettings, DurableAgentConfig, RetryPolicy, ToolOptions,
     activities::tool::ToolExecutor,
     compaction::Compaction,
     config::ConfigSnapshot,
@@ -74,11 +74,6 @@ pub enum AgentOrchestratorError {
     #[error("durable sub-agent `{0}` requires approval, which parent run handles cannot route")]
     SubAgentApprovalUnsupported(String),
     #[error(
-        "tool `{0}` declares a replay policy, which requires `InvocationContract::Logical`; \
-         select it with `invocation_contract` under a new agent version"
-    )]
-    InvocationContractRequired(String),
-    #[error(
         "tool `{0}` never repeats an uncertain effect and requires an invocation guard store; \
          supply one with `invocation_guard`"
     )]
@@ -119,8 +114,7 @@ struct AgentMetadata {
     session_orchestration: String,
     approval_queue: String,
     checkpoint_target: Option<String>,
-    /// Attached to new runs under the logical contract.
-    snapshot: Option<ConfigSnapshot>,
+    snapshot: ConfigSnapshot,
 }
 
 /// Built agent registration, including its model, tools, and child agents.
@@ -149,14 +143,13 @@ impl AgentDefinition {
 /// Configure a durable agent from a Rig completion model and tools.
 ///
 /// Call [`build`](Self::build) to validate tool policies and create an
-/// [`AgentDefinition`]. Non-default tool policies require the logical contract.
+/// [`AgentDefinition`]. Every executable tool needs an explicit policy.
 /// The supplied `lookup` in this example must perform no external write.
 ///
 /// ```no_run
 /// use rig::{DynModel, operation::Completion, tool::Tool};
 /// use rig_durable::{
-///     AgentDefinition, AgentOrchestratorError, DurableAgent, InvocationContract,
-///     ToolOptions, ToolPolicy,
+///     AgentDefinition, AgentOrchestratorError, DurableAgent, ToolPolicy,
 /// };
 ///
 /// fn define(
@@ -164,9 +157,8 @@ impl AgentDefinition {
 ///     lookup: impl Tool + 'static,
 /// ) -> Result<AgentDefinition, AgentOrchestratorError> {
 ///     DurableAgent::builder("support", model)
-///         .invocation_contract(InvocationContract::Logical)
 ///         .preamble("Use the lookup tool to check facts.")
-///         .tool_with(lookup, ToolOptions::default().policy(ToolPolicy::read_only()))
+///         .tool(lookup, ToolPolicy::read_only())
 ///         .build()
 /// }
 /// ```
@@ -203,14 +195,6 @@ impl DurableAgentBuilder {
             #[cfg(feature = "codemode")]
             code_mode: None,
         }
-    }
-
-    /// Select the wire contract between this agent version and its tool
-    /// activities. Switching an existing version's contract breaks replay of
-    /// its in-flight runs; select it together with a new version.
-    pub fn invocation_contract(mut self, contract: InvocationContract) -> Self {
-        self.config.contract = contract;
-        self
     }
 
     /// Supply the store that tools with
@@ -284,13 +268,12 @@ impl DurableAgentBuilder {
         self
     }
 
-    /// Register a Rig tool with default retries and application-managed safety.
-    /// Use [`Self::tool_with`] to require approval or declare a replay policy.
-    pub fn tool<T>(self, tool: T) -> Self
+    /// Register a Rig tool with an explicit replay policy and default retries.
+    pub fn tool<T>(self, tool: T, policy: ToolPolicy) -> Self
     where
         T: Tool + 'static,
     {
-        self.tool_with(tool, ToolOptions::default())
+        self.tool_with(tool, ToolOptions::new(policy))
     }
 
     /// Register a Rig tool with explicit durable execution settings.
@@ -381,6 +364,7 @@ impl DurableAgentBuilder {
             },
             child_metadata.orchestration,
             child_metadata.version.to_string(),
+            child_metadata.snapshot,
         ));
         self.children.push(child);
         Ok(self)
@@ -399,7 +383,12 @@ impl DurableAgentBuilder {
             let options = self
                 .tool_options
                 .remove(definition.name.as_str())
-                .unwrap_or_default();
+                .ok_or_else(|| {
+                    AgentOrchestratorError::InvalidToolPolicy(format!(
+                        "tool `{}` has no policy",
+                        definition.name
+                    ))
+                })?;
             self.routed_tools.insert(ToolEntry {
                 definition: (*definition).clone(),
                 route: crate::ToolRoute::RigTool,
@@ -412,13 +401,6 @@ impl DurableAgentBuilder {
         self.config.tools = self.routed_tools;
         for entry in self.config.tools.0.values() {
             let name = entry.definition.name.as_str();
-            if self.config.contract == InvocationContract::Legacy
-                && entry.policy != ToolPolicy::default()
-            {
-                return Err(AgentOrchestratorError::InvocationContractRequired(
-                    name.to_owned(),
-                ));
-            }
             entry
                 .check_route_policy()
                 .map_err(AgentOrchestratorError::InvalidToolPolicy)?;
@@ -439,8 +421,7 @@ impl DurableAgentBuilder {
             let (entry, planning, workflows) = crate::codemode::duroxide::registries(
                 names.clone(),
                 &version,
-                self.config.tools.clone(),
-                self.config.contract,
+                self.config.clone(),
                 limits,
             )
             .map_err(AgentOrchestratorError::InvalidToolPolicy)?;
@@ -477,10 +458,7 @@ impl DurableAgentBuilder {
                 session_orchestration: names.session_orchestration,
                 approval_queue: self.config.approval.queue_name.clone(),
                 checkpoint_target: self.config.checkpoint.target_version.clone(),
-                snapshot: match self.config.contract {
-                    InvocationContract::Legacy => None,
-                    InvocationContract::Logical => Some(self.config.snapshot()),
-                },
+                snapshot: self.config.snapshot(),
             },
             activities,
             orchestrations,
@@ -493,6 +471,7 @@ impl DurableAgentBuilder {
 /// Collect agent registrations and runtime options before starting Duroxide.
 pub struct AgentOrchestratorBuilder {
     provider: Arc<dyn Provider>,
+    execution_scope: String,
     activities: ActivityRegistry,
     orchestrations: OrchestrationRegistry,
     agents: BTreeMap<String, BTreeMap<Version, AgentMetadata>>,
@@ -569,6 +548,11 @@ impl AgentOrchestratorBuilder {
     }
 
     pub async fn start(self) -> Result<AgentOrchestrator, AgentOrchestratorError> {
+        if self.execution_scope.is_empty() {
+            return Err(AgentOrchestratorError::InvalidToolPolicy(
+                "execution scope must be nonempty".into(),
+            ));
+        }
         for (name, versions) in &self.agents {
             for metadata in versions.values() {
                 if let Some(target) = &metadata.checkpoint_target {
@@ -597,6 +581,7 @@ impl AgentOrchestratorBuilder {
         .await;
         Ok(AgentOrchestrator {
             provider: self.provider,
+            execution_scope: self.execution_scope,
             client,
             runtime,
             agents: Arc::new(self.agents),
@@ -611,15 +596,20 @@ impl AgentOrchestratorBuilder {
 /// stop. See the [crate example](crate) for a complete SQLite setup.
 pub struct AgentOrchestrator {
     provider: Arc<dyn Provider>,
+    execution_scope: String,
     client: Client,
     runtime: Arc<Runtime>,
     agents: Arc<BTreeMap<String, BTreeMap<Version, AgentMetadata>>>,
 }
 
 impl AgentOrchestrator {
-    pub fn builder(provider: Arc<dyn Provider>) -> AgentOrchestratorBuilder {
+    pub fn builder(
+        provider: Arc<dyn Provider>,
+        execution_scope: impl Into<String>,
+    ) -> AgentOrchestratorBuilder {
         AgentOrchestratorBuilder {
             provider,
+            execution_scope: execution_scope.into(),
             activities: ActivityRegistry::builder().build(),
             orchestrations: OrchestrationRegistry::builder().build(),
             agents: BTreeMap::new(),
@@ -630,11 +620,12 @@ impl AgentOrchestrator {
     #[cfg(feature = "sqlite")]
     pub async fn sqlite(
         database_url: &str,
+        execution_scope: impl Into<String>,
     ) -> Result<AgentOrchestratorBuilder, AgentOrchestratorError> {
         let provider = duroxide::providers::sqlite::SqliteProvider::new(database_url, None)
             .await
             .map_err(|error| AgentOrchestratorError::Sqlite(error.to_string()))?;
-        Ok(Self::builder(Arc::new(provider)))
+        Ok(Self::builder(Arc::new(provider), execution_scope))
     }
 
     /// Select the highest registered semantic version of a named agent.
@@ -648,6 +639,7 @@ impl AgentOrchestrator {
             .ok_or_else(|| AgentOrchestratorError::AgentNotFound(name.into()))?;
         Ok(DurableAgent {
             client: self.client.clone(),
+            execution_scope: self.execution_scope.clone(),
             metadata,
         })
     }
@@ -673,6 +665,7 @@ impl AgentOrchestrator {
             })?;
         Ok(DurableAgent {
             client: self.client.clone(),
+            execution_scope: self.execution_scope.clone(),
             metadata,
         })
     }
@@ -702,6 +695,7 @@ impl AgentOrchestrator {
 #[derive(Clone)]
 pub struct DurableAgent {
     client: Client,
+    execution_scope: String,
     metadata: AgentMetadata,
 }
 
@@ -757,9 +751,10 @@ impl DurableAgent {
     ) -> Result<DurableRun, AgentOrchestratorError> {
         let run_id = run_id.into();
         let instance_id = instance_id(&self.metadata, "rig-agent", &run_id);
-        let mut input = AgentInput::new(prompt);
+        let mut input = AgentInput::new(prompt).with_scope(&self.execution_scope);
         input.history = history;
-        input.snapshot = self.metadata.snapshot.clone();
+        input.snapshot = Some(self.metadata.snapshot.clone());
+        crate::config::encode_execution(&input).map_err(AgentOrchestratorError::Run)?;
         self.client
             .start_orchestration_versioned_typed(
                 &instance_id,
@@ -799,8 +794,10 @@ impl DurableAgent {
     ) -> Result<DurableSession, AgentOrchestratorError> {
         let session = self.session(session_id);
         let input = SessionInput::new(session.instance_id(), DEFAULT_LEDGER_MAX_BYTES)
+            .with_scope(&self.execution_scope)
             .with_history(history)
-            .with_snapshot(self.metadata.snapshot.clone());
+            .with_snapshot(Some(self.metadata.snapshot.clone()));
+        crate::config::encode_execution(&input).map_err(AgentOrchestratorError::Run)?;
         self.client
             .start_orchestration_versioned_typed(
                 session.instance_id(),

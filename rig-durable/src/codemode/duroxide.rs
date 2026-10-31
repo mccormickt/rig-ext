@@ -13,26 +13,42 @@ use rig_codemode::{
     Limits,
     replay::{ScriptCall, ScriptStep},
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentInput, InvocationContract, ToolActivityInput, ToolActivityOutput, ToolInvocation,
+    AgentInput, ToolActivityInput, ToolInvocation,
+    activities::tool::ToolActivityResult,
+    config::{ConfigSnapshot, DurableAgentConfig, encode_execution},
     identity::{AttemptMetadata, LogicalCallKey},
     names::RuntimeNames,
     orchestration::schedule_with_retry,
-    tools::{ToolCatalog, ToolEntry, ToolRoute, sub_orchestration_tool},
+    tools::{ToolCatalog, ToolEntry, ToolRoute},
 };
 
-use super::{CodeModeConfig, ScriptInput, StepInput};
+use super::{CodeModeConfig, StepInput};
+
+/// Trusted backend input, separate from the model's source-only arguments.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct ExecutionInput {
+    pub code: String,
+    pub parent: LogicalCallKey,
+    pub definition: ConfigSnapshot,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PlanningInput {
+    config: CodeModeConfig,
+    step: StepInput,
+}
 
 pub(crate) fn registries(
     names: RuntimeNames,
     version: &str,
-    tools: ToolCatalog,
-    contract: InvocationContract,
+    mut definition: DurableAgentConfig,
     limits: Limits,
 ) -> Result<(ToolEntry, ActivityRegistry, OrchestrationRegistry), String> {
     limits.validate().map_err(|error| error.to_string())?;
-    for entry in tools.0.values() {
+    for entry in definition.tools.0.values() {
         if entry.requires_approval {
             return Err("code-mode nested calls do not support human approval".into());
         }
@@ -48,26 +64,34 @@ pub(crate) fn registries(
             );
         }
     }
-    let config = CodeModeConfig {
-        limits,
-        definitions: tools.definitions(),
-    };
+    let config = CodeModeConfig::native(limits, definition.tools.definitions());
     config.validate()?;
+    definition.code_mode = Some(config.clone());
     let plan = format!("{}::codemode-step::v1", names.tool_activity);
     let workflow = format!("{}::codemode::v1", names.orchestration);
-    let entry = sub_orchestration_tool(config.definition()?, &workflow, Some(version.into()));
+    let entry = ToolEntry {
+        definition: config.definition()?,
+        route: ToolRoute::CodeMode {
+            orchestration_name: workflow.clone(),
+            version: version.into(),
+            snapshot: Box::new(definition.snapshot()),
+        },
+        retry: crate::RetryPolicy::new(1),
+        tag: None,
+        requires_approval: false,
+        policy: crate::ToolPolicy::application_managed(),
+    };
     let activity = ActivityRegistry::builder()
-        .register_typed(&plan, move |_ctx, input: StepInput| {
-            let config = config.clone();
-            async move { config.step(input).await }
+        .register_typed(&plan, move |_ctx, input: PlanningInput| async move {
+            encode_execution(&input)?;
+            input.config.step(input.step).await
         })
         .build();
     let orchestration = OrchestrationRegistry::builder()
-        .register_versioned_typed(&workflow, version, move |ctx, input: ScriptInput| {
-            let tools = tools.clone();
+        .register_versioned_typed(&workflow, version, move |ctx, input: ExecutionInput| {
             let names = names.clone();
             let plan = plan.clone();
-            async move { run(ctx, input, tools, names, plan, contract, limits).await }
+            async move { run(ctx, input, names, plan).await }
         })
         .build();
     Ok((entry, activity, orchestration))
@@ -75,16 +99,20 @@ pub(crate) fn registries(
 
 async fn run(
     ctx: OrchestrationContext,
-    input: ScriptInput,
-    tools: ToolCatalog,
+    input: ExecutionInput,
     names: RuntimeNames,
     plan: String,
-    contract: InvocationContract,
-    limits: Limits,
 ) -> Result<serde_json::Value, String> {
+    encode_execution(&input)?;
+    let definition = DurableAgentConfig::default()
+        .resolve(&input.definition)
+        .map_err(|error| error.to_string())?;
+    let config = definition.code_mode.ok_or("missing code-mode definition")?;
+    let tools = definition.tools;
+    let parent = input.parent;
     let report = super::run(
         input.code,
-        limits,
+        config.limits,
         |state| {
             ctx.set_custom_status(
                 serde_json::json!({
@@ -93,13 +121,25 @@ async fn run(
                 })
                 .to_string(),
             );
-            ctx.schedule_activity_typed::<_, ScriptStep>(&plan, &state)
+            let input = PlanningInput {
+                config: config.clone(),
+                step: state,
+            };
+            let ctx = &ctx;
+            let plan = &plan;
+            async move {
+                let payload = encode_execution(&input)?;
+                let raw = ctx.schedule_activity(plan, payload).await?;
+                serde_json::from_str::<ScriptStep>(&raw).map_err(|error| error.to_string())
+            }
         },
         |call| {
             let ctx = &ctx;
             let tools = &tools;
             let names = &names;
-            async move { execute(ctx, &call, tools, names, contract).await }
+            let parent = &parent;
+            let runtime_identity = &config.runtime_identity;
+            async move { execute(ctx, &call, tools, names, parent, runtime_identity).await }
         },
     )
     .await?;
@@ -111,12 +151,20 @@ async fn execute(
     call: &ScriptCall,
     tools: &ToolCatalog,
     names: &RuntimeNames,
-    contract: InvocationContract,
+    parent: &LogicalCallKey,
+    runtime_identity: &str,
 ) -> Result<ToolResult, String> {
     let entry = tools
         .get(&call.name)
         .ok_or("script called an unregistered tool")?;
     let args = serde_json::to_string(&call.arguments).map_err(|error| error.to_string())?;
+    let key = LogicalCallKey {
+        logical_execution_id: parent.canonical(),
+        submission_id: "codemode".into(),
+        model_turn: 1,
+        call_index: call.ordinal as usize,
+    };
+    entry.check_route_policy()?;
     let result = match &entry.route {
         #[cfg(feature = "durable-object")]
         ToolRoute::DurableObject { .. } => {
@@ -125,29 +173,26 @@ async fn execute(
         ToolRoute::RigTool => {
             let raw = schedule_with_retry(
                 ctx,
-                names.tool_activity(contract),
+                &names.tool_activity,
                 |attempt| {
                     let execution_id = format!("{}:{}", ctx.instance_id(), ctx.execution_id());
-                    let mut invocation =
-                        ToolInvocation::legacy(execution_id.clone(), 0, 1, call.ordinal as usize);
-                    if contract == InvocationContract::Logical {
-                        invocation.logical_key = Some(LogicalCallKey {
-                            logical_execution_id: ctx.instance_id(),
-                            submission_id: LogicalCallKey::submission_for_prompt(0),
-                            model_turn: 1,
-                            call_index: call.ordinal as usize,
-                        });
-                        invocation.attempt = Some(AttemptMetadata {
+                    let invocation = ToolInvocation {
+                        execution_id: execution_id.clone(),
+                        prompt_index: 0,
+                        turn: 1,
+                        call_index: call.ordinal as usize,
+                        logical_key: key.clone(),
+                        attempt: AttemptMetadata {
                             backend_execution_id: execution_id,
                             activity_attempt: Some(attempt),
-                        });
-                    }
+                        },
+                    };
                     serde_json::to_string(&ToolActivityInput {
                         name: call.name.clone(),
                         arguments: args.clone(),
                         invocation,
-                        policy: (contract == InvocationContract::Logical)
-                            .then(|| entry.policy.clone()),
+                        policy: entry.policy.clone(),
+                        runtime_identity: Some(runtime_identity.into()),
                     })
                     .map_err(|error| error.to_string())
                 },
@@ -157,9 +202,9 @@ async fn execute(
             .await;
             match raw {
                 Ok(raw) => {
-                    let output: ToolActivityOutput =
+                    let output: ToolActivityResult =
                         serde_json::from_str(&raw).map_err(|error| error.to_string())?;
-                    super::activity_result(output, &call.name)
+                    super::activity_result(output.map_err(|error| error.to_string())?, &call.name)
                 }
                 Err(error) => Err(error),
             }
@@ -183,14 +228,18 @@ async fn execute(
         ToolRoute::DurableAgent {
             orchestration_name,
             version,
+            snapshot,
         } => {
             let prompt = call
                 .arguments
                 .get("prompt")
                 .and_then(serde_json::Value::as_str)
                 .ok_or("sub-agent requires a string prompt")?;
-            let input = serde_json::to_string(&AgentInput::new(prompt))
-                .map_err(|error| error.to_string())?;
+            let input = encode_execution(
+                &AgentInput::new(prompt)
+                    .with_scope(key.canonical())
+                    .with_snapshot(*snapshot.clone()),
+            )?;
             match ctx
                 .schedule_sub_orchestration_versioned(
                     orchestration_name,
@@ -206,6 +255,9 @@ async fn execute(
                 }
                 Err(error) => Err(error),
             }
+        }
+        ToolRoute::CodeMode { .. } => {
+            return Err("direct nested code-mode routes are unsupported; use a typed child".into());
         }
     };
     Ok(result.unwrap_or_else(|error| {
@@ -241,19 +293,17 @@ mod tests {
 
     #[test]
     fn replays_recorded_codemode_histories_and_new_schedule_prefixes() {
-        for (bytes, agent, contract, max_in_flight) in [
+        for (bytes, agent, max_in_flight) in [
             (
                 include_bytes!("../../tests/fixtures/replay/duroxide-codemode-children.json")
                     .as_slice(),
                 "workflow",
-                InvocationContract::Logical,
                 Limits::default().max_in_flight,
             ),
             (
                 include_bytes!("../../tests/fixtures/replay/duroxide-codemode-race.json")
                     .as_slice(),
                 "race",
-                InvocationContract::Legacy,
                 2,
             ),
         ] {
@@ -278,6 +328,7 @@ mod tests {
                     route: child.map_or(ToolRoute::RigTool, |child| ToolRoute::DurableAgent {
                         orchestration_name: RuntimeNames::for_agent(child, "1.0.0").orchestration,
                         version: "1.0.0".into(),
+                        snapshot: Box::new(DurableAgentConfig::default().snapshot()),
                     }),
                     retry: crate::RetryPolicy::new(1),
                     tag: None,
@@ -285,15 +336,17 @@ mod tests {
                     policy: if name == "interruptible" {
                         crate::ToolPolicy::read_only()
                     } else {
-                        Default::default()
+                        crate::ToolPolicy::application_managed()
                     },
                 });
             }
             let (_, _, registry) = registries(
                 RuntimeNames::for_agent(agent, "1.0.0"),
                 "1.0.0",
-                tools,
-                contract,
+                DurableAgentConfig {
+                    tools,
+                    ..Default::default()
+                },
                 Limits {
                     max_in_flight,
                     ..Default::default()

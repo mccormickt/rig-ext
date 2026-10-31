@@ -10,17 +10,17 @@ use tokio::sync::Notify;
 
 #[tokio::test]
 async fn observed_completions_precede_results_that_arrive_during_planning() {
-    let config = CodeModeConfig {
-        limits: rig_codemode::Limits {
+    let config = CodeModeConfig::native(
+        rig_codemode::Limits {
             max_in_flight: 3,
             ..Default::default()
         },
-        definitions: ToolSet::from_tools(vec![MockAddTool])
+        ToolSet::from_tools(vec![MockAddTool])
             .tool_definitions()
             .into_iter()
             .map(|definition| (*definition).clone())
             .collect(),
-    };
+    );
     let release = Notify::new();
     let report = run(
         r#"
@@ -67,17 +67,17 @@ async fn observed_completions_precede_results_that_arrive_during_planning() {
 async fn planning_failure_drains_admitted_calls_and_checkpoints_their_results() {
     use std::{pin::pin, sync::Mutex, time::Duration};
 
-    let config = CodeModeConfig {
-        limits: rig_codemode::Limits {
+    let config = CodeModeConfig::native(
+        rig_codemode::Limits {
             max_in_flight: 2,
             ..Default::default()
         },
-        definitions: ToolSet::from_tools(vec![MockAddTool])
+        ToolSet::from_tools(vec![MockAddTool])
             .tool_definitions()
             .into_iter()
             .map(|definition| (*definition).clone())
             .collect(),
-    };
+    );
     let failed = Notify::new();
     let release = Notify::new();
     let completed = Mutex::new(Vec::new());
@@ -244,14 +244,14 @@ fn scheduler_reopens_active_ready_and_failed_draining_work() {
 #[tokio::test]
 async fn host_execution_failure_drains_siblings_before_terminal_report() {
     use std::{pin::pin, sync::Mutex, time::Duration};
-    let config = CodeModeConfig {
-        limits: Default::default(),
-        definitions: ToolSet::from_tools(vec![MockAddTool])
+    let config = CodeModeConfig::native(
+        Default::default(),
+        ToolSet::from_tools(vec![MockAddTool])
             .tool_definitions()
             .into_iter()
             .map(|definition| (*definition).clone())
             .collect(),
-    };
+    );
     let release = Notify::new();
     let failed = Notify::new();
     let history = Mutex::new(Vec::new());
@@ -314,17 +314,17 @@ async fn host_execution_failure_drains_siblings_before_terminal_report() {
 async fn scheduler_replans_provisional_report_after_all_admitted_work_drains() {
     use rig_codemode::replay::ScriptStep;
     use rig_durable::codemode::{SchedulerAction, SchedulerState, StepInput};
-    let config = CodeModeConfig {
-        limits: rig_codemode::Limits {
+    let config = CodeModeConfig::native(
+        rig_codemode::Limits {
             max_in_flight: 1,
             ..Default::default()
         },
-        definitions: ToolSet::from_tools(vec![MockAddTool])
+        ToolSet::from_tools(vec![MockAddTool])
             .tool_definitions()
             .into_iter()
             .map(|definition| (*definition).clone())
             .collect(),
-    };
+    );
     let mut state = SchedulerState::new(
         "return await Promise.race([tools.add({x:1,y:0}),tools.add({x:2,y:0})]);".into(),
         config.limits,

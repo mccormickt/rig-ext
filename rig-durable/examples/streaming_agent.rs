@@ -17,10 +17,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
     ]);
     let definition = DurableAgent::builder("streaming-calculator", model)
-        .tool(MockAddTool)
+        .tool(MockAddTool, rig_durable::ToolPolicy::application_managed())
         .completion_mode(CompletionMode::Streaming)
         .build()?;
-    let orchestrator = AgentOrchestrator::sqlite("sqlite::memory:")
+    let orchestrator = AgentOrchestrator::sqlite("sqlite::memory:", "example-store")
         .await?
         .register(definition)?
         .start()

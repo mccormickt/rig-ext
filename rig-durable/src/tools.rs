@@ -36,7 +36,7 @@ fn allowed_names(executable: &BTreeSet<String>, choice: Option<&ToolChoice>) -> 
 
 /// Retry, routing, approval, and replay settings for one Rig tool.
 /// Approval pauses execution; it does not make a tool safe to retry.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ToolOptions {
     pub retry: RetryPolicy,
     pub tag: Option<String>,
@@ -45,6 +45,15 @@ pub struct ToolOptions {
 }
 
 impl ToolOptions {
+    pub fn new(policy: ToolPolicy) -> Self {
+        Self {
+            retry: RetryPolicy::default(),
+            tag: None,
+            requires_approval: false,
+            policy,
+        }
+    }
+
     pub fn retry(mut self, retry: impl Into<RetryPolicy>) -> Self {
         self.retry = retry.into();
         self
@@ -71,7 +80,7 @@ impl ToolOptions {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolRoute {
     RigTool,
@@ -91,6 +100,13 @@ pub enum ToolRoute {
     DurableAgent {
         orchestration_name: String,
         version: String,
+        snapshot: Box<crate::config::ConfigSnapshot>,
+    },
+    #[cfg(all(feature = "duroxide", feature = "codemode"))]
+    CodeMode {
+        orchestration_name: String,
+        version: String,
+        snapshot: Box<crate::config::ConfigSnapshot>,
     },
 }
 
@@ -101,8 +117,8 @@ pub struct ToolEntry {
     pub retry: RetryPolicy,
     pub tag: Option<String>,
     pub requires_approval: bool,
-    /// Replay safety, implementation version, and metadata retention. Applied
-    /// only under [`InvocationContract::Logical`](crate::InvocationContract).
+    /// Replay safety, implementation version, and metadata retention for external tools.
+    /// Framework child routes use their retained execution definitions instead.
     pub policy: ToolPolicy,
 }
 
@@ -163,7 +179,11 @@ impl ToolCatalog {
     }
 }
 
-pub async fn catalog_from_toolset(toolset: &ToolSet, retry: impl Into<RetryPolicy>) -> ToolCatalog {
+pub async fn catalog_from_toolset(
+    toolset: &ToolSet,
+    retry: impl Into<RetryPolicy>,
+    policy: ToolPolicy,
+) -> ToolCatalog {
     let retry = retry.into();
     ToolCatalog(
         toolset
@@ -179,7 +199,7 @@ pub async fn catalog_from_toolset(toolset: &ToolSet, retry: impl Into<RetryPolic
                         retry: retry.clone(),
                         tag: None,
                         requires_approval: false,
-                        policy: ToolPolicy::default(),
+                        policy: policy.clone(),
                     },
                 )
             })
@@ -191,6 +211,7 @@ pub fn activity_tool(
     definition: ToolDefinition,
     activity_name: impl Into<String>,
     retry: impl Into<RetryPolicy>,
+    policy: ToolPolicy,
 ) -> ToolEntry {
     ToolEntry {
         definition,
@@ -200,7 +221,7 @@ pub fn activity_tool(
         retry: retry.into(),
         tag: None,
         requires_approval: false,
-        policy: ToolPolicy::default(),
+        policy,
     }
 }
 
@@ -214,6 +235,7 @@ pub fn sub_orchestration_tool(
     definition: ToolDefinition,
     orchestration_name: impl Into<String>,
     version: Option<String>,
+    policy: ToolPolicy,
 ) -> ToolEntry {
     ToolEntry {
         definition,
@@ -224,7 +246,7 @@ pub fn sub_orchestration_tool(
         retry: RetryPolicy::new(1),
         tag: None,
         requires_approval: false,
-        policy: ToolPolicy::default(),
+        policy,
     }
 }
 
@@ -233,17 +255,19 @@ pub(crate) fn durable_agent_tool(
     definition: ToolDefinition,
     orchestration_name: String,
     version: String,
+    snapshot: crate::config::ConfigSnapshot,
 ) -> ToolEntry {
     ToolEntry {
         definition,
         route: ToolRoute::DurableAgent {
             orchestration_name,
             version,
+            snapshot: Box::new(snapshot),
         },
         retry: RetryPolicy::new(1),
         tag: None,
         requires_approval: false,
-        policy: ToolPolicy::default(),
+        policy: ToolPolicy::application_managed(),
     }
 }
 
@@ -263,6 +287,7 @@ mod tests {
             },
             format!("{name}Activity"),
             RetryPolicy::new(1),
+            ToolPolicy::read_only(),
         )
     }
 

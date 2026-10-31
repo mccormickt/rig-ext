@@ -90,10 +90,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         MockTurn::text("The service is available."),
     ]))
     .activity_max_attempts(3)
-    .tool(FlakyLookup {
-        attempts: Arc::clone(&attempts),
-        invocations: Arc::clone(&invocations),
-    });
+    .tool(
+        FlakyLookup {
+            attempts: Arc::clone(&attempts),
+            invocations: Arc::clone(&invocations),
+        },
+        rig_durable::ToolPolicy::application_managed(),
+    );
     let input = agent.input("Check whether the service is available.");
     let task_queue = format!("rig-temporal-retry-{}", uuid::Uuid::new_v4());
     let mut options = WorkerOptions::new(task_queue.clone()).build();

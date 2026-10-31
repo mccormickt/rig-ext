@@ -15,12 +15,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let definition = DurableAgent::builder("approved-calculator", model)
         .tool_with(
             MockAddTool,
-            ToolOptions::default()
+            ToolOptions::new(rig_durable::ToolPolicy::application_managed())
                 .retry(RetryPolicy::new(1))
                 .require_approval(),
         )
         .build()?;
-    let orchestrator = AgentOrchestrator::sqlite("sqlite::memory:")
+    let orchestrator = AgentOrchestrator::sqlite("sqlite::memory:", "example-store")
         .await?
         .register(definition)?
         .start()

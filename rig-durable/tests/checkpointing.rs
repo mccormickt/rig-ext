@@ -20,11 +20,16 @@ async fn run(checkpoint: CheckpointPolicy, instance: &str) -> (PromptResponse, V
         MockTurn::text("42"),
     ]);
     let tools = ToolSet::from_tools(vec![MockAddTool]);
-    let catalog = catalog_from_toolset(&tools, RetryPolicy::new(1)).await;
+    let catalog = catalog_from_toolset(
+        &tools,
+        RetryPolicy::new(1),
+        rig_durable::ToolPolicy::application_managed(),
+    )
+    .await;
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
     let runtime = runtime::Runtime::start_with_store(
         store.clone(),
-        activity_registry(model.clone(), tools),
+        activity_registry(model.clone(), tools, &catalog),
         orchestration_registry(DurableAgentConfig {
             tools: catalog,
             checkpoint: CheckpointConfig {
@@ -37,7 +42,11 @@ async fn run(checkpoint: CheckpointPolicy, instance: &str) -> (PromptResponse, V
     .await;
     let client = Client::new(store);
     client
-        .start_orchestration_typed(instance, ORCHESTRATION, AgentInput::new("add"))
+        .start_orchestration_typed(
+            instance,
+            ORCHESTRATION,
+            AgentInput::new("add").with_scope("raw-test-store"),
+        )
         .await
         .unwrap();
     let response = client

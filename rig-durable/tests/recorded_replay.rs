@@ -72,8 +72,12 @@ async fn duroxide_replays_each_recorded_continuation_window() {
     use std::num::NonZeroU32;
 
     let config = DurableAgentConfig {
-        tools: catalog_from_toolset(&ToolSet::from_tools(vec![MockAddTool]), RetryPolicy::new(1))
-            .await,
+        tools: catalog_from_toolset(
+            &ToolSet::from_tools(vec![MockAddTool]),
+            RetryPolicy::new(1),
+            rig_durable::ToolPolicy::application_managed(),
+        )
+        .await,
         checkpoint: CheckpointConfig {
             policy: CheckpointPolicy::Every(NonZeroU32::new(1).unwrap()),
             target_version: None,

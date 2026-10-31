@@ -43,7 +43,7 @@ where
     let mut catalog = ToolCatalog::default();
     catalog.insert(entry);
     let base = orchestration_registry(DurableAgentConfig {
-        tools: catalog,
+        tools: catalog.clone(),
         ..Default::default()
     });
     let orchestrations = OrchestrationRegistry::builder_from(&base)
@@ -52,7 +52,7 @@ where
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
     let runtime = runtime::Runtime::start_with_store(
         store.clone(),
-        activity_registry(model.clone(), ToolSet::default()),
+        activity_registry(model.clone(), ToolSet::default(), &catalog),
         orchestrations,
     )
     .await;
@@ -61,7 +61,7 @@ where
         .start_orchestration_typed(
             "parent",
             rig_durable::names::ORCHESTRATION,
-            AgentInput::new("run"),
+            AgentInput::new("run").with_scope("raw-test-store"),
         )
         .await
         .unwrap();
@@ -80,7 +80,12 @@ async fn json_output_and_correlations_reach_the_model() {
             assert_eq!(input, r#"{"value":7}"#);
             Ok(r#"{"answer":42}"#.into())
         },
-        sub_orchestration_tool(definition(), "Child", None),
+        sub_orchestration_tool(
+            definition(),
+            "Child",
+            None,
+            rig_durable::ToolPolicy::application_managed(),
+        ),
     )
     .await;
     assert_eq!(result.unwrap().output(), "done");
@@ -101,7 +106,12 @@ async fn raw_text_output_and_continue_as_new_complete() {
                 ctx.continue_as_new(format!("next:{input}")).await
             }
         },
-        sub_orchestration_tool(definition(), "Child", None),
+        sub_orchestration_tool(
+            definition(),
+            "Child",
+            None,
+            rig_durable::ToolPolicy::application_managed(),
+        ),
     )
     .await;
     assert_eq!(result.unwrap().output(), "done");
@@ -115,7 +125,12 @@ async fn raw_text_output_and_continue_as_new_complete() {
 async fn child_failure_propagates() {
     let (result, _) = run_child_tool(
         |_ctx, _input| async { Err("child exploded".into()) },
-        sub_orchestration_tool(definition(), "Child", None),
+        sub_orchestration_tool(
+            definition(),
+            "Child",
+            None,
+            rig_durable::ToolPolicy::application_managed(),
+        ),
     )
     .await;
     assert!(result.unwrap_err().contains("child exploded"));
@@ -123,7 +138,12 @@ async fn child_failure_propagates() {
 
 #[tokio::test]
 async fn unsupported_configuration_fails_before_child_is_scheduled() {
-    let mut entry = sub_orchestration_tool(definition(), "Child", None);
+    let mut entry = sub_orchestration_tool(
+        definition(),
+        "Child",
+        None,
+        rig_durable::ToolPolicy::application_managed(),
+    );
     entry.tag = Some("worker".into());
     let (result, _) = run_child_tool(
         |_ctx, _input| async { panic!("child must not be scheduled") },
@@ -132,7 +152,12 @@ async fn unsupported_configuration_fails_before_child_is_scheduled() {
     .await;
     assert!(result.unwrap_err().contains("does not support worker tags"));
 
-    let mut entry = sub_orchestration_tool(definition(), "Child", None);
+    let mut entry = sub_orchestration_tool(
+        definition(),
+        "Child",
+        None,
+        rig_durable::ToolPolicy::application_managed(),
+    );
     entry.retry = RetryPolicy::new(2)
         .with_backoff(BackoffStrategy::Fixed {
             delay: Duration::from_millis(1),
@@ -145,7 +170,12 @@ async fn unsupported_configuration_fails_before_child_is_scheduled() {
     .await;
     assert!(result.unwrap_err().contains("parent-side retries"));
 
-    let mut entry = sub_orchestration_tool(definition(), "Child", None);
+    let mut entry = sub_orchestration_tool(
+        definition(),
+        "Child",
+        None,
+        rig_durable::ToolPolicy::application_managed(),
+    );
     entry.retry = RetryPolicy::new(1)
         .with_timeout(Duration::from_secs(1))
         .into();

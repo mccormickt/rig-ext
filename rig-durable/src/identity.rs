@@ -24,6 +24,21 @@ pub struct LogicalCallKey {
 }
 
 impl LogicalCallKey {
+    /// Qualify an execution with a stable application/runtime-store scope.
+    /// Independent stores must not reuse the same scope for independent work.
+    pub fn scoped_execution(scope: &str, execution: &str) -> Result<String, String> {
+        if scope.is_empty() || execution.is_empty() {
+            return Err("execution scope and execution identity must be nonempty".into());
+        }
+        Ok(format!(
+            "{}:{};{}:{}",
+            scope.len(),
+            scope,
+            execution.len(),
+            execution
+        ))
+    }
+
     /// Build the submission identity used for a prompt index.
     pub fn submission_for_prompt(prompt_index: u64) -> String {
         format!("prompt-{prompt_index}")

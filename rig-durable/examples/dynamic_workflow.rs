@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sub_agent("review", reviewer)?
         .code_mode(Limits::default())
         .build()?;
-    let orchestrator = AgentOrchestrator::sqlite("sqlite::memory:")
+    let orchestrator = AgentOrchestrator::sqlite("sqlite::memory:", "example-store")
         .await?
         .register(coordinator)?
         .start()

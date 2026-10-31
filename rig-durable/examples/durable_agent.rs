@@ -44,9 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = OpenAI::from_env()?.completion(openai::GPT_4O_MINI);
     let definition = DurableAgent::builder("calculator", model)
         .preamble("Use the calculator tool for arithmetic.")
-        .tool(Add)
+        .tool(Add, rig_durable::ToolPolicy::application_managed())
         .build()?;
-    let orchestrator = AgentOrchestrator::sqlite("sqlite::memory:")
+    let orchestrator = AgentOrchestrator::sqlite("sqlite::memory:", "example-store")
         .await?
         .register(definition)?
         .start()

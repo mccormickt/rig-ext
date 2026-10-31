@@ -9,37 +9,23 @@ use crate::{
     result::DurableToolResult,
 };
 
-/// Selects the wire contract between an orchestration and its tool activity.
-///
-/// The contract fixes activity names and payloads for an execution. Select it
-/// before starting work; replay requires the same contract.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InvocationContract {
-    /// Minimal invocation payloads without logical identity or policy metadata.
-    /// Every tool runs with application-managed replay safety.
-    #[default]
-    Legacy,
-    /// Payloads carry the logical call key, attempt metadata, and the tool
-    /// policy, and results retain their disposition.
-    Logical,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolActivityInput {
     pub name: String,
     pub arguments: String,
     pub invocation: ToolInvocation,
-    /// Policy the activity enforces. Absent under the legacy contract.
+    /// Recorded policy. Live registration is checked only before new execution.
+    pub policy: ToolPolicy,
+    /// Native code-mode planner/projection that admitted this call, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy: Option<ToolPolicy>,
+    pub runtime_identity: Option<String>,
 }
 
 /// Stable identity for one logical tool call. Retries receive the same value.
 ///
 /// Durable Rig tools receive this value through their [`rig::tool::ToolContext`].
 /// For idempotent external writes, use the logical key, not the physical
-/// execution ID or the provider's tool-call ID. The logical contract is required.
+/// execution ID or the provider's tool-call ID.
 ///
 /// ```
 /// use rig::tool::ToolContext;
@@ -47,8 +33,7 @@ pub struct ToolActivityInput {
 ///
 /// fn idempotency_key(context: &ToolContext) -> Result<String, String> {
 ///     let invocation = context.require::<ToolInvocation>().map_err(|e| e.to_string())?;
-///     let key = invocation.logical_key.as_ref().ok_or("logical contract required")?;
-///     Ok(key.digest())
+///     Ok(invocation.logical_key.digest())
 /// }
 /// ```
 ///
@@ -63,25 +48,10 @@ pub struct ToolInvocation {
     pub turn: usize,
     pub call_index: usize,
     /// Identity fixed across retries and continuations. Idempotent tools use
-    /// it as their external idempotency key. Absent under the legacy contract.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub logical_key: Option<LogicalCallKey>,
+    /// it as their external idempotency key.
+    pub logical_key: LogicalCallKey,
     /// Physical attempt information for diagnosis.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attempt: Option<AttemptMetadata>,
-}
-
-impl ToolInvocation {
-    pub fn legacy(execution_id: String, prompt_index: u64, turn: usize, call_index: usize) -> Self {
-        Self {
-            execution_id,
-            prompt_index,
-            turn,
-            call_index,
-            logical_key: None,
-            attempt: None,
-        }
-    }
+    pub attempt: AttemptMetadata,
 }
 
 impl rig::tool::ContextValue for ToolInvocation {
@@ -93,8 +63,7 @@ pub struct ToolActivityOutput {
     pub content: Vec<ToolResultContent>,
     pub is_error: bool,
     /// Versioned result with its host-visible disposition.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<DurableToolResult>,
+    pub result: DurableToolResult,
 }
 
 impl ToolActivityOutput {
@@ -102,7 +71,7 @@ impl ToolActivityOutput {
         Self {
             content: result.model_content(tool_name),
             is_error: result.is_error_for_model(),
-            result: Some(result),
+            result,
         }
     }
 }

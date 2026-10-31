@@ -247,9 +247,7 @@ impl Tool for Observe {
     ) -> Result<rig::tool::ToolOutput> {
         let _ = &args.payload;
         let invocation = context.require::<ToolInvocation>().map_err(worker_error)?;
-        let key = invocation
-            .logical_key
-            .ok_or_else(|| worker_error("logical identity missing"))?;
+        let key = invocation.logical_key;
         write(&self.storage, "started", &true)?;
         while args.gate && !read::<bool>(&self.storage, "released")?.unwrap_or(false) {
             Delay::from(std::time::Duration::from_millis(25)).await;
@@ -291,7 +289,7 @@ fn child_builder(storage: CellStorage, drift: bool) -> Builder {
     .implementation_version(if drift { "child-v2" } else { "child-v1" })
     .tool_with(
         Observe { storage },
-        ToolOptions::default().policy(ToolPolicy::interrupt_on_uncertain()),
+        ToolOptions::new(ToolPolicy::interrupt_on_uncertain()),
     )
 }
 
@@ -681,15 +679,13 @@ impl ScriptSession {
                 Observe {
                     storage: self.storage.clone(),
                 },
-                ToolOptions::default().policy(
-                    ToolPolicy::interrupt_on_uncertain().implementation_version(
-                        if config.policy_drift {
-                            "effect-v2"
-                        } else {
-                            "effect-v1"
-                        },
-                    ),
-                ),
+                ToolOptions::new(ToolPolicy::interrupt_on_uncertain().implementation_version(
+                    if config.policy_drift {
+                        "effect-v2"
+                    } else {
+                        "effect-v1"
+                    },
+                )),
             )
             .session_history_max_bytes(config.max_history_bytes);
             let builder = if config.ordinary_child_batch.is_some() {

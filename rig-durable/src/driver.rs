@@ -31,27 +31,6 @@ pub(crate) fn apply_model_turn(agent: &mut Run, turn: CompletionOutput) -> Resul
     agent.model_response(turn.response)
 }
 
-#[cfg(any(feature = "duroxide", feature = "temporal"))]
-pub(crate) fn approval_request(
-    call: &ToolCall,
-    prompt_index: u64,
-    turn: usize,
-    call_index: usize,
-) -> Result<ApprovalRequest, String> {
-    let arguments = serde_json::Value::Object(call.function.arguments.clone());
-    let digest = arguments_digest(&arguments).map_err(|error| error.to_string())?;
-    Ok(ApprovalRequest {
-        approval_id: format!(
-            "prompt-{prompt_index}-turn-{turn}-call-{call_index}-{}-{digest}",
-            call.id
-        ),
-        tool_name: call.function.name.to_string(),
-        arguments,
-        tool_call_id: call.id.to_string(),
-        call_id: call.id.provider().map(|id| id.as_str().to_owned()),
-    })
-}
-
 /// Approval bound to the logical call, the final argument digest, and the
 /// tool implementation version. Rewritten arguments or a new implementation
 /// version produce a new request, so an old decision cannot authorize them.

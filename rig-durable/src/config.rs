@@ -5,7 +5,6 @@ use rig::{completion::ToolDefinition, message::ToolChoice};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    activity_types::InvocationContract,
     compaction::CompactionConfig,
     policy::ToolPolicy,
     tools::{ToolCatalog, ToolEntry, ToolRoute},
@@ -13,6 +12,68 @@ use crate::{
 
 pub const DEFAULT_APPROVAL_QUEUE: &str = "rig-duroxide-approvals";
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
+/// Complete native start/continuation input limit. This leaves 1 MiB below
+/// Temporal's 2 MiB payload limit for SDK envelopes. Duroxide uses the same cap.
+pub const EXECUTION_MAX_BYTES: usize = 1024 * 1024;
+/// Leaves headroom below serde_json's 128-container decoder limit.
+pub const EXECUTION_MAX_DEPTH: usize = 64;
+
+/// Encode a complete trusted execution envelope with bounded bytes and depth.
+#[cfg(any(feature = "duroxide", feature = "temporal"))]
+pub(crate) fn encode_execution(value: &impl Serialize) -> Result<String, String> {
+    struct Writer {
+        bytes: Vec<u8>,
+        depth: usize,
+        quoted: bool,
+        escaped: bool,
+    }
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > EXECUTION_MAX_BYTES.saturating_sub(self.bytes.len()) {
+                return Err(std::io::Error::other("execution input exceeds 1 MiB"));
+            }
+            for &byte in bytes {
+                if self.quoted {
+                    if self.escaped {
+                        self.escaped = false;
+                    } else if byte == b'\\' {
+                        self.escaped = true;
+                    } else if byte == b'"' {
+                        self.quoted = false;
+                    }
+                } else {
+                    match byte {
+                        b'"' => self.quoted = true,
+                        b'{' | b'[' => {
+                            self.depth += 1;
+                            if self.depth > EXECUTION_MAX_DEPTH {
+                                return Err(std::io::Error::other(
+                                    "execution input exceeds 64 JSON containers",
+                                ));
+                            }
+                        }
+                        b'}' | b']' => self.depth -= 1,
+                        _ => {}
+                    }
+                }
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = Writer {
+        bytes: Vec::new(),
+        depth: 0,
+        quoted: false,
+        escaped: false,
+    };
+    serde_json::to_writer(&mut writer, value).map_err(|error| error.to_string())?;
+    String::from_utf8(writer.bytes).map_err(|error| error.to_string())
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,7 +134,7 @@ impl Default for ApprovalConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompletionSettings {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
@@ -102,12 +163,11 @@ pub struct DurableAgentConfig {
     pub completion_retry: RetryPolicy,
     pub approval: ApprovalConfig,
     pub checkpoint: CheckpointConfig,
-    /// Wire contract between the orchestration and its tool activity.
-    /// The default uses minimal payloads with application-managed replay safety.
-    pub contract: InvocationContract,
     /// Compaction of the active context between completed prompts in a
     /// session. Single runs do not compact.
     pub compaction: Option<CompactionConfig>,
+    #[cfg(feature = "codemode")]
+    pub code_mode: Option<crate::codemode::CodeModeConfig>,
 }
 
 impl Default for DurableAgentConfig {
@@ -121,8 +181,9 @@ impl Default for DurableAgentConfig {
             completion_retry: RetryPolicy::default(),
             approval: ApprovalConfig::default(),
             checkpoint: CheckpointConfig::default(),
-            contract: InvocationContract::default(),
             compaction: None,
+            #[cfg(feature = "codemode")]
+            code_mode: None,
         }
     }
 }
@@ -153,36 +214,21 @@ impl DurableAgentConfig {
             approval: self.approval.clone(),
             checkpoint: self.checkpoint.clone(),
             compaction: self.compaction.clone(),
+            #[cfg(feature = "codemode")]
+            code_mode: self.code_mode.clone(),
         }
     }
 
-    /// Resolve a retained snapshot against this worker's registration.
+    /// Restore retained configuration without vetoing recorded results.
     ///
-    /// Every snapshot tool must be registered with the same route and
-    /// implementation version. The returned configuration takes its decisions
-    /// from the snapshot, so a worker whose live settings drifted still replays
-    /// the retained history.
+    /// The activity executor checks live tool registration only before new
+    /// execution. Raw handlers remain subject to application versioning.
     pub fn resolve(&self, snapshot: &ConfigSnapshot) -> Result<Self, SnapshotError> {
         if snapshot.format_version != SNAPSHOT_FORMAT_VERSION {
             return Err(SnapshotError::UnsupportedFormat(snapshot.format_version));
         }
         let mut tools = ToolCatalog::default();
         for tool in &snapshot.tools {
-            let name = tool.definition.name.as_str();
-            let registered = self
-                .tools
-                .get(name)
-                .ok_or_else(|| SnapshotError::ToolUnavailable(name.to_owned()))?;
-            if registered.route != tool.route {
-                return Err(SnapshotError::RouteMismatch(name.to_owned()));
-            }
-            if registered.policy.version() != tool.policy.version() {
-                return Err(SnapshotError::VersionMismatch {
-                    tool: name.to_owned(),
-                    snapshot: tool.policy.version().into(),
-                    registered: registered.policy.version().into(),
-                });
-            }
             tools.insert(ToolEntry {
                 definition: tool.definition.clone(),
                 route: tool.route.clone(),
@@ -201,8 +247,9 @@ impl DurableAgentConfig {
             completion_retry: snapshot.completion_retry.to_policy(),
             approval: snapshot.approval.clone(),
             checkpoint: snapshot.checkpoint.clone(),
-            contract: self.contract,
             compaction: snapshot.compaction.clone(),
+            #[cfg(feature = "codemode")]
+            code_mode: snapshot.code_mode.clone(),
         })
     }
 }
@@ -211,22 +258,11 @@ impl DurableAgentConfig {
 pub enum SnapshotError {
     #[error("unsupported configuration snapshot format version {0}")]
     UnsupportedFormat(u32),
-    #[error("snapshot tool `{0}` is not registered on this worker")]
-    ToolUnavailable(String),
-    #[error("snapshot tool `{0}` is registered with a different route")]
-    RouteMismatch(String),
-    #[error(
-        "snapshot tool `{tool}` has implementation version `{snapshot}`, worker has `{registered}`"
-    )]
-    VersionMismatch {
-        tool: String,
-        snapshot: String,
-        registered: String,
-    },
 }
 
 /// Versioned, serializable configuration retained with an execution.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigSnapshot {
     pub format_version: u32,
     pub preamble: Option<String>,
@@ -240,9 +276,12 @@ pub struct ConfigSnapshot {
     pub checkpoint: CheckpointConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionConfig>,
+    #[cfg(feature = "codemode")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_mode: Option<crate::codemode::CodeModeConfig>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolSnapshot {
     pub definition: ToolDefinition,
     pub route: ToolRoute,
@@ -355,14 +394,15 @@ mod tests {
 
     fn config() -> DurableAgentConfig {
         let mut tools = ToolCatalog::default();
-        tools.insert(
-            activity_tool(definition("pay"), "PayActivity", RetryPolicy::new(2))
-                .with_policy(ToolPolicy::idempotent().implementation_version("3")),
-        );
+        tools.insert(activity_tool(
+            definition("pay"),
+            "PayActivity",
+            RetryPolicy::new(2),
+            ToolPolicy::read_only().implementation_version("3"),
+        ));
         DurableAgentConfig {
             tools,
             max_turns: 3,
-            contract: InvocationContract::Logical,
             ..Default::default()
         }
     }
@@ -385,33 +425,32 @@ mod tests {
             RetrySnapshot::from(&resolved.completion_retry),
             RetrySnapshot::from(&RetryPolicy::default())
         );
+        let mut unsupported = serde_json::to_value(snapshot).unwrap();
+        let field = if cfg!(feature = "codemode") {
+            "unavailable_capability"
+        } else {
+            "code_mode"
+        };
+        unsupported[field] = serde_json::json!({});
+        assert!(serde_json::from_value::<ConfigSnapshot>(unsupported).is_err());
     }
 
     #[test]
-    fn incompatible_workers_fail_closed() {
+    fn snapshots_restore_without_live_registration_vetoes() {
         let live = config();
         let snapshot = live.snapshot();
 
         let mut renamed = live.clone();
         renamed.tools = ToolCatalog::default();
-        assert_eq!(
-            renamed.resolve(&snapshot).unwrap_err(),
-            SnapshotError::ToolUnavailable("pay".into())
-        );
+        assert_eq!(renamed.resolve(&snapshot).unwrap().snapshot(), snapshot);
 
         let mut upgraded = live.clone();
         upgraded.tools.0.get_mut("pay").unwrap().policy =
             ToolPolicy::idempotent().implementation_version("4");
-        assert!(matches!(
-            upgraded.resolve(&snapshot).unwrap_err(),
-            SnapshotError::VersionMismatch { .. }
-        ));
+        assert_eq!(upgraded.resolve(&snapshot).unwrap().snapshot(), snapshot);
 
         let mut rerouted = live;
         rerouted.tools.0.get_mut("pay").unwrap().route = ToolRoute::RigTool;
-        assert_eq!(
-            rerouted.resolve(&snapshot).unwrap_err(),
-            SnapshotError::RouteMismatch("pay".into())
-        );
+        assert_eq!(rerouted.resolve(&snapshot).unwrap().snapshot(), snapshot);
     }
 }

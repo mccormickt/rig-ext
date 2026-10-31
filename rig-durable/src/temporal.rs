@@ -64,8 +64,7 @@
 //!
 //! Activities are delivered at least once. [`ToolPolicy`] declares whether a
 //! tool may repeat an uncertain effect; retry limits alone cannot prevent
-//! duplicate writes. New inputs use [`InvocationContract::Logical`]. Logical
-//! keys include the namespace and first execution run ID, so they survive
+//! duplicate writes. Logical keys include the namespace and first execution run ID, so they survive
 //! continue-as-new without colliding with later starts that reuse a workflow ID.
 //! Keep worker implementations compatible with their recorded configuration.
 
@@ -90,8 +89,11 @@ use temporalio_sdk::{
 };
 
 use crate::{
-    activities::{self, tool::ToolExecutor},
-    activity_types::{InvocationContract, ToolActivityInput, ToolActivityOutput, ToolInvocation},
+    activities::{
+        self,
+        tool::{ToolExecutionFailure, ToolExecutor},
+    },
+    activity_types::{ToolActivityInput, ToolActivityOutput, ToolInvocation},
     approval::{ApprovalDecision, ApprovalRequest},
     compaction::{
         Compaction, CompactionConfig, CompactionOutput, CompactionRecord, CompactionRequest,
@@ -117,6 +119,7 @@ pub const SESSION_RESULT_RETENTION: usize = 16;
 /// Request configuration. It travels in the workflow input, so a running
 /// workflow keeps the configuration it started with across continue-as-new.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TemporalAgentConfig {
     pub preamble: Option<String>,
     pub tools: Vec<TemporalTool>,
@@ -128,9 +131,6 @@ pub struct TemporalAgentConfig {
     pub activity_timeout_secs: u64,
     pub activity_max_attempts: u32,
     pub session_history_max_bytes: usize,
-    /// Tool activity contract. Inputs built by [`TemporalAgent`] use
-    /// [`InvocationContract::Logical`].
-    pub contract: InvocationContract,
     /// Completed-prompt compaction for session workflows. `None` disables it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionConfig>,
@@ -152,7 +152,6 @@ impl Default for TemporalAgentConfig {
             activity_timeout_secs: DEFAULT_ACTIVITY_TIMEOUT_SECS,
             activity_max_attempts: 3,
             session_history_max_bytes: DEFAULT_SESSION_HISTORY_MAX_BYTES,
-            contract: InvocationContract::Logical,
             compaction: None,
             #[cfg(feature = "codemode")]
             code_mode: None,
@@ -179,8 +178,7 @@ impl TemporalAgentConfig {
 pub struct TemporalTool {
     pub definition: ToolDefinition,
     pub requires_approval: bool,
-    /// Replay policy the tool activity enforces under the logical contract.
-    #[serde(default)]
+    /// Recorded replay policy enforced before new tool execution.
     pub policy: ToolPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child: Option<TemporalChildAgent>,
@@ -200,10 +198,6 @@ pub enum TemporalAgentError {
     InvalidConfiguration(String),
     #[error(transparent)]
     Registration(#[from] WorkflowRegistrationError),
-    #[error(
-        "tool `{0}` declares a replay policy, but the agent uses the legacy invocation contract"
-    )]
-    InvocationContractRequired(String),
     #[error(
         "tool `{0}` never repeats an uncertain effect and requires an invocation guard store; \
          supply one with `invocation_guard`"
@@ -586,7 +580,7 @@ impl TemporalAgentSessionWorkflow {
 impl TemporalAgentSessionWorkflow {
     #[init]
     fn init(ctx: &WorkflowContextView, input: TemporalAgentSessionInput) -> Self {
-        let mut init_error = None;
+        let mut init_error = crate::config::encode_execution(&input).err();
         let context = match ContextState::new(input.history).with_compaction(input.compaction) {
             Ok(context) => context,
             Err(error) => {
@@ -663,6 +657,7 @@ impl TemporalAgentSessionWorkflow {
             }
             if ctx.continue_as_new_suggested() && ctx.all_handlers_finished() {
                 let input = ctx.state(TemporalAgentSessionWorkflow::continue_as_new_input);
+                crate::config::encode_execution(&input).map_err(workflow_error)?;
                 return match ctx.continue_as_new(input, ContinueAsNewOptions::default()) {
                     Err(error) => Err(error),
                     Ok(never) => match never {},
@@ -1106,6 +1101,20 @@ impl TemporalCodeModeActivities {
         _ctx: ActivityContext,
         input: TemporalCodeModeStepInput,
     ) -> Result<rig_codemode::replay::ScriptStep, ActivityError> {
+        crate::config::encode_execution(&input)
+            .map_err(|error| ApplicationFailure::non_retryable(std::io::Error::other(error)))?;
+        if input.config.runtime_identity
+            != crate::codemode::CodeModeConfig::runtime_identity(
+                &rig_codemode::replay::NativeReplayPlanner,
+            )
+        {
+            return Err(
+                ApplicationFailure::non_retryable(crate::InvocationConfigurationError(
+                    "code-mode runtime identity mismatch".into(),
+                ))
+                .into(),
+            );
+        }
         input.config.step(input.input).await.map_err(activity_error)
     }
 }
@@ -1123,16 +1132,6 @@ impl TemporalActivities {
             .map_err(activity_error)
     }
 
-    /// Minimal invocation payloads with application-managed replay safety.
-    #[activity(name = "RigTemporalToolExecutionG3V1")]
-    async fn execute_tool(
-        self: Arc<Self>,
-        _ctx: ActivityContext,
-        input: ToolActivityInput,
-    ) -> Result<ToolActivityOutput, ActivityError> {
-        self.tools.execute(input).await.map_err(activity_error)
-    }
-
     /// Logical contract: the input carries the logical call key and policy;
     /// the activity adds the physical attempt Temporal reports.
     #[activity(name = "RigTemporalToolExecutionG3V2")]
@@ -1141,12 +1140,16 @@ impl TemporalActivities {
         ctx: ActivityContext,
         mut input: ToolActivityInput,
     ) -> Result<ToolActivityOutput, ActivityError> {
-        let attempt = input
-            .invocation
-            .attempt
-            .get_or_insert_with(Default::default);
-        attempt.activity_attempt = Some(ctx.info().attempt);
-        self.tools.execute(input).await.map_err(activity_error)
+        input.invocation.attempt.activity_attempt = Some(ctx.info().attempt);
+        self.tools
+            .execute(input)
+            .await
+            .map_err(|error| match error {
+                ToolExecutionFailure::Configuration(error) => {
+                    ApplicationFailure::non_retryable(error).into()
+                }
+                error => activity_error(error.to_string()),
+            })
     }
 
     /// Run the registered policy and compactor over a session transcript.
@@ -1191,12 +1194,6 @@ impl TemporalAgent {
         }
     }
 
-    /// Select the tool activity contract for inputs this agent builds.
-    pub fn invocation_contract(mut self, contract: InvocationContract) -> Self {
-        self.config.contract = contract;
-        self
-    }
-
     /// Store that tools with [`crate::ReplaySafety::InterruptOnUncertain`]
     /// claim before they run. Share one store across the workers that may
     /// pick up the same activity.
@@ -1218,10 +1215,7 @@ impl TemporalAgent {
     /// Advertise one JavaScript tool while retaining nested execution policies.
     #[cfg(feature = "codemode")]
     pub fn code_mode(mut self, limits: rig_codemode::Limits) -> Self {
-        self.config.code_mode = Some(crate::codemode::CodeModeConfig {
-            limits,
-            definitions: Vec::new(),
-        });
+        self.config.code_mode = Some(crate::codemode::CodeModeConfig::native(limits, Vec::new()));
         self
     }
 
@@ -1264,7 +1258,7 @@ impl TemporalAgent {
                 parameters: serde_json::json!({"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"],"additionalProperties":false}),
             },
             requires_approval: false,
-            policy: ToolPolicy::default(),
+            policy: ToolPolicy::application_managed(),
             child: Some(TemporalChildAgent { task_queue, config: Box::new(child.snapshot_config()) }),
         });
         Ok(self)
@@ -1325,24 +1319,24 @@ impl TemporalAgent {
         self
     }
 
-    pub fn tool<T>(self, tool: T) -> Self
+    pub fn tool<T>(self, tool: T, policy: ToolPolicy) -> Self
     where
         T: Tool + 'static,
     {
-        self.tool_with_options(tool, false, ToolPolicy::default())
+        self.tool_with_options(tool, false, policy)
     }
 
     /// Pause for an approval decision before executing this Rig tool.
     /// Read the request from the workflow status query and send its exact ID
     /// through the approval signal. Approval does not change replay safety.
-    pub fn approval_tool<T>(self, tool: T) -> Self
+    pub fn approval_tool<T>(self, tool: T, policy: ToolPolicy) -> Self
     where
         T: Tool + 'static,
     {
-        self.tool_with_options(tool, true, ToolPolicy::default())
+        self.tool_with_options(tool, true, policy)
     }
 
-    /// Register a tool with a replay policy. Requires the logical contract.
+    /// Register a tool with an explicit replay policy, like [`Self::tool`].
     pub fn tool_with_policy<T>(self, tool: T, policy: ToolPolicy) -> Self
     where
         T: Tool + 'static,
@@ -1447,13 +1441,6 @@ impl TemporalAgent {
         }
         for tool in &self.config.tools {
             let name = tool.definition.name.as_str();
-            if self.config.contract == InvocationContract::Legacy
-                && tool.policy != ToolPolicy::default()
-            {
-                return Err(TemporalAgentError::InvocationContractRequired(
-                    name.to_owned(),
-                ));
-            }
             if tool.policy.safety().requires_guard() && self.guard.is_none() {
                 return Err(TemporalAgentError::GuardStoreRequired(name.to_owned()));
             }
@@ -1520,6 +1507,7 @@ async fn run_agent<W>(
 where
     W: TemporalWorkflowState,
 {
+    crate::config::encode_execution(&input).map_err(workflow_error)?;
     ctx.state_mut(|workflow| workflow.runtime_mut().outcomes.clear());
     let config = input.config;
     let mut agent = Run::new(input.prompt)
@@ -1583,7 +1571,6 @@ where
                             (pending, denied) = await_approval(
                                 ctx,
                                 pending,
-                                config.contract,
                                 &version,
                                 prompt_index,
                                 model_turn,
@@ -1694,7 +1681,6 @@ fn logical_key<W>(
 async fn await_approval<W>(
     ctx: &mut WorkflowContext<W>,
     mut pending: crate::persistent::PendingToolCall,
-    contract: InvocationContract,
     implementation_version: &str,
     prompt_index: u64,
     turn: usize,
@@ -1704,16 +1690,11 @@ where
     W: TemporalWorkflowState,
 {
     let call = &pending.tool_call;
-    let request = match contract {
-        InvocationContract::Legacy => {
-            driver::approval_request(call, prompt_index, turn, call_index)
-        }
-        InvocationContract::Logical => driver::logical_approval_request(
-            call,
-            &logical_key(ctx, prompt_index, turn, call_index),
-            implementation_version,
-        ),
-    }
+    let request = driver::logical_approval_request(
+        call,
+        &logical_key(ctx, prompt_index, turn, call_index),
+        implementation_version,
+    )
     .map_err(workflow_error)?;
     ctx.state_mut(|workflow| {
         let runtime = workflow.runtime_mut();
@@ -1831,14 +1812,17 @@ async fn route_tool<W>(
                     .unwrap_or_else(|| "direct".into()),
                 call_index
             );
+            let input = TemporalAgentInput {
+                prompt: prompt.into(),
+                history: Vec::new(),
+                config: *child.config.clone(),
+            };
+            crate::config::encode_execution(&input)
+                .map_err(|_| "child execution input exceeds its bounds")?;
             let started = ctx
                 .start_child_workflow(
                     TemporalAgentWorkflow::run,
-                    TemporalAgentInput {
-                        prompt: prompt.into(),
-                        history: Vec::new(),
-                        config: *child.config.clone(),
-                    },
+                    input,
                     ChildWorkflowOptions::builder()
                         .task_queue(child.task_queue.clone())
                         .workflow_id(id)
@@ -1861,54 +1845,41 @@ async fn route_tool<W>(
         key.logical_execution_id.push_str(&suffix);
         execution_id.push_str(&suffix);
     }
-    let output = match config.contract {
-        InvocationContract::Legacy => {
-            ctx.execute_activity(
-                TemporalActivities::execute_tool,
-                ToolActivityInput {
-                    name,
-                    arguments,
-                    invocation: ToolInvocation::legacy(
-                        execution_id,
-                        prompt_index,
-                        turn,
-                        call_index,
-                    ),
-                    policy: None,
-                },
-                activity_options(config),
-            )
-            .await?
-        }
-        InvocationContract::Logical => {
-            let policy = config
-                .tools
-                .iter()
-                .find(|tool| tool.definition.name == name)
-                .map(|tool| tool.policy.clone())
-                .ok_or_else(|| workflow_error(format!("tool `{name}` is not registered")))?;
-            ctx.execute_activity(
-                TemporalActivities::execute_logical_tool,
-                ToolActivityInput {
-                    name,
-                    arguments,
-                    invocation: ToolInvocation {
-                        execution_id: execution_id.clone(),
-                        prompt_index,
-                        turn,
-                        call_index,
-                        logical_key: Some(key),
-                        attempt: Some(AttemptMetadata {
-                            backend_execution_id: execution_id,
-                            activity_attempt: None,
-                        }),
+    let output = {
+        let policy = config
+            .tools
+            .iter()
+            .find(|tool| tool.definition.name == name)
+            .map(|tool| tool.policy.clone())
+            .ok_or_else(|| workflow_error(format!("tool `{name}` is not registered")))?;
+        ctx.execute_activity(
+            TemporalActivities::execute_logical_tool,
+            ToolActivityInput {
+                name,
+                arguments,
+                invocation: ToolInvocation {
+                    execution_id: execution_id.clone(),
+                    prompt_index,
+                    turn,
+                    call_index,
+                    logical_key: key,
+                    attempt: AttemptMetadata {
+                        backend_execution_id: execution_id,
+                        activity_attempt: None,
                     },
-                    policy: Some(policy),
                 },
-                activity_options(config),
-            )
-            .await?
-        }
+                policy,
+                #[cfg(feature = "codemode")]
+                runtime_identity: config
+                    .code_mode
+                    .as_ref()
+                    .map(|code| code.runtime_identity.clone()),
+                #[cfg(not(feature = "codemode"))]
+                runtime_identity: None,
+            },
+            activity_options(config),
+        )
+        .await?
     };
     Ok(output)
 }
@@ -1936,6 +1907,8 @@ async fn run_code_mode<W>(
     code: String,
     parent: CallPosition,
 ) -> WorkflowResult<rig::tool::ToolOutput> {
+    let failure = std::cell::RefCell::new(None);
+    let failure_ref = &failure;
     let report = crate::codemode::run(
         code,
         code_mode.limits,
@@ -1966,11 +1939,9 @@ async fn run_code_mode<W>(
             .await
             {
                 Ok(output) => output,
-                Err(_) => {
-                    return Ok(rig::tool::ToolResult::failed(
-                        rig::tool::ToolExecutionError::other("The nested durable tool failed.")
-                            .with_retryable(false),
-                    ));
+                Err(error) => {
+                    failure_ref.borrow_mut().get_or_insert(error);
+                    return Err("nested durable execution failed".into());
                 }
             };
             crate::codemode::activity_result(output, &call.name)
@@ -1979,6 +1950,9 @@ async fn run_code_mode<W>(
     .await;
     if ctx.cancellation_token().is_cancelled() {
         return Err(temporalio_sdk::WorkflowTermination::cancelled());
+    }
+    if let Some(error) = failure.into_inner() {
+        return Err(error);
     }
     let report = report.map_err(workflow_error)?;
     serde_json::to_value(report)

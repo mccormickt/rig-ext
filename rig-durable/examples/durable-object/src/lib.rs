@@ -87,9 +87,7 @@ impl Tool for Add {
         args: AddArgs,
     ) -> std::result::Result<i128, Self::Error> {
         let invocation = context.require::<ToolInvocation>().map_err(worker_error)?;
-        let key = invocation
-            .logical_key
-            .ok_or_else(|| Error::RustError("logical tool identity is required".into()))?;
+        let key = invocation.logical_key;
         let result = i128::from(args.left) + i128::from(args.right);
         #[cfg(target_family = "wasm")]
         self.storage.sql().exec(
@@ -121,9 +119,7 @@ impl AgentSession {
                         #[cfg(target_family = "wasm")]
                         storage: self.storage.clone(),
                     },
-                    ToolOptions::default()
-                        .policy(ToolPolicy::read_only())
-                        .require_approval(),
+                    ToolOptions::new(ToolPolicy::read_only()).require_approval(),
                 )
                 .build(
                     self.storage.clone(),

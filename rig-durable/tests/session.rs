@@ -17,9 +17,9 @@ use rig::{
     tool::{Tool, ToolContext, ToolExecutionError},
 };
 use rig_durable::{
-    AgentOrchestrator, AgentOrchestratorError, Compaction, DurableAgent, InvocationContract,
-    ModelCompactor, ModelSummary, OutcomeSource, SubmissionError, SubmissionMode, SubmissionState,
-    SubmitInput, ToolDisposition, ToolOptions, ToolPolicy,
+    AgentOrchestrator, AgentOrchestratorError, Compaction, DurableAgent, ModelCompactor,
+    ModelSummary, OutcomeSource, SubmissionError, SubmissionMode, SubmissionState, SubmitInput,
+    ToolDisposition, ToolOptions, ToolPolicy,
 };
 use rig_memory::recent::LastMessages;
 use serde::Deserialize;
@@ -74,7 +74,7 @@ async fn oversized_answers_preserve_single_run_results_and_do_not_close_sessions
 
 async fn orchestrator(definition: rig_durable::AgentDefinition) -> AgentOrchestrator {
     let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap());
-    AgentOrchestrator::builder(store)
+    AgentOrchestrator::builder(store, "test-store")
         .register(definition)
         .unwrap()
         .start()
@@ -240,7 +240,8 @@ async fn follow_up_during_a_tool_round_runs_after_the_answer_and_reject_if_busy_
                     release: release.clone(),
                     calls: calls.clone(),
                 },
-                ToolOptions::default().retry(RetryPolicy::new(1)),
+                ToolOptions::new(rig_durable::ToolPolicy::application_managed())
+                    .retry(RetryPolicy::new(1)),
             )
             .build()
             .unwrap(),
@@ -365,7 +366,7 @@ async fn compaction_keeps_the_request_canonical_and_the_transcript_complete() {
     ]);
     let orchestrator = orchestrator(
         DurableAgent::builder("compacting", model.clone())
-            .tool(MockAddTool)
+            .tool(MockAddTool, rig_durable::ToolPolicy::application_managed())
             .compaction(compaction(&model, 2).version("test-1"))
             .build()
             .unwrap(),
@@ -620,11 +621,10 @@ fn disposition_model() -> MockCompletionModel {
 
 fn disposition_agent(model: MockCompletionModel) -> rig_durable::AgentDefinition {
     DurableAgent::builder("dispositions", model)
-        .invocation_contract(InvocationContract::Logical)
         .max_turns(4)
         .tool_with(
             Disposition,
-            ToolOptions::default()
+            ToolOptions::new(rig_durable::ToolPolicy::application_managed())
                 .retry(RetryPolicy::new(1))
                 .policy(ToolPolicy::read_only()),
         )

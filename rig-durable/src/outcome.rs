@@ -17,8 +17,6 @@ pub const OUTCOME_FORMAT_VERSION: u32 = 1;
 pub enum OutcomeSource {
     /// A tool activity under the logical contract retained the disposition.
     Retained,
-    /// Derived from the activity's error flag under the legacy contract.
-    Derived,
     /// A routed activity, sub-orchestration, or sub-agent returned a value.
     Routed,
     /// A human denied the call; the tool did not run.
@@ -68,32 +66,16 @@ impl ToolOutcome {
         }
     }
 
-    /// Outcome of a Rig tool activity. Logical-contract outputs carry their
-    /// retained disposition; legacy outputs only report whether the model
-    /// should treat the content as an error.
+    /// Outcome of a Rig tool activity with its retained disposition.
     pub fn from_activity(
         position: CallPosition,
         call: &rig::message::ToolCall,
         output: &ToolActivityOutput,
     ) -> Self {
-        match &output.result {
-            Some(result) => {
-                let mut outcome =
-                    Self::new(position, call, result.disposition, OutcomeSource::Retained);
-                outcome.interruption = result.interruption.clone();
-                outcome
-            }
-            None => Self::new(
-                position,
-                call,
-                if output.is_error {
-                    ToolDisposition::Error
-                } else {
-                    ToolDisposition::Success
-                },
-                OutcomeSource::Derived,
-            ),
-        }
+        let result = &output.result;
+        let mut outcome = Self::new(position, call, result.disposition, OutcomeSource::Retained);
+        outcome.interruption = result.interruption.clone();
+        outcome
     }
 
     pub fn routed(position: CallPosition, call: &rig::message::ToolCall) -> Self {
@@ -232,15 +214,6 @@ mod tests {
         assert_eq!(outcome.source, OutcomeSource::Retained);
         assert_eq!(outcome.prompt_index, 2);
         assert_eq!(outcome.tool_call_id, "call-1");
-
-        let legacy = ToolActivityOutput {
-            content: Vec::new(),
-            is_error: true,
-            result: None,
-        };
-        let outcome = ToolOutcome::from_activity(POSITION, &call(), &legacy);
-        assert_eq!(outcome.disposition, ToolDisposition::Error);
-        assert_eq!(outcome.source, OutcomeSource::Derived);
     }
 
     #[test]

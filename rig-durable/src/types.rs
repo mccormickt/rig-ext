@@ -9,6 +9,8 @@ const CONTINUATION_FORMAT_VERSION: u32 = 3;
 /// Persisted orchestration input.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentInput {
+    /// Stable application/runtime-store scope. Raw starts must supply it.
+    pub execution_scope: String,
     pub prompt: Message,
     #[serde(default)]
     pub history: Vec<Message>,
@@ -77,6 +79,7 @@ pub(crate) struct ResumedRun {
 impl AgentInput {
     pub fn new(prompt: impl Into<Message>) -> Self {
         Self {
+            execution_scope: String::new(),
             prompt: prompt.into(),
             history: Vec::new(),
             snapshot: None,
@@ -86,6 +89,11 @@ impl AgentInput {
 
     pub fn with_snapshot(mut self, snapshot: ConfigSnapshot) -> Self {
         self.snapshot = Some(snapshot);
+        self
+    }
+
+    pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        self.execution_scope = scope.into();
         self
     }
 
@@ -129,6 +137,7 @@ impl AgentInput {
         tool_outcomes: Vec<ToolOutcome>,
     ) -> Self {
         Self {
+            execution_scope: String::new(),
             // Start-only fields are retained for a stable, human-readable wire shape.
             prompt: Message::user(""),
             history: Vec::new(),

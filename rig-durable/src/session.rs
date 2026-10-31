@@ -15,7 +15,6 @@ use duroxide::{Either2, OrchestrationContext};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    activity_types::InvocationContract,
     compaction::ContextState,
     config::{CheckpointPolicy, ConfigSnapshot, DurableAgentConfig},
     names::RuntimeNames,
@@ -48,6 +47,7 @@ pub fn session_result_key(submission_id: &str) -> String {
 /// Orchestration input of a session. It is also the continuation payload.
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionInput {
+    pub execution_scope: String,
     pub format_version: u32,
     pub context: ContextState,
     pub ledger: SubmissionLedger,
@@ -84,6 +84,7 @@ impl<'de> Deserialize<'de> for SessionInput {
         }
         #[derive(Deserialize)]
         struct Wire {
+            execution_scope: String,
             format_version: u32,
             context: ContextState,
             ledger: SubmissionLedger,
@@ -102,6 +103,7 @@ impl<'de> Deserialize<'de> for SessionInput {
         }
         let wire: Wire = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
         Ok(Self {
+            execution_scope: wire.execution_scope,
             format_version: wire.format_version,
             context: wire.context,
             ledger: wire.ledger,
@@ -118,6 +120,7 @@ impl<'de> Deserialize<'de> for SessionInput {
 impl SessionInput {
     pub fn new(logical_session_id: impl Into<String>, ledger_max_bytes: usize) -> Self {
         Self {
+            execution_scope: String::new(),
             format_version: SESSION_FORMAT_VERSION,
             context: ContextState::default(),
             ledger: SubmissionLedger::new(logical_session_id, ledger_max_bytes),
@@ -137,6 +140,11 @@ impl SessionInput {
 
     pub fn with_snapshot(mut self, snapshot: Option<ConfigSnapshot>) -> Self {
         self.snapshot = snapshot;
+        self
+    }
+
+    pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        self.execution_scope = scope.into();
         self
     }
 }
@@ -309,6 +317,10 @@ pub(crate) async fn run_session(
     config: DurableAgentConfig,
     names: RuntimeNames,
 ) -> Result<SessionResult, String> {
+    crate::config::encode_execution(&input)?;
+    let execution_scope = input.execution_scope.clone();
+    let logical_execution_id =
+        crate::LogicalCallKey::scoped_execution(&execution_scope, &ctx.instance_id())?;
     if input.format_version != SESSION_FORMAT_VERSION {
         return Err(format!(
             "unsupported session format version {}",
@@ -327,11 +339,7 @@ pub(crate) async fn run_session(
             .map_err(|error| error.to_string())?,
         None => config,
     };
-    let snapshot = match (input.snapshot.clone(), config.contract) {
-        (Some(snapshot), _) => Some(snapshot),
-        (None, InvocationContract::Logical) => Some(config.snapshot()),
-        (None, InvocationContract::Legacy) => None,
-    };
+    let snapshot = Some(input.snapshot.clone().unwrap_or_else(|| config.snapshot()));
     let context = ContextState::new(input.context.transcript)
         .with_compaction(input.context.compaction)
         .map_err(|error| format!("session context is not canonical: {error}"))?;
@@ -358,6 +366,7 @@ pub(crate) async fn run_session(
         ctx: &ctx,
         config: &config,
         names: &names,
+        logical_execution_id: &logical_execution_id,
     };
     let mut operations: u32 = 0;
 
@@ -378,7 +387,7 @@ pub(crate) async fn run_session(
         if let CheckpointPolicy::Every(threshold) = config.checkpoint.policy
             && operations >= threshold.get()
         {
-            return checkpoint(&ctx, state, generation, &config, snapshot).await;
+            return checkpoint(&ctx, state, generation, &config, snapshot, execution_scope).await;
         }
     }
 
@@ -497,12 +506,14 @@ async fn checkpoint(
     generation: u32,
     config: &DurableAgentConfig,
     snapshot: Option<ConfigSnapshot>,
+    execution_scope: String,
 ) -> Result<SessionResult, String> {
     let generation = generation
         .checked_add(1)
         .ok_or("checkpoint generation overflow")?;
     ctx.set_custom_status(state.status("checkpoint").to_string());
     let input = SessionInput {
+        execution_scope,
         format_version: SESSION_FORMAT_VERSION,
         context: state.context,
         ledger: state.ledger,
@@ -513,7 +524,7 @@ async fn checkpoint(
         closed: state.closed,
         snapshot,
     };
-    let payload = serde_json::to_string(&input).map_err(|error| error.to_string())?;
+    let payload = crate::config::encode_execution(&input)?;
     let raw = match &config.checkpoint.target_version {
         Some(version) => ctx.continue_as_new_versioned(version, payload).await?,
         None => ctx.continue_as_new(payload).await?,

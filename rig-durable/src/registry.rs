@@ -4,7 +4,10 @@ use duroxide::runtime::registry::{ActivityRegistry, OrchestrationRegistry};
 use rig::{DynModel, operation::Completion, tool::ToolSet};
 
 use crate::{
-    activities::{self, tool::ToolExecutor},
+    activities::{
+        self,
+        tool::{ToolExecutionFailure, ToolExecutor},
+    },
     activity_types::{ToolActivityInput, ToolActivityOutput},
     compaction::Compaction,
     config::DurableAgentConfig,
@@ -15,13 +18,18 @@ use crate::{
     types::AgentInput,
 };
 
+/// Register activities with explicit catalog policies. The tool activity emits
+/// [`crate::ToolActivityResult`], recording configuration failures as data so
+/// they do not enter the activity retry path. Guarded tools need
+/// [`activity_registry_with_guard`].
 pub fn activity_registry(
     model: impl Into<DynModel<Completion>>,
     tools: ToolSet,
+    catalog: &ToolCatalog,
 ) -> ActivityRegistry {
     activity_registry_with_names(
         model.into(),
-        ToolExecutor::new(Arc::new(tools)),
+        ToolExecutor::new(Arc::new(tools)).with_registered_policies(catalog.policies()),
         &RuntimeNames::legacy(),
         None,
     )
@@ -51,11 +59,9 @@ pub(crate) fn activity_registry_with_names(
     let model = Arc::new(model);
     let completion_model = Arc::clone(&model);
     let executor = Arc::new(executor);
-    let logical_executor = Arc::clone(&executor);
     let completion_activity = names.completion_activity.clone();
     let streaming_completion_activity = names.streaming_completion_activity.clone();
     let tool_activity = names.tool_activity.clone();
-    let logical_tool_activity = names.logical_tool_activity.clone();
     let compaction_activity = names.compaction_activity.clone();
     ActivityRegistry::builder()
         .register_typed(completion_activity, move |_ctx, request| {
@@ -68,15 +74,8 @@ pub(crate) fn activity_registry_with_names(
         })
         .register_typed(tool_activity, move |_ctx, input: ToolActivityInput| {
             let executor = Arc::clone(&executor);
-            async move { executor.execute(input).await }
+            async move { ToolExecutionFailure::activity_result(executor.execute(input).await) }
         })
-        .register_typed(
-            logical_tool_activity,
-            move |_ctx, input: ToolActivityInput| {
-                let executor = Arc::clone(&logical_executor);
-                async move { executor.execute(input).await }
-            },
-        )
         .register_typed(compaction_activity, move |_ctx, request| {
             let compaction = compaction.clone();
             async move { activities::compaction::compact(compaction.as_ref(), request).await }

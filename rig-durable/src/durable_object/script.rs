@@ -84,6 +84,7 @@ impl Builder {
         let code = CodeModeConfig {
             limits: registration.limits,
             definitions: config.tools.definitions(),
+            runtime_identity: CodeModeConfig::runtime_identity(registration.planner.as_ref()),
         };
         code.validate().map_err(Error::Invalid)?;
         let definition = ScriptDefinition {
@@ -136,10 +137,7 @@ fn effect_key(parent: &LogicalCallKey, ordinal: u32) -> String {
 }
 
 fn script_result(output: &ToolActivityOutput, name: &str) -> Result<ToolResult, Error> {
-    let durable = output
-        .result
-        .as_ref()
-        .ok_or_else(|| Error::Invalid("script effect result is missing".into()))?;
+    let durable = &output.result;
     Ok(durable.result.clone().unwrap_or_else(|| {
         ToolResult::failed(
             ToolExecutionError::other(crate::result::interrupted_feedback(name))
@@ -161,13 +159,26 @@ fn drain_capacity_error(error: Error) -> Error {
 }
 
 impl<D: SqlDatabase, W: Wake> Engine<D, W> {
-    pub(super) fn check_script_registration(&self, call: &Call) -> Result<(), Error> {
-        let Some(parent) = &call.input.invocation.logical_key else {
-            return Ok(());
-        };
+    pub(super) fn check_script_registration(
+        &self,
+        call: &Call,
+    ) -> Result<Option<ToolActivityOutput>, Error> {
+        let parent = &call.input.invocation.logical_key;
         let Some(record) = storage::read::<ScriptRecord>(&self.db, &script_key(parent))? else {
-            return Ok(());
+            return Ok(None);
         };
+        let input: ScriptInput = serde_json::from_str(&call.input.arguments)?;
+        if &record.parent != parent
+            || call.input.name != "codemode"
+            || input.code != record.scheduler.input().code
+            || call.input.policy
+                != ToolPolicy::idempotent().implementation_version(record.definition.digest()?)
+        {
+            return Err(Error::Invalid("script intent identity mismatch".into()));
+        }
+        if let SchedulerAction::Complete(result) = record.scheduler.action() {
+            return self.script_output(call, result.clone()).map(Some);
+        }
         let runtime = self
             .script
             .as_ref()
@@ -180,7 +191,29 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
         // Preflight every retained script before any batch member starts.
         self.check_script_capacity(&record)
             .map_err(drain_capacity_error)?;
-        Ok(())
+        Ok(None)
+    }
+
+    fn script_output(
+        &self,
+        outer: &Call,
+        result: Result<rig_codemode::ExecutionReport, String>,
+    ) -> Result<ToolActivityOutput, Error> {
+        let result = match result {
+            Ok(report) => ToolResult::success(ToolOutput::json(serde_json::to_value(report)?)),
+            Err(error) => {
+                ToolResult::failed(ToolExecutionError::other(error).with_retryable(false))
+            }
+        };
+        let (result, _) = DurableToolResult::from_rig(
+            result,
+            &ToolResultContext::default(),
+            &crate::policy::MetadataRetention::none(),
+        );
+        bounded_call_output(
+            outer,
+            ToolActivityOutput::from_result(&outer.input.name, result),
+        )
     }
 
     /// Committed scheduler state for one outer model tool call. A planner
@@ -300,9 +333,7 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
     }
 
     pub(super) fn script_deadline(&self, call: &Call) -> Result<Option<u64>, Error> {
-        let Some(parent) = &call.input.invocation.logical_key else {
-            return Ok(None);
-        };
+        let parent = &call.input.invocation.logical_key;
         let Some(record) = storage::read::<ScriptRecord>(&self.db, &script_key(parent))? else {
             return Ok(None);
         };
@@ -340,13 +371,14 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                 prompt_index: 0,
                 turn: record.parent.model_turn,
                 call_index: call.ordinal as usize,
-                logical_key: Some(key),
-                attempt: Some(AttemptMetadata {
+                logical_key: key,
+                attempt: AttemptMetadata {
                     backend_execution_id: record.parent.logical_execution_id.clone(),
                     activity_attempt: Some(1),
-                }),
+                },
             },
-            policy: Some(entry.policy.clone()),
+            policy: entry.policy.clone(),
+            runtime_identity: None,
         };
         let child = self.children.get(&call.name).map(|child| {
             ChildInvocation::new(
@@ -375,12 +407,7 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
             .script
             .as_ref()
             .ok_or_else(|| Error::Incompatible("script planner is not registered".into()))?;
-        let parent = outer
-            .input
-            .invocation
-            .logical_key
-            .clone()
-            .ok_or_else(|| Error::Invalid("script parent identity is missing".into()))?;
+        let parent = outer.input.invocation.logical_key.clone();
         let key = script_key(&parent);
         let input: ScriptInput = match serde_json::from_str(&outer.input.arguments) {
             Ok(input) => input,
@@ -478,21 +505,7 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                     self.db.transaction(|| self.save_script(&key, &record))?;
                 }
                 SchedulerAction::Complete(result) => {
-                    let result = match result {
-                        Ok(report) => {
-                            ToolResult::success(ToolOutput::json(serde_json::to_value(report)?))
-                        }
-                        Err(error) => ToolResult::failed(
-                            ToolExecutionError::other(error).with_retryable(false),
-                        ),
-                    };
-                    let (result, _) = DurableToolResult::from_rig(
-                        result,
-                        &ToolResultContext::default(),
-                        &crate::policy::MetadataRetention::none(),
-                    );
-                    let output = ToolActivityOutput::from_result(&outer.input.name, result);
-                    return Ok(Some(bounded_call_output(outer, output)?));
+                    return self.script_output(outer, result).map(Some);
                 }
                 SchedulerAction::Execute => {
                     while let Some(call) = record.scheduler.admit_next() {
@@ -539,9 +552,7 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                         }
                         effect.started = true;
                         effect.deadline_ms = None;
-                        if let Some(attempt) = &mut effect.input.invocation.attempt {
-                            attempt.activity_attempt = Some(effect.attempt);
-                        }
+                        effect.input.invocation.attempt.activity_attempt = Some(effect.attempt);
                         self.db
                             .transaction(|| self.save_script_effect(&parent, &effect))?;
                         let ordinal = call.ordinal;
@@ -554,6 +565,7 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                                     self.executor
                                         .execute_committed(effect.input.clone())
                                         .await
+                                        .map_err(|error| error.to_string())
                                         .map(Some)
                                 };
                                 (effect, result)
@@ -678,11 +690,7 @@ impl<D: SqlDatabase, W: Wake> Engine<D, W> {
                     if !matches!(error, Error::Limit { .. } | Error::Depth { .. }) {
                         return Err(error);
                     }
-                    let interruption = output
-                        .result
-                        .as_ref()
-                        .and_then(|result| result.interruption.as_ref())
-                        .map(|i| i.reason);
+                    let interruption = output.result.interruption.as_ref().map(|i| i.reason);
                     let output = storage_failure_output(&effect.call.name, interruption);
                     record.scheduler = before;
                     record
