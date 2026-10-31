@@ -242,6 +242,75 @@ fn scheduler_reopens_active_ready_and_failed_draining_work() {
 }
 
 #[tokio::test]
+async fn host_execution_failure_drains_siblings_before_terminal_report() {
+    use std::{pin::pin, sync::Mutex, time::Duration};
+    let config = CodeModeConfig {
+        limits: Default::default(),
+        definitions: ToolSet::from_tools(vec![MockAddTool])
+            .tool_definitions()
+            .into_iter()
+            .map(|definition| (*definition).clone())
+            .collect(),
+    };
+    let release = Notify::new();
+    let failed = Notify::new();
+    let history = Mutex::new(Vec::new());
+    let mut execution = pin!(run(
+        "await Promise.all([tools.add({x:1,y:0}), tools.add({x:2,y:0})]);".into(),
+        config.limits,
+        |input| {
+            *history.lock().unwrap() = input.history.clone();
+            config.step(input)
+        },
+        |call| {
+            let release = &release;
+            let failed = &failed;
+            async move {
+                if call.ordinal == 0 {
+                    release.notified().await;
+                    Ok(ToolResult::success(ToolOutput::text("settled sibling")))
+                } else {
+                    failed.notify_one();
+                    Err("incompatible tool implementation".into())
+                }
+            }
+        },
+    ));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::select! {
+            result = &mut execution => panic!("abandoned admitted sibling: {result:?}"),
+            () = failed.notified() => {}
+        }
+        assert!(futures::poll!(execution.as_mut()).is_pending());
+        release.notify_one();
+        assert_eq!(
+            execution.await.unwrap_err(),
+            "incompatible tool implementation"
+        );
+    })
+    .await
+    .unwrap();
+    let history = history.lock().unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(
+        history
+            .iter()
+            .find(|item| item.call.ordinal == 0)
+            .unwrap()
+            .result
+            .is_success()
+    );
+    assert!(
+        !history
+            .iter()
+            .find(|item| item.call.ordinal == 1)
+            .unwrap()
+            .result
+            .is_success()
+    );
+}
+
+#[tokio::test]
 async fn scheduler_replans_provisional_report_after_all_admitted_work_drains() {
     use rig_codemode::replay::ScriptStep;
     use rig_durable::codemode::{SchedulerAction, SchedulerState, StepInput};

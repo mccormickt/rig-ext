@@ -307,6 +307,8 @@ impl SchedulerState {
 /// On a planning failure, drain admitted calls and checkpoint the final history
 /// through `plan` before returning the original error. Ignore that checkpoint's
 /// output: it cannot admit further calls.
+/// An execution `Err` is a host failure and uses the same drain path. Ordinary
+/// tool failures must return `Ok(ToolResult::failed(...))`.
 pub async fn run<P, PF, E, EF>(
     code: String,
     limits: Limits,
@@ -321,10 +323,15 @@ where
 {
     let mut state = SchedulerState::new(code, limits)?;
     let mut active = Vec::new();
+    let mut failure: Option<String> = None;
     loop {
         match state.action().clone() {
             SchedulerAction::Plan => {
-                state.apply_plan(plan(state.input().clone()).await);
+                let result = plan(state.input().clone()).await;
+                state.apply_plan(match &failure {
+                    Some(error) => Err(error.clone()),
+                    None => result,
+                });
                 continue;
             }
             SchedulerAction::Complete(result) => return result,
@@ -359,6 +366,9 @@ where
             })
             .await;
             for (ordinal, result) in completions {
+                if let Err(error) = &result {
+                    failure.get_or_insert_with(|| error.clone());
+                }
                 state.complete(ordinal, result)?;
             }
         }
