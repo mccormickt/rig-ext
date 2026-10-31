@@ -55,6 +55,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 rig-codemode = { path = "../rig-codemode", features = ["quickjs"], optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 duroxide = { workspace = true, features = ["sqlite"] }
@@ -71,6 +72,7 @@ codemode-worker-replay = ["codemode", "durable-object", "rig-codemode/worker-rep
 durable-object = ["dep:worker", "dep:rig-celld"]
 duroxide = ["dep:duroxide", "dep:tokio"]
 sqlite = ["duroxide", "duroxide/sqlite"]
+guard-sqlite = ["dep:rusqlite", "dep:tokio", "tokio/rt", "tokio/sync"]
 temporal = [
   "dep:temporalio-common",
   "dep:temporalio-sdk",

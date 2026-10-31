@@ -20,7 +20,11 @@ pub const EXECUTION_MAX_BYTES: usize = 1024 * 1024;
 pub const EXECUTION_MAX_DEPTH: usize = 64;
 
 /// Encode a complete trusted execution envelope with bounded bytes and depth.
-#[cfg(any(feature = "duroxide", feature = "temporal"))]
+#[cfg(any(
+    feature = "duroxide",
+    feature = "temporal",
+    all(feature = "guard-sqlite", not(target_family = "wasm"))
+))]
 pub(crate) fn encode_execution(value: &impl Serialize) -> Result<String, String> {
     struct Writer {
         bytes: Vec<u8>,

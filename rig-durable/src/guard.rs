@@ -25,6 +25,11 @@ use rig::wasm_compat::{WasmBoxedFuture as BoxFuture, WasmCompatSend, WasmCompatS
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[cfg(all(feature = "guard-sqlite", not(target_family = "wasm")))]
+mod sqlite;
+#[cfg(all(feature = "guard-sqlite", not(target_family = "wasm")))]
+pub use sqlite::SqliteGuardStore;
+
 use crate::{
     identity::{AttemptMetadata, LogicalCallKey},
     policy::ToolPolicy,
@@ -80,6 +85,12 @@ pub enum SettleOutcome {
 }
 
 /// Atomic create-if-absent claims with conditional settlement.
+///
+/// Every outcome, including `Existing` and `get`, must reflect committed state.
+/// A write with an unknown outcome is an error; it never authorizes execution.
+/// Canceling a caller's wait does not prove the write or external effect stopped.
+/// Claims never expire. Retain records for all possible redeliveries; rollback
+/// or restoration of storage can invalidate the guarantee.
 pub trait InvocationGuardStore: WasmCompatSend + WasmCompatSync {
     /// Create the claim if no record exists for `claim.key`. Must be atomic
     /// with respect to concurrent claims for the same key.
