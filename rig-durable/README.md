@@ -14,10 +14,19 @@ safety and idempotency policy.
 | `temporal`, without defaults | `temporal::TemporalAgent::new` | Temporal server and worker |
 | `durable-object`, without defaults | `durable_object::Builder::new` | Cloudflare or celld SQLite Durable Objects |
 | `codemode` with a native backend | `.code_mode(...)` | Durable JavaScript composition through QuickJS |
+| `guard-sqlite` | `guard::SqliteGuardStore::open` | Independent local guard storage for either native backend |
 | None | Shared contracts and configuration | Native or Wasm, without a runtime |
 
 Backend features are independent. Enable `temporal` with defaults to use both
 native backends. Use only `durable-object` on `wasm32-unknown-unknown`.
+
+Every executable tool registration requires a `ToolPolicy`, for example
+`.tool(lookup, ToolPolicy::read_only())`. There is one logical invocation contract.
+Duroxide runtime construction also requires a stable application/store scope,
+for example `AgentOrchestrator::sqlite(url, "support/production")`. Independent
+stores must use different scopes, even when they use the same run IDs.
+Managed inputs retain typed-child and code-mode configuration across restart
+and continuation. Native input envelopes are limited to 1 MiB and 64 JSON containers.
 
 ## Persistent Rig runner
 

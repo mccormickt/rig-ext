@@ -12,7 +12,7 @@ one `durable_object::Engine` per object and pass its ID as the session ID:
 let storage = rig_celld::CellStorage::from(state);
 let engine = rig_durable::durable_object::Builder::new(model)
     .preamble("Use the calculator for arithmetic.")
-    .tool_with(Add, ToolOptions::default().policy(ToolPolicy::read_only()))
+    .tool(Add, ToolPolicy::read_only())
     .build(storage.clone(), storage, object_id)?;
 
 let receipt = engine.submit(SubmitInput::new("req-1", "What is 20 + 22?")).await?;
@@ -32,8 +32,9 @@ turn. It commits all tool intents before it starts the concurrent tool batch.
 Each result commits separately; final outcomes retain model emission order.
 After a restart, an incomplete model call runs again. An incomplete tool call
 runs again only when its stored and registered replay policies agree and permit
-repetition. Otherwise the model receives an `Interrupted` result. An
-implementation-version change fails the session closed. The SQL tool-call
+repetition. A held non-repeatable intent returns `Interrupted`. A new execution
+with a safety or implementation-version mismatch returns `Error::Incompatible`
+without closing the session or discarding its admitted work. The SQL tool-call
 table is the invocation guard; no separate guard store is needed.
 
 The object uses the `Logical` contract. Approval resolves the whole tool batch
@@ -162,7 +163,7 @@ use temporalio_sdk::WorkerOptions;
 
 let agent = TemporalAgent::new(model)
     .preamble("Use the calculator tool for arithmetic.")
-    .tool(Add);
+    .tool(Add, ToolPolicy::read_only());
 let input = agent.input("What is 20 + 22?");
 
 let mut worker_options = WorkerOptions::new("rig-agents").build();
@@ -226,7 +227,9 @@ TEMPORAL_ADDRESS=temporal.example.com:443 TEMPORAL_TLS=true \
 An approval tool pauses before any tool activity is scheduled:
 
 ```rust,ignore
-let agent = TemporalAgent::new(model).approval_tool(DeleteAccount);
+let agent = TemporalAgent::new(model)
+    .approval_tool(DeleteAccount, ToolPolicy::interrupt_on_uncertain())
+    .invocation_guard(guard);
 
 let request = match handle.query(
     TemporalAgentWorkflow::status,
@@ -256,10 +259,10 @@ it with an `AgentOrchestrator`, and call `prompt`.
 let calculator = DurableAgent::builder("calculator", model)
     .version("1.0.0")?
     .preamble("Use the calculator tool for arithmetic.")
-    .tool(Add)
+    .tool(Add, ToolPolicy::read_only())
     .build()?;
 
-let orchestrator = AgentOrchestrator::sqlite("sqlite://agents.db?mode=rwc")
+let orchestrator = AgentOrchestrator::sqlite("sqlite://agents.db?mode=rwc", "calculator/production")
     .await?
     .register(calculator)?
     .start()
@@ -302,9 +305,7 @@ agents. Rig memory, retrieval, hooks, structured output, and arbitrary per-run
 `ToolContext` values are not yet mirrored. Activity-backed Rig tools receive a
 durable `ToolInvocation` in their context.
 
-Under the default `Legacy` contract, configuration and retry policies are
-captured at registration time rather than serialized. Under the `Logical`
-contract, each new run records a configuration snapshot in its input and
+Each managed run records a complete configuration snapshot in its input and
 carries it across continue-as-new; see
 [Tool replay safety](#tool-replay-safety). Tool calls are checked against the
 exact advertised and `ToolChoice`-allowed names, and unknown calls fail closed.
@@ -442,8 +443,8 @@ transcript, not only the compacted active context.
 Temporal `TemporalAgentWorkflow::run` result. The crate-owned
 `DurableResponse` wraps it with ordered `ToolOutcome`s: one per tool call, in
 dispatch order, with `prompt_index`, 1-based model `turn`, `call_index`, the
-`ToolDisposition`, and whether it was `Retained` from the activity output or
-`Derived` from the legacy error flag. Read it from
+`ToolDisposition`, and its source (retained activity output, routed result,
+denial, or pre-resolved result). Read it from
 `DurableRun::wait_detailed`/`result_detailed`, `DurableSession::wait`, the
 Temporal `submit` update, or the Temporal `tool_outcomes` and `result`
 queries. Tool results with equal content and different dispositions stay
@@ -510,8 +511,8 @@ it does not load a separate persistent Rig log.
 Replay is bounded by a poll budget based on recorded dispatches and tool calls,
 and the configured model-turn limit. A long prompt costs more storage and replay
 time; continue-as-new does not truncate its Rig log. Native single-run
-checkpoints have no additional crate-owned byte cap; backend payload limits
-still apply. Between prompts the log is discarded and compaction bounds the
+inputs and continuations have a 1 MiB and 64-container cap, including the complete
+configuration and replay state. Between prompts the log is discarded and compaction bounds the
 next seed's context. DO byte/depth limits cover the full checkpoint.
 DO admission reserves space for bounded settlements and the next
 replay window. Oversized tool results become committed failures. Retained work
@@ -557,7 +558,7 @@ tool schema is `{ "prompt": string }`; private `AgentInput` and
 ```rust,ignore
 let researcher = DurableAgent::builder("researcher", research_model)
     .description("Research a question and return a concise report.")
-    .tool(WebSearch)
+    .tool(WebSearch, ToolPolicy::read_only())
     .build()?;
 let assistant = DurableAgent::builder("assistant", main_model)
     .sub_agent("research", researcher)?
@@ -595,8 +596,8 @@ input ordering; `Promise.race` uses recorded host delivery order, not physical
 timestamps. A restart reuses completed activities and children rather than
 rerunning the whole script as one tool activity. Interrupted activities still
 have at-least-once delivery and need the existing replay-safety policies.
-Under `Logical`, nested Rig tools receive a key scoped to the script's child
-workflow instance and call ordinal. Keys differ across script calls and remain
+Nested Rig tools receive a key scoped to the full parent call and nested ordinal.
+Keys differ across script calls and remain
 stable across activity attempts. Temporal scopes keys to the execution chain,
 parent prompt, model turn, outer script call, and nested ordinal.
 Guard stores and per-tool retries still apply.
@@ -641,7 +642,7 @@ Calling `.sub_agent(...)` captures the child's configuration and queue:
 let researcher = TemporalAgent::new(research_model);
 let coordinator = TemporalAgent::new(main_model)
     .sub_agent("research", &researcher, "research-workers")?
-    .tool(lookup)
+    .tool(lookup, ToolPolicy::read_only())
     .code_mode(Default::default());
 let input = coordinator.input("Research and check the result.");
 researcher.register(&mut research_worker_options)?;
@@ -673,10 +674,10 @@ returning. Nested human approval and child
 conversation steering are not supported. Parent steering keeps its existing
 follow-up-turn behavior; it does not modify a running script or child.
 
-Treat enabling code mode, changing the nested catalog or policies, changing
-limits, or upgrading the VM as an agent-version boundary. Keep each registered
-version fixed while its histories live. Duroxide's parent configuration snapshot
-does not snapshot nested script configuration; Temporal inputs record it.
+Both native backends retain the nested catalog, routes, policies, retry settings,
+limits, typed-child definitions, and planner/projection identity. New planning
+requires the recorded runtime identity. Keep the declared tool implementations
+available for new effects; snapshots contain configuration, not executable code.
 Step inputs retain prior results,
 so history grows with both the number of calls and their result sizes. This
 feature does not add continue-as-new or bounded transcript storage to scripts.
@@ -687,7 +688,7 @@ Approval is enabled automatically when a builder tool requires it:
 
 ```rust,ignore
 let ops = DurableAgent::builder("ops", model)
-    .tool_with(DeleteAccount, ToolOptions::default().require_approval())
+    .tool_with(DeleteAccount, ToolOptions::new(ToolPolicy::idempotent()).require_approval())
     .build()?;
 let run = orchestrator.agent("ops")?.start("Delete account 123").await?;
 let request = run.next_approval().await?;
@@ -725,7 +726,7 @@ decides whether a redelivered attempt may run the tool again:
 
 | `ReplaySafety` | Redelivered attempt | Requirement |
 |---|---|---|
-| `ApplicationManaged` (default) | Runs the tool again | The application owns idempotency. |
+| `ApplicationManaged` | Runs the tool again | The application explicitly owns replay safety. |
 | `ReadOnly` | Runs the tool again | No external write. A durably recorded result is never replaced by a new read. |
 | `Idempotent` | Runs the tool again with the same `LogicalCallKey` | The tool keys its effect on `ToolInvocation::logical_key`, so attempts have one effect. |
 | `InterruptOnUncertain` | Does not run the tool | An `InvocationGuardStore` shared by every worker that can receive the activity. |
@@ -735,15 +736,14 @@ Declare a policy per tool. An explicit `retryable = false` on a returned
 whatever the replay safety:
 
 ```rust,ignore
+let guard = Arc::new(rig_durable::guard::SqliteGuardStore::open("payments-guard.db")?);
 let agent = DurableAgent::builder("payments", model)
-    .invocation_contract(InvocationContract::Logical)
-    .invocation_guard(Arc::new(InMemoryGuardStore::new()))
-    .tool_with(LookupBalance, ToolOptions::default().policy(ToolPolicy::read_only()))
+    .invocation_guard(guard.clone())
+    .tool(LookupBalance, ToolPolicy::read_only())
     .tool_with(
         Transfer,
-        ToolOptions::default()
-            .retry(RetryPolicy::new(3))
-            .policy(ToolPolicy::interrupt_on_uncertain().implementation_version("2")),
+        ToolOptions::new(ToolPolicy::interrupt_on_uncertain().implementation_version("2"))
+            .retry(RetryPolicy::new(3)),
     )
     .build()?;
 
@@ -752,31 +752,40 @@ let agent = TemporalAgent::new(model)
     .tool_with_policy(Transfer, ToolPolicy::interrupt_on_uncertain());
 ```
 
-### Invocation contracts
+### One logical invocation contract
 
-`InvocationContract` selects the activity payloads an agent version produces:
+Every native Rig-tool payload requires `LogicalCallKey`, attempt metadata, and
+`ToolPolicy`. Results retain `DurableToolResult` and `ToolDisposition`. Builders,
+catalog helpers, low-level executors, and DO registration require a policy.
+There is no default policy or minimal-payload mode. Approval, names, schemas,
+and annotations do not establish replay safety.
 
-- `Legacy` uses minimal invocation payloads. Every tool runs with
-  `ApplicationManaged` safety; the builder rejects any other policy.
-- `Logical` adds the `LogicalCallKey`, attempt metadata, and the tool policy to
-  each payload, and records results as `DurableToolResult` with a
-  `ToolDisposition`.
-
-The Duroxide builder defaults to `Legacy`; `TemporalAgent` inputs default to
-`Logical`. Choose the contract before starting an execution and keep it fixed
-for that execution's histories.
+Generated child and code-mode tools route durable work under framework-defined
+semantics. They do not declare external work read-only. Arbitrary raw activity
+and sub-orchestration routes still receive raw arguments, not Rig context.
+They support explicit `ReadOnly` or `ApplicationManaged` declarations, but cannot
+promise logical metadata delivery or invocation guards. Their implementations
+and configuration capture remain the application's responsibility.
 
 ### Logical call identity
 
-Under `Logical`, `ToolInvocation::logical_key` identifies one tool call across
+`ToolInvocation::logical_key` identifies one tool call across
 retries, redelivery, and continue-as-new: the logical execution ID (the
-Duroxide instance ID or the Temporal namespace and first execution run ID), the submission ID
+Duroxide application/store scope and instance ID, or the Temporal namespace and first execution run ID), the submission ID
 (`prompt-{index}`), the model turn, and the call index. The same tool called
 from two prompts gets two keys; a retry keeps its key. `ToolInvocation::attempt`
 carries the physical execution ID and activity attempt for diagnosis only.
 Provider tool-call IDs can repeat across prompts and are not an idempotency key.
 Independent Temporal starts that reuse a closed workflow ID get different keys.
 Continue-as-new retains the execution-chain identity and ledger identity.
+
+Duroxide runtime constructors require a nonempty stable scope. Keep it unchanged
+for retries, restarts, and continuation. Give independent runtime stores distinct
+scopes, including copies of a store used for independent work. The scope is in
+both the guard key and the external idempotency digest, not only a storage prefix.
+Do not use a random worker ID. Raw starts must set `AgentInput::with_scope` or
+`SessionInput::with_scope`. Restoring or rolling back runtime or guard storage can
+invalidate these guarantees; the application must coordinate backups and recovery.
 
 ### Invocation guard
 
@@ -788,12 +797,45 @@ record whose arguments, policy, or implementation version differ returns
 `ClaimMismatch`. Settlement is conditional on the claim token, so a worker
 that resumes after its lease expired cannot overwrite a newer result.
 
-The guard gives up automatic progress after a crash between claim and I/O:
-the call stays interrupted until an operator or a tool-specific status lookup
-resolves it. Registration fails with `GuardStoreRequired` when a tool needs a
-guard and none was supplied. `InMemoryGuardStore` is process-local and only
-suitable for tests and single-worker deployments. Run
-`guard::conformance::run` against any other store before using it.
+Recovery validates the recorded key, tool, final argument digest, and policy
+before using a stored result. A matching settled result needs no live tool
+registration or matching current implementation. A matching held claim returns
+`Interrupted`, even under worker drift. Only new execution checks registration,
+exact replay-safety equality, declared implementation version, metadata, and guard
+availability. Safety declarations have no strength ordering. Retry and metadata
+retention settings remain those recorded in the input. Version checks compare
+declarations; they do not inspect executable binaries. Native incompatibility is
+a nonretryable configuration failure, not an uncertain effect or tool failure.
+Already admitted sibling work drains before a terminal native report.
+
+Raw Duroxide consumers decode `ToolActivityResult`: `Ok(ToolActivityOutput)` or
+`Err(InvocationConfigurationError)`. Configuration failures are recorded in this
+envelope without activity retries. Temporal uses a nonretryable application failure.
+
+The `guard-sqlite` feature supplies `SqliteGuardStore`, independent of Duroxide
+and Temporal. Inject it explicitly with `.invocation_guard(Arc::new(store))`.
+Its SQLite WAL uses `synchronous=FULL`, atomic cross-process claim uniqueness,
+and conditional settlement. Each outcome, including `Existing` and `get`, observes
+committed state; settlement commits before success. An ambiguous write is an error
+and never authorizes I/O. At most eight operations per store instance can queue
+or run, with 1 MiB/64-container claim and result limits. Saturation fails closed.
+No batching or deferred persistence is used. Cancellation of an await does not
+cancel a blocking database write or release its capacity early.
+
+This adapter supports processes on one host with a local filesystem, not
+multi-host distributed storage or network filesystems. Process-crash persistence
+is provided by SQLite. Host/power-loss durability requires the filesystem and
+device to honor sync operations. Preserve the database and WAL consistently.
+Retain records for every possible redelivery. Rollback or restoration can permit
+duplicate effects. PostgreSQL and distributed SQL adapters are outside this scope.
+
+There is no takeover, expiry, deletion, unlock, or generic reconciliation API.
+A missing external result does not establish safety while an original worker can
+resume. Reconciliation is application-specific and cannot rewrite an `Interrupted`
+outcome already recorded in backend history. No automatic memory fallback exists.
+`InMemoryGuardStore` is for tests and loses protection on process restart. Run
+`guard::conformance::run` against other adapters before using them. DO keeps its
+transactional intent ledger and does not add this second store.
 
 ### Result dispositions
 
@@ -807,24 +849,31 @@ tool's `MetadataRetention` approved, within its size limit. Inbound
 
 ### Configuration snapshots
 
-Under `Logical`, a new top-level Duroxide run started through the facade stores
-a `ConfigSnapshot` in its input:
-ordered tool definitions, routes, retry settings, approval flags, tool
-policies, completion settings, and checkpoint policy. Continuations carry it
-forward. On replay, the worker resolves the snapshot against its registration
-and fails the run closed when a snapshot tool is missing, routed differently,
-or registered with another implementation version. The tool executor refuses a
-payload recorded for another implementation version for the same reason. A
-worker whose live settings drifted in other ways replays the retained
-configuration.
+Managed native starts retain complete inline execution definitions: tool catalog,
+routes, policies, retries, approval settings, completion settings, checkpoint
+settings, and nested typed-child/code-mode definitions. Duroxide captures a typed
+child at parent construction, including children reached through code mode.
+Continuations carry the same definition. Native code-mode planning uses the
+existing `ReplayPlanner` identity plus the durable projection version. The model
+supplies source code only; backend-owned envelopes supply configuration.
+Configuration decoding rejects unknown fields, including capabilities disabled
+in the worker build, instead of silently dropping retained settings.
 
-**Child agents and raw orchestration starts do not have this automatic input
-snapshot guarantee.** Child starts retain the versioned `AgentInput` payload
-and resolve configuration from that registered child version until their first
-checkpoint. That checkpoint carries the resolved snapshot. Keep each child
-registration unchanged for its live histories; deploy changed configuration
-under a new child orchestration version. Raw callers can attach an explicit
-snapshot with `AgentInput::with_snapshot`.
+Complete native start and continuation inputs are limited to 1 MiB and 64 JSON
+containers before new effects. These bounds leave 1 MiB below Temporal's 2 MiB
+payload limit for SDK envelopes and 64 containers below serde's decoder limit.
+They cover prompt/history, configuration width and depth, and retained runner
+state, not only snapshot fragments. Large histories need application retention
+planning; compaction does not shrink an audit transcript. Backend limits can be
+stricter. DO retains its existing row and checkpoint limits.
+
+Raw starts own configuration capture: attach `AgentInput::with_snapshot` (or the
+session equivalent) as well as a scope. Missing snapshots do not disable policy
+or guard checks. Snapshots do not contain credentials, executable code, or all
+model implementation behavior. Applications must retain compatible registrations.
+Keep credentials in worker bindings, not serializable settings.
+Recorded approval settings are immutable execution configuration; applications
+must enforce current authorization and revocation at the external-effect boundary.
 
 Approval requests bind to the logical call, the final argument digest, and the
 tool implementation version. A decision recorded in history is reused after a
