@@ -18,8 +18,8 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use rig_codemode::{Catalog, CatalogEntry, CodeMode, DynamicToolDispatcher};
-//! use rig_codemode::mcp::OutputSchemaValidator;
+//! use rig_codemode_core::{Catalog, CatalogEntry, CodeMode, DynamicToolDispatcher};
+//! use rig_codemode_core::mcp::OutputSchemaValidator;
 //! use rig_rmcp::McpTool;
 //!
 //! fn executor(tools: Vec<McpTool>) -> Result<CodeMode, Box<dyn std::error::Error>> {

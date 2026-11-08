@@ -1,0 +1,31 @@
+[package]
+name = "rig-codemode-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared code-mode contracts, bindings, and replay interpreter"
+
+[dependencies]
+jsonschema = { version = "0.58", default-features = false }
+rig-core.workspace = true
+rig-rmcp = { version = "0.45.0", default-features = false, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing = "0.1"
+rquickjs = { version = "=0.14.0", default-features = false, features = ["std"], optional = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+rig = { workspace = true, features = ["test-utils"] }
+
+[features]
+default = []
+quickjs = ["dep:rquickjs"]
+worker-runtime = ["dep:rquickjs"]
+mcp = ["dep:rig-rmcp"]
+
+[lints]
+workspace = true

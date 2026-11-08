@@ -10,7 +10,7 @@
 //! dispatcher's policies and schema validation.
 //!
 //! ```
-//! use rig_codemode::{DynamicToolDispatcher, HostDispatcher, Invocation};
+//! use rig_codemode_core::{DynamicToolDispatcher, HostDispatcher, Invocation};
 //! use rig_core::tool::{DynamicTool, ToolContext, ToolExecutionError, ToolOutput};
 //! use serde_json::json;
 //!
@@ -224,7 +224,7 @@ impl DynamicToolDispatcher {
     /// this policy, so rewritten arguments must still match the tool schema.
     ///
     /// ```
-    /// use rig_codemode::{DynamicToolDispatcher, HostDispatcher, Invocation};
+    /// use rig_codemode_core::{DynamicToolDispatcher, HostDispatcher, Invocation};
     /// use rig_core::tool::{DynamicTool, ToolContext, ToolExecutionError, ToolOutput};
     /// use serde_json::json;
     ///
@@ -267,7 +267,7 @@ impl DynamicToolDispatcher {
     /// does not filter [`DispatchOutcome::metadata`].
     ///
     /// ```
-    /// use rig_codemode::{DynamicToolDispatcher, HostDispatcher, Invocation};
+    /// use rig_codemode_core::{DynamicToolDispatcher, HostDispatcher, Invocation};
     /// use rig_core::tool::{DynamicTool, ToolContext, ToolOutput};
     /// use serde_json::json;
     ///

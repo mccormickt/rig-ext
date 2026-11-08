@@ -11,18 +11,18 @@ use crate::bridge::{Reply, Request, WorkerOutcome};
 use crate::projection::bounded_json_with_depth;
 use crate::{CatalogEntry, Limits, ScriptOutput};
 
-pub(crate) const VERSION: u32 = 1;
+pub const VERSION: u32 = 1;
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub(crate) struct ExchangeBudget {
+pub struct ExchangeBudget {
     pub bytes: usize,
     pub work: u64,
     pub elapsed: Duration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct RunnerRequest {
+pub struct RunnerRequest {
     pub version: u32,
     pub code: String,
     pub catalog: Vec<CatalogEntry>,
@@ -32,32 +32,32 @@ pub(crate) struct RunnerRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct PrefixEntry {
+pub struct PrefixEntry {
     pub batch: EventBatch,
     pub reply: Reply,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct EventBatch {
+pub struct EventBatch {
     pub events: Vec<Request>,
     pub boundary: Boundary,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) enum Boundary {
+pub enum Boundary {
     Idle { output: ScriptOutput },
     Done(WorkerOutcome),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct RunnerResponse {
+pub struct RunnerResponse {
     pub version: u32,
     pub batches: Vec<EventBatch>,
     pub usage: RunnerUsage,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub(crate) struct RunnerUsage {
+pub struct RunnerUsage {
     /// Actual bounded response body length, measured by the adapter before
     /// decoding. The adapter must replace the guest's placeholder value.
     pub response_bytes: usize,
@@ -68,28 +68,109 @@ pub(crate) struct RunnerUsage {
     pub elapsed: Duration,
 }
 
+// Decode the envelope separately from guest JSON, which can contain values
+// serde_json cannot represent (depth or unpaired surrogates).
+pub fn decode_response(body: &[u8], limits: Limits) -> Result<RunnerResponse, ReplayError> {
+    use crate::{ExecutionStatus, ScriptDiagnostic};
+
+    #[derive(Deserialize)]
+    struct Envelope {
+        version: u32,
+        batches: Vec<Batch>,
+        usage: RunnerUsage,
+    }
+    #[derive(Deserialize)]
+    struct Batch {
+        events: Vec<Request>,
+        boundary: WireBoundary,
+    }
+    #[derive(Deserialize)]
+    enum WireBoundary {
+        Idle { output: ScriptOutput },
+        Done(WireOutcome),
+    }
+    #[derive(Deserialize)]
+    struct WireOutcome {
+        status: ExecutionStatus,
+        output: ScriptOutput,
+        // Require the field even when null.
+        #[serde(deserialize_with = "return_text")]
+        returned: Option<String>,
+        diagnostic: Option<ScriptDiagnostic>,
+        over_budget_calls: u32,
+    }
+    fn return_text<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        Option::<String>::deserialize(deserializer)
+    }
+
+    let envelope: Envelope = serde_json::from_slice(body).map_err(|_| ReplayError::Protocol)?;
+    Ok(RunnerResponse {
+        version: envelope.version,
+        usage: envelope.usage,
+        batches: envelope
+            .batches
+            .into_iter()
+            .map(|batch| EventBatch {
+                events: batch.events,
+                boundary: match batch.boundary {
+                    WireBoundary::Idle { output } => Boundary::Idle { output },
+                    WireBoundary::Done(wire) => {
+                        let mut outcome = WorkerOutcome {
+                            status: wire.status,
+                            output: wire.output,
+                            returned: None,
+                            diagnostic: wire.diagnostic,
+                            over_budget_calls: wire.over_budget_calls,
+                        };
+                        if let Some(json) = wire.returned {
+                            match serde_json::from_str(&json) {
+                                Ok(value) => outcome.returned = Some(value),
+                                Err(_) => {
+                                    outcome.status = ExecutionStatus::ScriptError;
+                                    let message = "the return value is not valid JSON";
+                                    let bound =
+                                        limits.message_bytes.min(limits.output_bytes).min(8192);
+                                    outcome.diagnostic = Some(ScriptDiagnostic {
+                                        message: message[..message.len().min(bound)].into(),
+                                        line: None,
+                                        column: None,
+                                        stack: None,
+                                    });
+                                }
+                            }
+                        }
+                        Boundary::Done(outcome)
+                    }
+                },
+            })
+            .collect(),
+    })
+}
+
 /// The runner must check each expected batch before supplying that batch's
 /// reply, reject unknown reply targets and early termination, drain all jobs
 /// after each reply, and return the full prefix plus exactly one new batch.
 /// It must enforce the remaining budget even when no response arrives.
-pub(crate) trait ReplayRunner: WasmCompatSend + WasmCompatSync {
+pub trait ReplayRunner: WasmCompatSend + WasmCompatSync {
     fn run<'a>(
         &'a self,
         request: RunnerRequest,
     ) -> WasmBoxedFuture<'a, Result<RunnerResponse, ReplayError>>;
 }
 
-pub(crate) struct CheckedPlanner<R> {
+pub struct CheckedPlanner<R> {
     runner: R,
     budget: ExchangeBudget,
 }
 
 impl<R: ReplayRunner> CheckedPlanner<R> {
-    pub(crate) fn new(runner: R, budget: ExchangeBudget) -> Self {
+    pub fn new(runner: R, budget: ExchangeBudget) -> Self {
         Self { runner, budget }
     }
 
-    pub(crate) async fn plan(&self, input: ReplayInput<'_>) -> Result<ScriptStep, ReplayError> {
+    pub async fn plan(&self, input: ReplayInput<'_>) -> Result<ScriptStep, ReplayError> {
         validate_source(input.code, input.limits)?;
         let mut state =
             ReplayState::new(input.catalog, input.limits, input.admitted, input.history)?;

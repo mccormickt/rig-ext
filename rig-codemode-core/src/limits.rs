@@ -7,7 +7,7 @@
 //!
 //! ```
 //! use std::time::Duration;
-//! use rig_codemode::{ExecutionRequest, LimitOverrides, Limits, LimitsError};
+//! use rig_codemode_core::{ExecutionRequest, LimitOverrides, Limits, LimitsError};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let host_limits = Limits {

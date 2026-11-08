@@ -23,7 +23,8 @@ use crate::projection::{bound_payload, project};
 use crate::{CallRecord, CallStatus, Catalog, ExecutionReport, Limits, ScriptDelivery};
 
 #[allow(dead_code)]
-pub(crate) mod protocol;
+#[doc(hidden)]
+pub mod protocol;
 
 /// Immutable inputs for one replay planning operation. No host tools execute.
 #[derive(Clone, Copy)]

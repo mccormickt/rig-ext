@@ -6580,21 +6580,35 @@ name = "rig-codemode"
 version = "0.1.0"
 dependencies = [
  "futures-util",
- "jsonschema",
  "rig",
  "rig-celld",
+ "rig-codemode-core",
  "rig-core",
  "rig-rmcp",
  "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen-test",
+ "worker",
+]
+
+[[package]]
+name = "rig-codemode-core"
+version = "0.1.0"
+dependencies = [
+ "jsonschema",
+ "rig",
+ "rig-core",
+ "rig-rmcp",
  "rquickjs",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
  "tracing",
- "tracing-subscriber",
- "wasm-bindgen-test",
- "worker",
 ]
 
 [[package]]

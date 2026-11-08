@@ -8,7 +8,7 @@ use crate::report::{CallStatus, ExecutionStatus, ScriptDiagnostic, ScriptOutput}
 
 /// Guest-to-host message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) enum Request {
+pub enum Request {
     /// The worker has drained its jobs and waits for a tool result.
     Idle,
     /// The script called `tools[name](args)` or `.raw(args)`.
@@ -30,13 +30,13 @@ pub(crate) enum Request {
 
 /// Host-to-guest message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Reply {
+pub struct Reply {
     pub ordinal: u32,
     pub payload: Payload,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) enum Payload {
+pub enum Payload {
     /// Resolve the promise with this JSON value.
     Resolve(String),
     /// Reject the promise with a typed script error.
@@ -46,7 +46,7 @@ pub(crate) enum Payload {
 /// A safe, typed error the script can observe. Contains only model-visible
 /// text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct ScriptError {
+pub struct ScriptError {
     pub message: String,
     pub kind: ToolErrorKind,
     /// `error`, `denied`, `skipped`, `rejected`, or `size`.
@@ -103,7 +103,7 @@ impl ScriptError {
 
 /// What the worker reports when the guest is done.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct WorkerOutcome {
+pub struct WorkerOutcome {
     pub status: ExecutionStatus,
     pub output: ScriptOutput,
     // JSON text keeps the return-value depth independent of its transport envelope.

@@ -34,7 +34,7 @@ pub(crate) fn bounded_json(
     bounded_json_with_depth(value, limit, 64)
 }
 
-pub(crate) fn bounded_json_with_depth(
+pub fn bounded_json_with_depth(
     value: &(impl Serialize + ?Sized),
     limit: usize,
     max_depth: usize,

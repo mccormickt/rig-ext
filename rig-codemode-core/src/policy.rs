@@ -15,7 +15,7 @@
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use std::sync::Arc;
-//! use rig_codemode::{
+//! use rig_codemode_core::{
 //!     Catalog, CatalogEntry, CodeMode, DynamicToolDispatcher, ExecutionRequest,
 //!     CallStatus, ScriptGrant, ScriptReview,
 //! };

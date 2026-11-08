@@ -13,7 +13,7 @@
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use std::sync::Arc;
-//! use rig_codemode::{
+//! use rig_codemode_core::{
 //!     Catalog, CodeMode, DynamicToolDispatcher, ExecutionRequest, ExecutionStatus,
 //! };
 //!
@@ -129,7 +129,7 @@ impl CallRecord {
     /// The executor must supply trusted values and enforce call limits.
     ///
     /// ```
-    /// use rig_codemode::{CallRecord, CallStatus, ExecutionReport, ExecutionStatus, ScriptDelivery};
+    /// use rig_codemode_core::{CallRecord, CallStatus, ExecutionReport, ExecutionStatus, ScriptDelivery};
     ///
     /// let call = CallRecord::new(2, "lookup", CallStatus::Succeeded, ScriptDelivery::Discarded);
     /// assert_eq!(serde_json::to_value(&call).unwrap(), serde_json::json!({
@@ -227,7 +227,7 @@ impl ExecutionReport {
     /// executor must enforce its own bounds and construct a trusted report.
     ///
     /// ```
-    /// use rig_codemode::{ExecutionReport, ExecutionStatus, ScriptDiagnostic};
+    /// use rig_codemode_core::{ExecutionReport, ExecutionStatus, ScriptDiagnostic};
     /// use rig_core::tool::ToolErrorKind;
     ///
     /// let mut report = ExecutionReport::new(ExecutionStatus::TimedOut);

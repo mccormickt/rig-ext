@@ -13,7 +13,7 @@
 //! but does not add a prefix to the callable name.
 //!
 //! ```
-//! use rig_codemode::{Catalog, CatalogEntry, Presentation};
+//! use rig_codemode_core::{Catalog, CatalogEntry, Presentation};
 //! use serde_json::json;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {

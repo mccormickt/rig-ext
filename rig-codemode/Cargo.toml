@@ -27,14 +27,11 @@ name = "mcp"
 required-features = ["quickjs", "mcp"]
 
 [dependencies]
-jsonschema = { version = "0.58", default-features = false }
+rig-codemode-core = { path = "../rig-codemode-core", version = "0.1.0", default-features = false }
 rig-core.workspace = true
 rig-rmcp = { version = "0.45.0", default-features = false, optional = true }
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-tracing = "0.1"
-rquickjs = { version = "=0.14.0", default-features = false, features = ["std"], optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
@@ -48,6 +45,7 @@ futures-util = { version = "0.3", optional = true }
 rig = { workspace = true, features = ["test-utils"] }
 rmcp = { version = "3.6", features = ["server", "client"] }
 tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
@@ -58,14 +56,14 @@ tokio = { version = "1", features = ["rt", "macros"] }
 default = []
 # Native QuickJS backend. Runs the script on a dedicated worker thread inside
 # the host process; see the README for its threat model.
-quickjs = ["dep:rquickjs"]
+quickjs = ["rig-codemode-core/quickjs"]
 # Replay-only QuickJS-WASM in fresh Dynamic Workers. Independent of native QuickJS.
 worker-replay = ["dep:rig-celld", "dep:worker", "dep:futures-util"]
 # Build the standalone Rust replay interpreter, not the host planner.
-worker-runtime = ["dep:rquickjs"]
+worker-runtime = ["rig-codemode-core/worker-runtime"]
 # Catalog entries with output schemas from `rig-rmcp` tools, plus output-schema
 # validation at the dispatch boundary.
-mcp = ["dep:rig-rmcp"]
+mcp = ["dep:rig-rmcp", "rig-codemode-core/mcp"]
 
 [lints]
 workspace = true

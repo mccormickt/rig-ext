@@ -38,7 +38,7 @@ impl ScriptAnalysis {
 /// and set `dynamic_tool_access`. No result proves complete tool coverage.
 ///
 /// ```
-/// use rig_codemode::analyze;
+/// use rig_codemode_core::analyze;
 ///
 /// let review = analyze(r#"
 ///     await tools.lookup({ id: "order-17" });
