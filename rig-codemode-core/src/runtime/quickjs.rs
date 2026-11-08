@@ -18,6 +18,7 @@ use rig_core::tool::ToolErrorKind;
 use rquickjs::context::EvalOptions;
 use rquickjs::convert::Coerced;
 use rquickjs::function::Opt;
+use rquickjs::object::Property;
 use rquickjs::promise::PromiseState;
 #[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
 use rquickjs::{Context, Runtime};
@@ -25,7 +26,7 @@ use rquickjs::{Ctx, Exception, FromJs, Function, Object, Promise, Value};
 
 #[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
 use super::SpawnError;
-use super::{PRELUDE, SCRIPT_FILENAME, locate, wrap_source, write_text};
+use super::{SCRIPT_FILENAME, locate, wrap_source, write_text};
 use crate::bridge::{Payload, Reply, Request, ScriptError, WorkerOutcome};
 #[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
 use crate::bridge::{WorkerChannels, WorkerConfig};
@@ -71,6 +72,7 @@ struct GuestState<'js> {
     over_budget_calls: u32,
     output: ScriptOutput,
     pending: HashMap<u32, (Function<'js>, Function<'js>)>,
+    boxer: Option<Function<'js>>,
 }
 
 type Shared<'js> = Rc<RefCell<GuestState<'js>>>;
@@ -157,7 +159,9 @@ pub(crate) enum Stop {
 impl Drop for Session<'_> {
     fn drop(&mut self) {
         // Guest handles must be released before the context and runtime.
-        self.state.borrow_mut().pending.clear();
+        let mut state = self.state.borrow_mut();
+        state.pending.clear();
+        state.boxer = None;
     }
 }
 
@@ -184,6 +188,7 @@ impl<'js> Session<'js> {
                 over_budget_calls: 0,
                 output: ScriptOutput::default(),
                 pending: HashMap::new(),
+                boxer: None,
             })),
         }
     }
@@ -308,15 +313,11 @@ impl<'js> Session<'js> {
 
     pub(crate) fn install(&self) -> rquickjs::Result<()> {
         let ctx = &self.ctx;
-        let host = Object::new(ctx.clone())?;
-
-        let names: Vec<String> = self
-            .catalog
-            .entries()
-            .iter()
-            .map(|entry| entry.name().to_string())
-            .collect();
-        host.set("names", Function::new(ctx.clone(), move || names.clone())?)?;
+        let globals = ctx.globals();
+        let object: Function = globals.get("Object")?;
+        let freeze: Function = object.get("freeze")?;
+        self.state.borrow_mut().boxer = Some(object);
+        let tools = Object::new_proto(ctx.clone(), None)?;
 
         let invoke = {
             let state = self.state.clone();
@@ -425,13 +426,35 @@ impl<'js> Session<'js> {
                 Ok(promise)
             }
         };
-        host.set("invoke", Function::new(ctx.clone(), invoke)?)?;
+        for entry in self.catalog.entries() {
+            let function = |raw| {
+                let invoke = invoke.clone();
+                let name = entry.name().to_owned();
+                Function::new(ctx.clone(), move |ctx: Ctx<'js>, args: Opt<Value<'js>>| {
+                    let args = match args.0 {
+                        Some(value) if !value.is_undefined() => value,
+                        _ => Object::new(ctx.clone())?.into_value(),
+                    };
+                    invoke(ctx, name.clone(), args, raw)
+                })
+            };
+            let call = function(false)?;
+            let raw = function(true)?;
+            freeze.call::<_, ()>((raw.clone(),))?;
+            call.prop("raw", Property::from(raw).enumerable())?;
+            call.prop("toolName", Property::from(entry.name()).enumerable())?;
+            freeze.call::<_, ()>((call.clone(),))?;
+            tools.prop(entry.name(), Property::from(call).enumerable())?;
+        }
+        freeze.call::<_, ()>((tools.clone(),))?;
+        globals.prop("tools", Property::from(tools).enumerable())?;
 
         let text = {
             let state = self.state.clone();
             let limit = self.limits.output_bytes;
             let check_output = self.check_output.clone();
-            move |ctx: Ctx<'js>, value: Value<'js>| -> rquickjs::Result<()> {
+            move |ctx: Ctx<'js>, value: Opt<Value<'js>>| -> rquickjs::Result<()> {
+                let value = value.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
                 if let Some(string) = value.as_string() {
                     let string = string.to_string()?;
                     if !check_output(&state.borrow().output, &string) {
@@ -472,16 +495,47 @@ impl<'js> Session<'js> {
                 Ok(())
             }
         };
-        host.set("text", Function::new(ctx.clone(), text)?)?;
+        globals.prop(
+            "text",
+            Property::from(Function::new(ctx.clone(), text)?).enumerable(),
+        )?;
 
         let search = {
             let catalog = self.catalog.clone();
             let stopped = self.stopped.clone();
             let message_bytes = self.limits.message_bytes;
+            let state = self.state.clone();
             move |ctx: Ctx<'js>,
-                  query: rquickjs::String<'js>,
-                  limit: Opt<Option<f64>>|
+                  query: Opt<Value<'js>>,
+                  options: Opt<Value<'js>>|
                   -> rquickjs::Result<Value<'js>> {
+                let query = query.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                let query: rquickjs::String = if query.is_null() || query.is_undefined() {
+                    rquickjs::String::from_str(ctx.clone(), "")?
+                } else {
+                    ctx.globals().get::<_, Function>("String")?.call((query,))?
+                };
+                let mut limit = None;
+                if let Some(options) = options.0
+                    && Coerced::<bool>::from_js(&ctx, options.clone())?.0
+                {
+                    // Box primitives with the intrinsic constructor, independent of guest globals.
+                    let boxer = state
+                        .borrow()
+                        .boxer
+                        .clone()
+                        .ok_or(rquickjs::Error::Unknown)?;
+                    let options: Object = boxer.call((options,))?;
+                    if !options.get::<_, Value>("limit")?.is_undefined()
+                        && !options.get::<_, Value>("limit")?.is_null()
+                    {
+                        limit = Some(
+                            ctx.globals()
+                                .get::<_, Function>("Number")?
+                                .call::<_, f64>((options.get::<_, Value>("limit")?,))?,
+                        );
+                    }
+                }
                 if query.clone().to_cstring()?.len() > MAX_QUERY_BYTES {
                     return Err(Exception::throw_range(
                         &ctx,
@@ -489,7 +543,7 @@ impl<'js> Session<'js> {
                     ));
                 }
                 let query = query.to_string()?;
-                let limit = match limit.0.flatten() {
+                let limit = match limit {
                     Some(n) if n.is_finite() && n >= 1.0 => (n as usize).min(MAX_SEARCH_LIMIT),
                     Some(_) => 1,
                     None => DEFAULT_SEARCH_LIMIT,
@@ -503,12 +557,18 @@ impl<'js> Session<'js> {
                 to_guest(&ctx, &results, message_bytes)
             }
         };
-        host.set("searchTools", Function::new(ctx.clone(), search)?)?;
+        globals.prop(
+            "searchTools",
+            Property::from(Function::new(ctx.clone(), search)?).enumerable(),
+        )?;
 
         let describe = {
             let catalog = self.catalog.clone();
             let message_bytes = self.limits.message_bytes;
-            move |ctx: Ctx<'js>, name: rquickjs::String<'js>| -> rquickjs::Result<Value<'js>> {
+            move |ctx: Ctx<'js>, name: Opt<Value<'js>>| -> rquickjs::Result<Value<'js>> {
+                let name = name.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                let name: rquickjs::String =
+                    ctx.globals().get::<_, Function>("String")?.call((name,))?;
                 if name.clone().to_cstring()?.len() > MAX_NAME_BYTES {
                     return Err(Exception::throw_range(&ctx, "tool name exceeds 128 bytes"));
                 }
@@ -519,20 +579,23 @@ impl<'js> Session<'js> {
                 }
             }
         };
-        host.set("describeTool", Function::new(ctx.clone(), describe)?)?;
-
-        ctx.globals().set("__host", host)?;
-        ctx.eval::<(), _>(PRELUDE)?;
-        ctx.eval::<(), _>(
-            r#"
-                delete globalThis.Date;
-                delete globalThis.WeakRef;
-                delete globalThis.FinalizationRegistry;
-                Object.defineProperty(Math, "random", {
-                    value: () => { throw new Error("Math.random is unavailable in code mode"); },
-                    writable: false, configurable: false
-                });
-            "#,
+        globals.prop(
+            "describeTool",
+            Property::from(Function::new(ctx.clone(), describe)?).enumerable(),
+        )?;
+        for name in ["Date", "WeakRef", "FinalizationRegistry"] {
+            globals.remove(name)?;
+        }
+        let math: Object = globals.get("Math")?;
+        math.remove("random")?;
+        math.prop(
+            "random",
+            Function::new(ctx.clone(), |ctx: Ctx<'js>| -> rquickjs::Result<()> {
+                Err(Exception::throw_message(
+                    &ctx,
+                    "Math.random is unavailable in code mode",
+                ))
+            })?,
         )?;
         Ok(())
     }

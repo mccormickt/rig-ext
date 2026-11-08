@@ -64,7 +64,7 @@ pub struct NativeReplayPlanner;
 #[cfg(all(feature = "quickjs", not(target_family = "wasm")))]
 impl ReplayPlanner for NativeReplayPlanner {
     fn runtime_identity(&self) -> &str {
-        "rig-codemode/quickjs-ng-0.16.2/rquickjs-0.14.0/replay-v1"
+        "rig-codemode/quickjs-ng-0.16.2/rquickjs-0.14.0/replay-v2-rust-bindings"
     }
 
     fn plan<'a>(&'a self, input: ReplayInput<'a>) -> ReplayFuture<'a> {

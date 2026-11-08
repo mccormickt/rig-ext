@@ -13,11 +13,6 @@ pub(crate) mod quickjs;
 #[error("could not start the script worker: {0}")]
 pub struct SpawnError(#[from] pub(crate) std::io::Error);
 
-/// Prelude shared by every backend: builds the frozen null-prototype `tools`
-/// table and the script-facing helpers from the private `__host` object, then
-/// removes `__host` from the global scope.
-pub(crate) const PRELUDE: &str = include_str!("../../../rig-codemode/runtime/prelude.js");
-
 /// Wrap the model's code as an async function body. The wrapper occupies one
 /// line, so guest line numbers are one greater than source line numbers.
 pub(crate) fn wrap_source(code: &str) -> String {

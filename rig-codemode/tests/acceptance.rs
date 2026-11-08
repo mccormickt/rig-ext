@@ -507,6 +507,11 @@ async fn exact_names_route_without_aliases_or_inherited_capabilities() {
             toString: typeof tools["toString"],
             hasOwn: typeof tools["hasOwnProperty"],
             frozen: Object.isFrozen(tools),
+            functionsFrozen: Object.isFrozen(tools["a-b"]) && Object.isFrozen(tools["a-b"].raw),
+            fixedGlobals: ["tools", "text", "searchTools", "describeTool"].every(name => {
+                const d = Object.getOwnPropertyDescriptor(globalThis, name);
+                return d.enumerable && !d.writable && !d.configurable;
+            }),
             proto_of_tools: Object.getPrototypeOf(tools),
         };
         "#,
@@ -522,6 +527,8 @@ async fn exact_names_route_without_aliases_or_inherited_capabilities() {
     assert_eq!(r["toString"], "undefined");
     assert_eq!(r["hasOwn"], "undefined");
     assert_eq!(r["frozen"], true);
+    assert_eq!(r["functionsFrozen"], true);
+    assert_eq!(r["fixedGlobals"], true);
     assert_eq!(r["proto_of_tools"], Value::Null);
     let names: Vec<&str> = report.calls.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["a-b", "a_b", "__proto__"]);
@@ -969,7 +976,13 @@ async fn discovery_searches_only_the_catalog_snapshot() {
         const all = searchTools("sleeps").length;
         const described = describeTool("validate");
         const capped = searchTools("tool", { limit: 1000 }).length;
-        return { found, all, described, capped };
+        let reads = 0;
+        const getterLimit = searchTools("sleeps", { get limit() { reads++; return 2.9; } }).length;
+        Number.prototype.limit = 1;
+        globalThis.Object = () => { throw Error('guest Object must not be called'); };
+        const boxedLimit = searchTools("sleeps", 3).length;
+        const coercedName = describeTool({ toString() { return 'validate'; } }).name;
+        return { found, all, described, capped, reads, getterLimit, boxedLimit, coercedName };
         "#,
     )
     .await;
@@ -992,6 +1005,10 @@ async fn discovery_searches_only_the_catalog_snapshot() {
     );
     assert!(r["described"]["inputSchema"].is_object());
     assert!(r["capped"].as_u64().unwrap() <= 50);
+    assert_eq!(r["reads"], 3);
+    assert_eq!(r["getterLimit"], 2);
+    assert_eq!(r["boxedLimit"], 1);
+    assert_eq!(r["coercedName"], "validate");
     assert!(report.calls.is_empty(), "discovery is not a tool call");
 
     let description = f.codemode.description();
