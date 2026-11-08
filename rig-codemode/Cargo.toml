@@ -35,6 +35,7 @@ serde_json.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+wasmtime = { version = "=48.0.8", default-features = false, features = ["std", "runtime", "cranelift", "async"], optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 rig-celld = { path = "../rig-celld", default-features = false, features = ["dynamic-workers"], optional = true }
@@ -56,6 +57,7 @@ tokio = { version = "1", features = ["rt", "macros"] }
 rig-codemode-core = { path = "../rig-codemode-core", version = "0.1.0", default-features = false }
 sha2 = { version = "0.10", optional = true }
 serde_json = { workspace = true, optional = true }
+walrus = { version = "=0.26.5", optional = true }
 
 [features]
 default = []
@@ -64,6 +66,8 @@ default = []
 quickjs = ["rig-codemode-core/quickjs"]
 # Replay-only QuickJS-WASM in fresh Dynamic Workers. Independent of native QuickJS.
 worker-replay = ["dep:rig-celld", "dep:worker", "dep:futures-util", "dep:sha2", "dep:serde_json"]
+# Replay-only embedded QuickJS-WASM on native hosts, without native QuickJS linkage.
+wasmtime-replay = ["dep:wasmtime", "dep:sha2", "dep:serde_json", "dep:walrus"]
 # Build the standalone Rust replay interpreter, not the host planner.
 worker-runtime = ["rig-codemode-core/worker-runtime"]
 # Catalog entries with output schemas from `rig-rmcp` tools, plus output-schema

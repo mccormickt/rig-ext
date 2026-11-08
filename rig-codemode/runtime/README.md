@@ -63,6 +63,43 @@ to QuickJS allocations, not all Rust or Worker allocations. Non-polling engine
 built-ins still require platform CPU isolation. Local tests do not prove
 Cloudflare production enforcement or hard cancellation.
 
+## Native Wasmtime adapter
+
+Enable `wasmtime-replay` and construct
+`wasmtime_replay::WasmtimeReplayPlanner::new(WasmtimeBudget::default())` on a
+native host. It implements the same `ReplayPlanner` interface as the Workers
+adapter. Keep the planner to reuse the compiled module. Planning requires Tokio
+timers. Construction compiles trusted embedded bytes outside the script budget.
+
+The crate embeds `quickjs-core.wasm` and instantiates it directly with Wasmtime
+48.0.8. There is no JavaScript host, external file load, WASI, or host import.
+The build and constructor reject modules with imports. Each exchange uses a
+fresh Store and instance. The host writes bounded JSON into WASM memory and
+checks exported offsets and lengths before reading the response. Both adapters
+use the same Rust interpreter, portable checker, and script helpers.
+
+`WasmtimeBudget` defaults to 64 MiB aggregate transport, one billion aggregate
+instruction fuel units, 128 MiB linear memory per instance, and 30 seconds.
+Fuel charges initialization, QuickJS built-ins, Rust serialization, and repeated
+prefix execution. It yields every 100,000 fuel units so the host timer and
+cancellation can run even inside a QuickJS built-in. Dropping the future drops
+the suspended instance. The WASM stack limit is 512 KiB; QuickJS retains its
+64 KiB stack ceiling and script heap limit. Fuel exhaustion is a planner budget
+error; guest interruption can instead produce a timed-out report.
+
+This adds a WASM memory boundary around QuickJS, not an OS process boundary.
+Wasmtime, its compiler, and the host checker remain trusted. Linear-memory
+limits do not bound host allocations or compiled code. Host JSON work is
+size-bounded but synchronous; deadlines are checked after it returns, not a
+hard real-time guarantee. Apply process isolation for a stronger threat model.
+
+The native identity pins the engine artifact, ABI, Wasmtime version, adapter
+policy, and budgets. Do not reuse a native QuickJS or Worker history with this
+adapter. These adapters are replay-only; `CodeMode::execute` is unchanged.
+The built-in `rig-durable` Duroxide and Temporal integrations still select
+native QuickJS. Using this planner there requires planner selection in both
+integrations; this adapter does not silently change their recorded identities.
+
 ## Exchange contract
 
 Each exchange creates a fresh WASM instance and QuickJS interpreter. The
@@ -140,9 +177,9 @@ JS, WASM, hashes, and identity files are not repository sources. The host embeds
 the output with `include_bytes!` and `include_str!`; no runtime download or file
 load is needed. Native `quickjs` and contracts-only builds do not build assets.
 
-Build tools must be installed first. The Workers adapter needs Rust's
+Build tools must be installed first. Both replay adapters need Rust's
 `wasm32-unknown-unknown` target, clang/lld (tested with 14.0.6), and
-`wasm-bindgen-cli` 0.2.129. It also needs `worker-build` 0.8.3 and esbuild
+`wasm-bindgen-cli` 0.2.129. Workers also needs `worker-build` 0.8.3 and esbuild
 0.28.2. Use `scripts/workers/install.sh` for pinned Workers tools, then set
 `ESBUILD_BIN` to `scripts/workers/node_modules/.bin/esbuild` using an absolute
 path. `WASM_BINDGEN_BIN` and `WORKER_BUILD_BIN` can select installed tools too.
@@ -158,12 +195,13 @@ do not reuse an incompatible durable history.
 ```sh
 # From the repository root, after installing the tools:
 export ESBUILD_BIN="$PWD/scripts/workers/node_modules/.bin/esbuild"
-cargo build --locked -p rig-codemode --features worker-replay
+cargo build --locked -p rig-codemode --features worker-replay,wasmtime-replay
 
 # Export Cargo output to ignored runtime/build/ for local test fixtures:
 rig-codemode/runtime/build.sh
 npm ci --prefix rig-codemode/runtime
 cargo test --locked -p rig-worker-tests --test replay -- --ignored --nocapture
+cargo test --locked -p rig-codemode --features wasmtime-replay --test wasmtime_replay
 ```
 
 The ignored Unix Rust integration test owns all 11 direct Dynamic Worker conformance
@@ -173,8 +211,11 @@ An additional test loads the built assets through Node's VM module linker and
 checks WASM memory growth for oversized returns and diagnostics against controls.
 Rust owns the test assertions.
 
-The build script builds the workers-rs handler.
-Upstream worker-build bundles the generated Worker bindings,
+The build script builds the workers-rs handler and/or the standalone core.
+wasm-bindgen resolves binding descriptors; `prepare.rs` retains only the
+exchange ABI, removes unreachable code, and converts the pinned binding abort
+hook to a WASM trap. It rejects every remaining import. Core binding JavaScript
+is not embedded. Upstream worker-build bundles the generated Worker bindings,
 leaving `./index_bg.wasm` external. The Loader supplies that
 file as a compiled WASM module, not a fetchable URL. npm supplies only development
 tools: esbuild 0.28.2 and Miniflare 4.20260730.0, with sharp 0.35.5 and undici
@@ -183,7 +224,7 @@ review notices when dependency pins change.
 
 Rebuild twice with the same toolchain and compare hashes to check reproducibility.
 Cargo's package file list includes the guest Rust source, manifest template,
-lock file, and notices. Creating a
+lock file, preparation code, and notices. Creating a
 publishable `.crate` remains blocked by the workspace's unpublished path-only
 dependencies; this runtime does not change publication policy.
 

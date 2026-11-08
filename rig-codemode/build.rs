@@ -2,12 +2,16 @@ use std::error::Error;
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=build.rs");
-    #[cfg(feature = "worker-replay")]
+    #[cfg(any(feature = "worker-replay", feature = "wasmtime-replay"))]
     assets::build()?;
     Ok(())
 }
 
-#[cfg(feature = "worker-replay")]
+#[cfg(feature = "wasmtime-replay")]
+#[path = "runtime/prepare.rs"]
+mod prepare;
+
+#[cfg(any(feature = "worker-replay", feature = "wasmtime-replay"))]
 mod assets {
     use super::*;
     use sha2::{Digest, Sha256};
@@ -75,7 +79,13 @@ mod assets {
 
     pub fn build() -> Result<(), Box<dyn Error>> {
         let worker = cfg!(feature = "worker-replay");
+        let native =
+            cfg!(feature = "wasmtime-replay") && env::var("CARGO_CFG_TARGET_FAMILY")? != "wasm";
+        if !worker && !native {
+            return Ok(());
+        }
         println!("cargo:rerun-if-changed=runtime/guest");
+        println!("cargo:rerun-if-changed=runtime/prepare.rs");
         println!(
             "cargo:rerun-if-changed={}",
             rig_codemode_core::SOURCE_DIRECTORY
@@ -123,7 +133,7 @@ mod assets {
         );
         fs::write(guest.join("Cargo.toml"), manifest)?;
         fs::copy("runtime/guest/Cargo.lock", guest.join("Cargo.lock"))?;
-        for name in ["lib.rs", "workers.rs"] {
+        for name in ["lib.rs", "abi.rs", "workers.rs"] {
             fs::copy(
                 Path::new("runtime/guest/src").join(name),
                 guest.join("src").join(name),
@@ -153,6 +163,40 @@ mod assets {
                     files["index_bg.wasm"]["sha256"]
                         .as_str()
                         .ok_or("missing WASM hash")?
+                ),
+            )?;
+        }
+        #[cfg(feature = "wasmtime-replay")]
+        if native {
+            run(
+                command(env::var_os("CARGO").ok_or("missing CARGO")?, &guest).args([
+                    "build",
+                    "--lib",
+                    "--locked",
+                    "-j1",
+                    "--release",
+                    "--target",
+                    "wasm32-unknown-unknown",
+                ]),
+            )?;
+            run(Command::new(&bindgen)
+                .args(["--target", "bundler", "--out-name", "core", "--out-dir"])
+                .arg(out.join("core"))
+                .arg(guest.join(
+                    "target/wasm32-unknown-unknown/release/rig_codemode_worker_runtime.wasm",
+                )))?;
+            super::prepare::core(
+                &out.join("core/core_bg.wasm"),
+                &out.join("quickjs-core.wasm"),
+            )?;
+            record(&out, "quickjs-core.wasm", &mut files)?;
+            fs::write(
+                out.join("core-identity.txt"),
+                format!(
+                    "quickjs-ng-0.16.2:abi-v1:{}\n",
+                    files["quickjs-core.wasm"]["sha256"]
+                        .as_str()
+                        .ok_or("missing core hash")?
                 ),
             )?;
         }

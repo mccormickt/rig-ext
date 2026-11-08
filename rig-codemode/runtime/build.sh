@@ -5,7 +5,7 @@ export ESBUILD_BIN="${ESBUILD_BIN:-$root/scripts/workers/node_modules/.bin/esbui
 messages=$(mktemp)
 trap 'rm -f "$messages"' EXIT
 cargo build --manifest-path "$root/Cargo.toml" --locked -p rig-codemode \
-  --features worker-replay --message-format=json > "$messages"
+  --features worker-replay,wasmtime-replay --message-format=json > "$messages"
 python3 - "$messages" "$root/rig-codemode/runtime/build" <<'PY'
 import json
 import shutil
@@ -22,7 +22,8 @@ for line in Path(sys.argv[1]).read_text().splitlines():
 assert out is not None, "Cargo did not report the rig-codemode asset directory"
 destination = Path(sys.argv[2])
 destination.mkdir(parents=True, exist_ok=True)
-for name in ["index.js", "index_bg.wasm", "identity.txt", "fingerprint.json"]:
+for name in ["index.js", "index_bg.wasm", "quickjs-core.wasm", "identity.txt",
+             "core-identity.txt", "fingerprint.json"]:
     shutil.copyfile(out / name, destination / name)
 print(f"Runtime test assets: {destination}")
 PY

@@ -15,14 +15,14 @@ selected = set(subprocess.check_output(
     cwd=root, text=True,
 ).splitlines())
 required = {
-    "NOTICES.txt", "guest/Cargo.toml.in", "guest/Cargo.lock",
-    "guest/src/lib.rs", "guest/src/workers.rs",
+    "NOTICES.txt", "prepare.rs", "guest/Cargo.toml.in", "guest/Cargo.lock",
+    "guest/src/lib.rs", "guest/src/abi.rs", "guest/src/workers.rs",
 }
 assert {"runtime/" + name for name in required} <= selected, required - selected
 assert "build.rs" in selected
 assert not any(name.endswith((".wasm", "prelude.js", "worker.js")) for name in selected)
 manifest = json.loads((output / "fingerprint.json").read_text())
-for name in ["index.js", "index_bg.wasm"]:
+for name in ["index.js", "index_bg.wasm", "quickjs-core.wasm"]:
     data = (output / name).read_bytes()
     assert len(data) == manifest["files"][name]["bytes"], name
     assert hashlib.sha256(data).hexdigest() == manifest["files"][name]["sha256"], name
@@ -32,6 +32,9 @@ assert identity == (
     f"{manifest['files']['index.js']['sha256']}:"
     f"{manifest['files']['index_bg.wasm']['sha256']}"
 ), identity
+assert (output / "core-identity.txt").read_text().strip() == (
+    f"{manifest['engine']}:abi-v1:{manifest['files']['quickjs-core.wasm']['sha256']}"
+)
 lock = tomllib.loads((runtime / "guest/Cargo.lock").read_text())
 packages = {package["name"]: package for package in lock["package"]}
 dependencies = tomllib.loads((runtime / "guest/Cargo.toml.in").read_text().replace(

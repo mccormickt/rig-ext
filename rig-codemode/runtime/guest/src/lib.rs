@@ -1,3 +1,5 @@
+#[cfg(not(feature = "workers"))]
+mod abi;
 #[cfg(feature = "workers")]
 mod workers;
 

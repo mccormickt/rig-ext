@@ -11,6 +11,7 @@ The crate owns script execution, tool discovery, and bounded results. The host o
 | none | `Catalog`, `Limits`, `ExecutionReport`, `HostDispatcher`, `DynamicToolDispatcher`, `ScriptPolicy`, `analyze`. `CodeMode::builder().build()` returns `BuildError::NoBackend`. | Stable Rust |
 | `quickjs` | Native QuickJS backend through `rquickjs`, one worker thread per script | A C compiler for QuickJS; native targets only |
 | `worker-replay` | Rust/WASM QuickJS replay planner in fresh Dynamic Workers | WASM target, clang/lld, pinned wasm-bindgen/worker-build/esbuild; Worker Loader binding |
+| `wasmtime-replay` | Embedded QuickJS-WASM replay planner with no host imports | WASM target, clang/lld, pinned wasm-bindgen; native Wasmtime target and Tokio timers |
 | `mcp` | `CatalogEntry::from_mcp_definition` and `mcp::OutputSchemaValidator` for `rig-rmcp` tools | Native targets only; MCP tools with declared output schemas |
 
 Enabling `mcp` does not change dispatch or permissions for non-MCP tools. The builder never selects a backend by feature precedence: with several backends compiled, call `CodeModeBuilder::backend`.
@@ -21,10 +22,13 @@ Use `rig-codemode` with `default-features = false` for contracts and direct host
 
 For Worker script replay, enable `worker-replay` and use `WorkerReplayPlanner`. It shares the native Rust bindings and builds QuickJS into WASM. The host executes admitted tools and records their results. See the [runtime guide](runtime/README.md) for contracts, limits, and asset builds.
 
-The Workers adapter implements `ReplayPlanner`, not ordinary `CodeMode::execute`.
-Workers HTTP handling is Rust; its SDK binding
+For a native WASM boundary, enable `wasmtime-replay` and use
+`wasmtime_replay::WasmtimeReplayPlanner`. It embeds the engine and uses Wasmtime
+directly from Rust, without a JavaScript host or external runtime installation.
+It does not enable native `rquickjs`. Both adapters implement `ReplayPlanner`,
+not ordinary `CodeMode::execute`. Workers HTTP handling is Rust; its SDK binding
 JavaScript is generated in Cargo's `OUT_DIR`. The script helpers are Rust bindings
-shared through `rig-codemode-core`. The adapter does not load external runtime files
+shared through `rig-codemode-core`. Neither adapter loads external runtime files
 at execution time. See the [build requirements](runtime/README.md#cargo-built-assets).
 
 The `quickjs` feature requires a native target. `CodeModeBuilder::backend` selects a compiled engine; it does not accept an external executor. On Wasm, `build()` returns `BuildError::NoBackend`; use the replay planner instead. The native bridge uses a worker thread, Tokio task scheduling, timers, and a join handle; it is not compiled on Wasm.
@@ -225,6 +229,7 @@ cargo run -p rig-codemode --example mcp_tools --features quickjs,mcp   # in-proc
 cargo test -p rig-codemode                          # no backend: contracts and catalog
 cargo test -p rig-codemode --features quickjs       # acceptance suite with mock tools
 cargo test -p rig-codemode --features quickjs,mcp   # plus the fake rmcp server
+cargo test -p rig-codemode --features wasmtime-replay # embedded WASM, fuel, memory, cancellation
 ```
 
 The Wasm regression test runs direct dispatch and script review with `Rc` state and local timer futures. It checks refusal, effective-argument validation, redaction, grants, and external report construction, not guest execution. Install `wasm-bindgen-cli` at the version of `wasm-bindgen` in `Cargo.lock`, then run with Node.js:
@@ -240,4 +245,4 @@ CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
 
 - Nested calls pass through the supplied `HostDispatcher`, not an agent runner's hooks. Keep per-call policy in the dispatcher and script-level policy in a `ScriptPolicy`.
 - Scripts have no small-value store, image helpers, or raw provider source grammar.
-- QuickJS is the only script engine. Native execution runs in the host process; Worker replay uses a WASM build in a fresh Dynamic Worker.
+- QuickJS is the only script engine. The `quickjs` backend runs it directly in the host process. Replay can instead use a WASM build inside Wasmtime or a fresh Dynamic Worker. WASM isolation still trusts the host runtime; it is not an OS process sandbox.
