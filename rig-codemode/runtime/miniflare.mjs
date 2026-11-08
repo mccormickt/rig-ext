@@ -6,13 +6,13 @@ const port = Number(process.argv[2]);
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
   throw new Error("Usage: node miniflare.mjs <port>");
 }
-const source = await readFile(new URL("worker.js", import.meta.url), "utf8");
-const wasm = await readFile(new URL("quickjs.wasm", import.meta.url));
+const source = await readFile(new URL("build/index.js", import.meta.url), "utf8");
+const wasm = await readFile(new URL("build/index_bg.wasm", import.meta.url));
 const host = `import wasm from './engine.bytes';
 export default { async fetch(request, env) {
   if (new URL(request.url).pathname === '/health') return new Response('ready');
-  const worker = env.LOADER.load({ compatibilityDate: '2026-07-01', mainModule: 'worker.js',
-    modules: { 'worker.js': ${JSON.stringify(source)}, 'quickjs.wasm': { wasm } },
+  const worker = env.LOADER.load({ compatibilityDate: '2026-07-01', mainModule: 'index.js',
+    modules: { 'index.js': ${JSON.stringify(source)}, 'index_bg.wasm': { wasm } },
     globalOutbound: null, env: {}, limits: { cpuMs: 100, subRequests: 0 } });
   try { return await worker.getEntrypoint().fetch(request); }
   finally { if (typeof worker.dispose === 'function') worker.dispose(); }

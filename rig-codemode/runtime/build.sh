@@ -1,11 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")"
-if [[ "$(wasm-bindgen --version)" != "wasm-bindgen 0.2.129" ]]; then
-  echo "Install wasm-bindgen-cli 0.2.129" >&2
-  exit 1
-fi
-cargo build --manifest-path crate/Cargo.toml --target-dir target --locked --release --target wasm32-unknown-unknown
-wasm-bindgen --target bundler --out-dir build --out-name runtime \
-  target/wasm32-unknown-unknown/release/rig_codemode_worker_runtime.wasm
-node build.mjs
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+export ESBUILD_BIN="${ESBUILD_BIN:-$root/scripts/workers/node_modules/.bin/esbuild}"
+messages=$(mktemp)
+trap 'rm -f "$messages"' EXIT
+cargo build --manifest-path "$root/Cargo.toml" --locked -p rig-codemode \
+  --features worker-replay --message-format=json > "$messages"
+python3 - "$messages" "$root/rig-codemode/runtime/build" <<'PY'
+import json
+import shutil
+import sys
+from pathlib import Path
+
+out = None
+for line in Path(sys.argv[1]).read_text().splitlines():
+    message = json.loads(line)
+    if (message.get("reason") == "build-script-executed"
+            and ("/rig-codemode#" in message["package_id"]
+                 or "#rig-codemode@" in message["package_id"])):
+        out = Path(message["out_dir"])
+assert out is not None, "Cargo did not report the rig-codemode asset directory"
+destination = Path(sys.argv[2])
+destination.mkdir(parents=True, exist_ok=True)
+for name in ["index.js", "index_bg.wasm", "identity.txt", "fingerprint.json"]:
+    shutil.copyfile(out / name, destination / name)
+print(f"Runtime test assets: {destination}")
+PY

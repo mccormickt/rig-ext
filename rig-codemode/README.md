@@ -10,7 +10,7 @@ The crate owns script execution, tool discovery, and bounded results. The host o
 | --- | --- | --- |
 | none | `Catalog`, `Limits`, `ExecutionReport`, `HostDispatcher`, `DynamicToolDispatcher`, `ScriptPolicy`, `analyze`. `CodeMode::builder().build()` returns `BuildError::NoBackend`. | Stable Rust |
 | `quickjs` | Native QuickJS backend through `rquickjs`, one worker thread per script | A C compiler for QuickJS; native targets only |
-| `worker-replay` | Rust/WASM QuickJS replay planner in fresh Dynamic Workers | `wasm32-unknown-unknown` and a Worker Loader binding; uses checked-in assets |
+| `worker-replay` | Rust/WASM QuickJS replay planner in fresh Dynamic Workers | WASM target, clang/lld, pinned wasm-bindgen/worker-build/esbuild; Worker Loader binding |
 | `mcp` | `CatalogEntry::from_mcp_definition` and `mcp::OutputSchemaValidator` for `rig-rmcp` tools | Native targets only; MCP tools with declared output schemas |
 
 Enabling `mcp` does not change dispatch or permissions for non-MCP tools. The builder never selects a backend by feature precedence: with several backends compiled, call `CodeModeBuilder::backend`.
@@ -20,6 +20,12 @@ Enabling `mcp` does not change dispatch or permissions for non-MCP tools. The bu
 Use `rig-codemode` with `default-features = false` for contracts and direct host dispatch on `wasm32-unknown-unknown`. `HostDispatcher`, `ScriptPolicy`, and their callbacks use Rig's portable bounds: local state and non-`Send` futures are allowed on this target, while native targets retain `Send`/`Sync`. Threaded Wasm is not supported by Rig.
 
 For Worker script replay, enable `worker-replay` and use `WorkerReplayPlanner`. It shares the native Rust bindings and builds QuickJS into WASM. The host executes admitted tools and records their results. See the [runtime guide](runtime/README.md) for contracts, limits, and asset builds.
+
+The Workers adapter implements `ReplayPlanner`, not ordinary `CodeMode::execute`.
+Workers HTTP handling is Rust; its SDK binding
+JavaScript is generated in Cargo's `OUT_DIR`. The script helpers are Rust bindings
+shared through `rig-codemode-core`. The adapter does not load external runtime files
+at execution time. See the [build requirements](runtime/README.md#cargo-built-assets).
 
 The `quickjs` feature requires a native target. `CodeModeBuilder::backend` selects a compiled engine; it does not accept an external executor. On Wasm, `build()` returns `BuildError::NoBackend`; use the replay planner instead. The native bridge uses a worker thread, Tokio task scheduling, timers, and a join handle; it is not compiled on Wasm.
 

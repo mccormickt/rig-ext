@@ -1,19 +1,10 @@
-use wasm_bindgen::prelude::*;
+#[cfg(feature = "workers")]
+mod workers;
 
 /// QuickJS has no observable clock in replay scripts.
 #[unsafe(no_mangle)]
 pub extern "C" fn __rquickjs_host_now_us() -> f64 {
     0.0
-}
-
-#[wasm_bindgen]
-pub fn exchange(body: &str) -> Result<String, JsValue> {
-    rig_codemode::worker_runtime::exchange(body, execute_job).map_err(|error| {
-        JsValue::from_f64(match error {
-            rig_codemode::replay::ReplayError::BudgetExceeded => 429.0,
-            _ => 422.0,
-        })
-    })
 }
 
 fn execute_job(ctx: &rquickjs::Ctx<'_>) -> rquickjs::Result<bool> {

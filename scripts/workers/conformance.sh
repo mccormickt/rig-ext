@@ -6,7 +6,7 @@ mkdir -p .amp/in/artifacts
 scripts/workers/build.sh
 python3 scripts/workers/assets.py
 cmp rig-codemode/runtime/NOTICES.txt rig-durable/examples/durable-object/build/NOTICES.txt
-cmp rig-codemode/runtime/fingerprint.json rig-durable/examples/durable-object/build/worker-replay-fingerprint.json
+cmp rig-codemode/runtime/build/fingerprint.json rig-durable/examples/durable-object/build/worker-replay-fingerprint.json
 amp orb services ensure
 # Ensure already-running services read the newly built bundle.
 amp orb service restart durable-celld

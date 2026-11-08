@@ -18,10 +18,11 @@
 
 # Runtime adapters
 
-- Share the guest prelude from `runtime/prelude.js`; do not duplicate helper
-  semantics.
-- Cargo builds must not download npm packages. Check in reproducible JS/WASM
-  assets, fingerprints, and required notices.
+- Share Rust guest bindings through `rig-codemode-core`; do not duplicate helper
+  semantics or add a JavaScript prelude.
+- Build replay assets in Cargo's OUT_DIR from `runtime/guest` with pinned tools.
+  Do not check in generated JS/WASM or download npm tools from build scripts.
+  Keep required redistribution notices and lock files with the build sources.
 - Native and WASM QuickJS builds are not history-compatible.
   Fingerprints must pin the engine, exact runtime assets, adapter policy, and
   aggregate replay budgets. Persist script limits separately.

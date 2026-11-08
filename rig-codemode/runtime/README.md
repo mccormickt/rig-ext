@@ -1,4 +1,4 @@
-# Worker replay runtime
+# QuickJS-WASM replay adapters
 
 Enable `rig-codemode/worker-replay` without `quickjs` for a Workers build.
 The `WorkerReplayPlanner` type is available on `wasm32-unknown-unknown`.
@@ -30,11 +30,21 @@ that method's native cancellation behavior.
 ## Rust/WASM adapter
 
 The Worker runtime shares the native Rust `Session` bindings, catalog, output
-writer, return conversion, and guest prelude. Rust owns the replay exchange, prefix
+writer, return conversion, and script helpers. Rust owns the replay exchange, prefix
 checks, integer work counters, and transport accounting. JavaScript only loads
-the WASM module, reads a bounded HTTP body, and returns the response. The engine
-is still QuickJS C compiled through `rquickjs`; this is not a Rust JavaScript
-engine. The shared `prelude.js` remains JavaScript.
+the WASM module through generated workers-rs bindings. A Rust `#[event(fetch)]`
+handler reads HTTP chunks, checks their lengths before copying into WASM,
+validates UTF-8, and returns the response. There is no handwritten JavaScript
+HTTP handler or runtime loader. The engine is still QuickJS C compiled through
+`rquickjs`; this is not a Rust JavaScript engine. `rig-codemode-core` defines the
+script API with rquickjs functions and property descriptors, without a JS prelude.
+
+The core crate is shared by the facade and the guest, so compiling the guest
+cannot recursively build the adapters. Only `rquickjs`'s `std` feature is enabled;
+there is no module loader or guest I/O module. `rquickjs-extra` supplies modules
+such as OS, timers, and SQLite; they are not needed here. `rquickjs-extension`
+helps install modules, and `rquickjs-serde` converts JS values. Neither is needed
+for this fixed API and its bounded JSON protocol.
 
 The standalone artifact crate contains the small unsafe job-step FFI call;
 `rig-codemode` retains `forbid(unsafe_code)`. It preserves pending job exceptions
@@ -46,16 +56,17 @@ retaining guest handles. Handled failures do not prevent normal completion.
 Guest diagnostic and discovery strings use checked UTF-8 conversion. Invalid or
 oversized diagnostic fields use a bounded `error` fallback before Rust copying.
 
-The WASM module has no WASI, clock, or network imports. A constant clock supplies
-the engine's hidden clock hook; guest clocks and random values remain unavailable. Heap limits apply
+The Worker WASM module imports SDK functions for HTTP, streams, and generated
+bindings. It has no WASI. A constant clock supplies the engine's hidden clock
+hook; guest clocks and random values remain unavailable. Heap limits apply
 to QuickJS allocations, not all Rust or Worker allocations. Non-polling engine
 built-ins still require platform CPU isolation. Local tests do not prove
 Cloudflare production enforcement or hard cancellation.
 
 ## Exchange contract
 
-Each exchange creates a fresh anonymous Worker and QuickJS interpreter. The
-shared `prelude.js` supplies the frozen tool table, `text`, `searchTools`, and
+Each exchange creates a fresh WASM instance and QuickJS interpreter. The
+shared Rust bindings supply the frozen tool table, `text`, `searchTools`, and
 `describeTool`. Date, WeakRef, and FinalizationRegistry are absent; Math.random
 throws. Engine JSON APIs and Rust-owned state keep trusted protocol operations
 separate from guest globals. Guest serialization can still execute `toJSON`.
@@ -121,24 +132,37 @@ outbound access. QuickJS counters and transport bounds remain required. Workerd
 uses GC-only Worker cleanup; celld requests asynchronous release. Cloudflare
 production behavior and platform-level memory exhaustion are not tested here.
 
-## Reproducible assets
+## Cargo-built assets
 
-Cargo uses checked-in `worker.js`, `quickjs.wasm`, `identity.txt`, and
-`fingerprint.json`; it never runs npm or downloads runtime artifacts.
+`build.rs` compiles `guest/` and `rig-codemode-core` directly to WASM in Cargo's
+`OUT_DIR`. The guest manifest template and lock file are build inputs. Generated
+JS, WASM, hashes, and identity files are not repository sources. The host embeds
+the output with `include_bytes!` and `include_str!`; no runtime download or file
+load is needed. Native `quickjs` and contracts-only builds do not build assets.
 
-Build with Rust 1.99.1, the `wasm32-unknown-unknown` target, clang/lld (tested with
-14.0.6), and `wasm-bindgen-cli` 0.2.129. The orb setup installs the build tools.
-`crate/Cargo.lock` pins the standalone artifact's Rust dependencies, including
-`rquickjs` 0.14.0 and `wasm-bindgen` 0.2.129. The `worker-runtime` Cargo feature
-builds the interpreter; `worker-replay` only embeds its assets in the host planner.
+Build tools must be installed first. The Workers adapter needs Rust's
+`wasm32-unknown-unknown` target, clang/lld (tested with 14.0.6), and
+`wasm-bindgen-cli` 0.2.129. It also needs `worker-build` 0.8.3 and esbuild
+0.28.2. Use `scripts/workers/install.sh` for pinned Workers tools, then set
+`ESBUILD_BIN` to `scripts/workers/node_modules/.bin/esbuild` using an absolute
+path. `WASM_BINDGEN_BIN` and `WORKER_BUILD_BIN` can select installed tools too.
+The build checks versions and does not install tools or npm packages.
+
+`guest/Cargo.lock` pins the guest dependencies, including rquickjs 0.14.0.
+The nested Cargo build uses a separate target directory and `--locked`. It can
+fetch locked Rust crates. Set `CARGO_NET_OFFLINE=true` to prevent network use in
+both outer and nested Cargo builds after dependencies are cached. Rust 1.99.1
+was used for validation. Changing toolchains or compiled bytes changes identity;
+do not reuse an incompatible durable history.
 
 ```sh
-# From rig-codemode/runtime:
-npm ci
-npm run build
-npm audit
+# From the repository root, after installing the tools:
+export ESBUILD_BIN="$PWD/scripts/workers/node_modules/.bin/esbuild"
+cargo build --locked -p rig-codemode --features worker-replay
 
-# From the repository root:
+# Export Cargo output to ignored runtime/build/ for local test fixtures:
+rig-codemode/runtime/build.sh
+npm ci --prefix rig-codemode/runtime
 cargo test --locked -p rig-worker-tests --test replay -- --ignored --nocapture
 ```
 
@@ -149,16 +173,17 @@ An additional test loads the built assets through Node's VM module linker and
 checks WASM memory growth for oversized returns and diagnostics against controls.
 Rust owns the test assertions.
 
-`build.sh` compiles Rust and runs wasm-bindgen. `build.mjs` bundles the generated
-glue and `entry.js`, leaving `./quickjs.wasm` external. The Loader supplies that
+The build script builds the workers-rs handler.
+Upstream worker-build bundles the generated Worker bindings,
+leaving `./index_bg.wasm` external. The Loader supplies that
 file as a compiled WASM module, not a fetchable URL. npm supplies only development
 tools: esbuild 0.28.2 and Miniflare 4.20260730.0, with sharp 0.35.5 and undici
 7.30.1 overrides. `NOTICES.txt` contains Rust dependency and engine licenses;
 review notices when dependency pins change.
 
 Rebuild twice with the same toolchain and compare hashes to check reproducibility.
-Cargo's package file list includes the assets, JavaScript source, npm lock, and
-notices. The standalone artifact crate is built from the repository. Creating a
+Cargo's package file list includes the guest Rust source, manifest template,
+lock file, and notices. Creating a
 publishable `.crate` remains blocked by the workspace's unpublished path-only
 dependencies; this runtime does not change publication policy.
 

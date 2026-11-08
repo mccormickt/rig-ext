@@ -7,6 +7,9 @@ rustup target add wasm32-unknown-unknown
 if [[ "$(worker-build --version 2>/dev/null || true)" != "0.8.3" ]]; then
   cargo install worker-build --version 0.8.3 --locked
 fi
+if [[ "$(wasm-bindgen --version 2>/dev/null || true)" != "wasm-bindgen 0.2.129" ]]; then
+  cargo install wasm-bindgen-cli --version 0.2.129 --locked
+fi
 if [[ "$(celld --version 2>/dev/null || true)" != "celld 0.6.2" ]]; then
   case "$(uname -s)-$(uname -m)" in
     Linux-x86_64)

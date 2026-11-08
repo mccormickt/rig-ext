@@ -157,7 +157,29 @@ fn dynamic_worker_replay_conformance() {
         let clean = suffix(send(&request("return await tools.echo({n:3})"), 200));
         assert_eq!(clean["events"][0]["Call"]["arguments"], "{\"n\":3}");
     }
-    println!("PASS fresh state and prototype mutations do not corrupt trusted events");
+    let bindings = suffix(send(
+        &request(
+            r#"
+        const fixed = ['tools', 'text', 'searchTools', 'describeTool'].every(name => {
+            const d = Object.getOwnPropertyDescriptor(globalThis, name);
+            return d.enumerable && !d.writable && !d.configurable;
+        });
+        const frozen = Object.isFrozen(tools.echo) && Object.isFrozen(tools.echo.raw);
+        let reads = 0;
+        searchTools(null, {get limit() {reads++; return 2.9;}});
+        Number.prototype.limit = 1;
+        globalThis.Object = () => { throw Error('guest Object must not be called'); };
+        return [fixed, frozen, reads, searchTools('echo', 3).length,
+            describeTool({toString() {return 'echo';}}).name];
+    "#,
+        ),
+        200,
+    ));
+    assert_eq!(
+        returned(&bindings["boundary"]["Done"]),
+        json!([true, true, 3, 1, "echo"])
+    );
+    println!("PASS fresh state, fixed bindings and discovery coercion");
 
     // 5. Byte bounds preserve UTF-8 boundaries and reject invalid output/returns.
     {
@@ -356,30 +378,46 @@ fn bridge_budgets_bound_wasm_memory() {
         .args(["--experimental-vm-modules", "--input-type=module", "-e", r#"
 import { readFile } from 'node:fs/promises';
 import { createContext, SourceTextModule, SyntheticModule } from 'node:vm';
-const path = 'rig-codemode/runtime/';
-const source = await readFile(path + 'worker.js', 'utf8');
-const wasm = await WebAssembly.compile(await readFile(path + 'quickjs.wasm'));
+const path = 'rig-codemode/runtime/build/';
+const source = await readFile(path + 'index.js', 'utf8');
+const wasm = await WebAssembly.compile(await readFile(path + 'index_bg.wasm'));
 const input = JSON.parse(process.argv[1]);
 const results = [];
-for (const code of [input.code, 'const a=Array(1200000).fill(0); return 0',
+const cases = [input.code, 'const a=Array(1200000).fill(0); return 0',
   "throw 'x'.repeat(24 * 1024 * 1024)",
-  "const s='x'.repeat(24 * 1024 * 1024); throw 'control'"]) {
+  "const s='x'.repeat(24 * 1024 * 1024); throw 'control'"]
+  .map(code => ({ body: JSON.stringify({ ...input, code }) }));
+cases.push({ body: new Uint8Array([0xc3, 0x28]) });
+cases.push({ body: JSON.stringify({ ...input, code: 'return 23' }).padEnd(16 * 1024 * 1024, ' ') });
+cases.push({ chunks: [new Uint8Array(32 * 1024 * 1024)] });
+cases.push({ chunks: [new Uint8Array(16 * 1024 * 1024 - 8), new Uint8Array(16)] });
+for (const test of cases) {
   let memory;
-  const context = createContext({ TextEncoder, TextDecoder, Response,
+  let cancelled = false;
+  const body = test.chunks ? new ReadableStream({
+    start(controller) { for (const chunk of test.chunks) controller.enqueue(chunk); },
+    cancel() { cancelled = true; return Promise.reject(Error('cleanup failed')); },
+  }) : test.body;
+  const context = createContext({ TextEncoder, TextDecoder, Response, Request, Headers,
+    Uint8Array, ReadableStream, queueMicrotask, console, addEventListener() {},
     WebAssembly: { Instance: class extends WebAssembly.Instance {
       constructor(...args) { super(...args); memory = this.exports.memory; }
     } },
   });
   const worker = new SourceTextModule(source, { context });
   await worker.link((name) => {
-    if (name !== './quickjs.wasm') throw Error('unexpected import: ' + name);
+    if (name === 'cloudflare:workers') return new SyntheticModule(['WorkerEntrypoint'], function() {
+      this.setExport('WorkerEntrypoint', class { constructor() { this.env = {}; this.ctx = {}; } });
+    }, { context });
+    if (name !== './index_bg.wasm') throw Error('unexpected import: ' + name);
     return new SyntheticModule(['default'], function() { this.setExport('default', wasm); }, { context });
   });
   await worker.evaluate();
-  const response = await worker.namespace.default.fetch(new Request('http://test/', {
-    method: 'POST', body: JSON.stringify({ ...input, code }),
+  const response = await new worker.namespace.default().fetch(new Request('http://test/', {
+    method: 'POST', body, duplex: 'half',
   }));
-  results.push({ status: response.status, memory: memory.buffer.byteLength, body: await response.text() });
+  results.push({ status: response.status, memory: memory.buffer.byteLength,
+    body: await response.text(), cancelled });
 }
 console.log(JSON.stringify(results));
 "#])
@@ -403,7 +441,22 @@ console.log(JSON.stringify(results));
         assert_eq!(batch["boundary"]["Done"]["status"], "script_error");
         assert_eq!(batch["boundary"]["Done"]["diagnostic"]["message"], message);
     }
-    for result in results.as_array().unwrap() {
+    assert_eq!(results[4]["status"], 422, "invalid UTF-8: {results}");
+    assert_eq!(results[5]["status"], 200, "exact body limit: {results}");
+    let body: Value = serde_json::from_str(results[5]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(returned(&suffix(body)["boundary"]["Done"]), 23);
+    for index in [6, 7] {
+        assert_eq!(results[index]["status"], 429, "oversized stream: {results}");
+        assert_eq!(
+            results[index]["cancelled"], true,
+            "stream cleanup: {results}"
+        );
+    }
+    assert_eq!(
+        results[6]["memory"], results[4]["memory"],
+        "oversized chunk must not enter WASM"
+    );
+    for result in &results.as_array().unwrap()[..4] {
         assert!(
             result["memory"].as_u64().unwrap() < 40 * 1024 * 1024,
             "{results}"

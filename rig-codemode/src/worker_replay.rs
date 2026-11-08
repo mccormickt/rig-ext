@@ -37,7 +37,7 @@ impl Default for ReplayBudget {
 pub fn runtime_identity(budget: ReplayBudget) -> String {
     format!(
         "{}:adapter-v3:compat={COMPATIBILITY_DATE}:cpu={CPU_MS}:subrequests={SUBREQUESTS}:transport={MAX_TRANSPORT}:bytes={}:work={}:elapsed-ns={}",
-        include_str!("../runtime/identity.txt").trim(),
+        include_str!(concat!(env!("OUT_DIR"), "/identity.txt")).trim(),
         budget.bytes,
         budget.work,
         budget.elapsed.as_nanos(),
@@ -134,18 +134,19 @@ mod wasm {
                 let loaded = self
                     .loader
                     .load(WorkerCode {
-                        main_module: "worker.js".into(),
+                        main_module: "index.js".into(),
                         modules: BTreeMap::from([
                             (
-                                "worker.js".into(),
+                                "index.js".into(),
                                 WorkerModule::JavaScript(
-                                    include_str!("../runtime/worker.js").into(),
+                                    include_str!(concat!(env!("OUT_DIR"), "/index.js")).into(),
                                 ),
                             ),
                             (
-                                "quickjs.wasm".into(),
+                                "index_bg.wasm".into(),
                                 WorkerModule::Wasm(
-                                    include_bytes!("../runtime/quickjs.wasm").to_vec(),
+                                    include_bytes!(concat!(env!("OUT_DIR"), "/index_bg.wasm"))
+                                        .to_vec(),
                                 ),
                             ),
                         ]),

@@ -11,9 +11,13 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-rig-codemode = { path = "../..", default-features = false, features = ["worker-runtime"] }
+rig-codemode = { package = "rig-codemode-core", path = @CORE@, default-features = false, features = ["worker-runtime"] }
 rquickjs = { version = "=0.14.0", default-features = false, features = ["std"] }
-wasm-bindgen = "=0.2.129"
+wasm-bindgen = { version = "=0.2.129", optional = true }
+worker = { version = "=0.8.3", optional = true }
+
+[features]
+workers = ["dep:worker", "dep:wasm-bindgen"]
 
 [profile.release]
 opt-level = "s"

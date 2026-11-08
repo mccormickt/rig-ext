@@ -2,6 +2,8 @@
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$root"
+export ESBUILD_BIN="${ESBUILD_BIN:-$root/scripts/workers/node_modules/.bin/esbuild}"
+rig-codemode/runtime/build.sh
 target=wasm32-unknown-unknown
 for features in '' storage sqlite-vec dynamic-workers mcp mcp-http; do
   cargo check --locked --target "$target" -p rig-celld --no-default-features --features "$features"
