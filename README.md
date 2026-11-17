@@ -10,6 +10,7 @@ Extensions and integrations for the [Rig](https://github.com/0xPlaygrounds/rig) 
 | [`rig-a2a`](rig-a2a/README.md) | Uses remote Agent2Agent (A2A) services as Rig completion models and agents. |
 | [`rig-celld`](rig-celld/README.md) | Durable Object SQL storage, a celld `sqlite-vec` vector-store adapter, and optional stateless JSON-only MCP tools for native and Workers targets. |
 | [`rig-codemode`](rig-codemode/README.md) | Runs model-written JavaScript that composes approved Rig tools in a bounded QuickJS sandbox. Optional `mcp` feature for `rig-rmcp` tools. |
+| [`rig-codemode-core`](rig-codemode-core) | Shared code-mode contracts, tool bindings, and replay interpreter. |
 | [`rig-typesafeai-tools`](rig-typesafeai-tools/README.md) | Exposes host-configured Jev evaluations as Rig tools for direct or code-mode calls. |
 
 ## Build
@@ -24,8 +25,12 @@ cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The crates are unpublished. Use a local path dependency when integrating them
-into another workspace. Dependency versions and features are defined in
+GitHub Actions covers native and WASM features, replay assets, and standalone
+examples. See [CI and releases](.github/README.md) for coverage, publication order,
+and the owner setup required for release-plz and crates.io.
+
+Until versions are available on crates.io, use a local path dependency when
+integrating these crates. Dependency versions and features are defined in
 [`Cargo.toml`](Cargo.toml) and each crate's manifest.
 
 Each crate README lists its API guide, examples, feature choices, and extra
@@ -59,8 +64,8 @@ Local workerd does not enforce the tested dynamic Worker CPU or subrequest
 limits; local tests do not prove Cloudflare production enforcement.
 
 Asset selection, fingerprints, and notices are checked separately from the
-actual Worker build. Registry `.crate` packaging remains blocked by path-only
-workspace dependencies; these commands do not publish packages.
+actual Worker build. CI also creates registry `.crate` archives for the six
+public crates together; these commands do not publish packages.
 
 ## Constraints
 

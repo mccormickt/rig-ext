@@ -38,7 +38,7 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 wasmtime = { version = "=48.0.8", default-features = false, features = ["std", "runtime", "cranelift", "async"], optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
-rig-celld = { path = "../rig-celld", default-features = false, features = ["dynamic-workers"], optional = true }
+rig-celld = { path = "../rig-celld", version = "0.1.0", default-features = false, features = ["dynamic-workers"], optional = true }
 worker = { workspace = true, optional = true }
 futures-util = { version = "0.3", optional = true }
 

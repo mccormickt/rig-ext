@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  RUST_TEST_THREADS: '1'
+
+jobs:
+  native:
+    name: Native workspace
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          workers: 'true'
+      - name: Default and all-feature tests, Clippy, formatting
+        run: scripts/workers/check.sh native
+      - name: Package all public crates in dependency order
+        run: >-
+          cargo package --locked
+          -p rig-a2a -p rig-codemode-core -p rig-celld
+          -p rig-codemode -p rig-durable -p rig-typesafeai-tools
+
+  features:
+    name: Native feature isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Check libraries without feature unification
+        shell: bash
+        run: |
+          for features in '' native-tls rustls; do
+            cargo check --locked -p rig-a2a --no-default-features --features "$features" --lib
+          done
+          for features in '' mcp mcp-http; do
+            cargo check --locked -p rig-celld --no-default-features --features "$features" --lib
+          done
+          for package in rig-codemode-core rig-codemode; do
+            for features in '' quickjs mcp quickjs,mcp; do
+              cargo check --locked -p "$package" --no-default-features --features "$features" --lib
+            done
+          done
+          cargo check --locked -p rig-typesafeai-tools --lib
+          for features in '' duroxide sqlite guard-sqlite temporal codemode durable-object durable-object,codemode temporal,codemode; do
+            cargo check --locked -p rig-durable --no-default-features --features "$features" --lib
+          done
+      - name: Test backend-specific configurations
+        run: |
+          cargo test --locked -p rig-codemode-core -p rig-codemode --no-default-features
+          cargo test --locked -p rig-durable --no-default-features --features temporal,codemode
+          cargo test --locked -p rig-durable --no-default-features --features durable-object,codemode --lib durable_object
+
+  wasm:
+    name: WASM and replay runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          workers: 'true'
+      - name: WASM features, backend isolation, assets
+        run: scripts/workers/check.sh wasm
+      - name: Run tool and dispatch tests in Node WASM
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: |
+          cargo test --locked --target wasm32-unknown-unknown -p rig-typesafeai-tools --test tool
+          cargo test --locked --target wasm32-unknown-unknown -p rig-codemode --test wasm_dispatch
+      - name: Run Dynamic Worker and memory-bound tests on local workerd
+        run: |
+          npm ci --prefix rig-codemode/runtime
+          cargo test --locked -p rig-worker-tests --test replay -- --ignored --nocapture
+      - name: Build the Durable Object Worker
+        run: scripts/workers/build.sh
+
+  standalone:
+    name: Standalone examples
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          workers: 'true'
+      - name: Test the independent Rig-native prototype
+        run: |
+          cargo test --locked --manifest-path rig-durable/examples/rig-native/Cargo.toml --target-dir target/rig-native
+          cargo clippy --locked --manifest-path rig-durable/examples/rig-native/Cargo.toml --target-dir target/rig-native --all-targets -- -D warnings
+          cargo fmt --manifest-path rig-durable/examples/rig-native/Cargo.toml -- --check
+      - name: Check standalone Loader and replay fixtures
+        run: |
+          cargo check --manifest-path rig-celld/examples/loader-conformance/Cargo.toml --target wasm32-unknown-unknown
+          cargo check --manifest-path rig-codemode/runtime/conformance/Cargo.toml --features native
+          cargo check --locked --manifest-path rig-codemode/runtime/conformance/Cargo.toml --target wasm32-unknown-unknown --features worker
+          cargo fmt --manifest-path rig-celld/examples/loader-conformance/Cargo.toml -- --check
+          cargo fmt --manifest-path rig-codemode/runtime/conformance/Cargo.toml -- --check

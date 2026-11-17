@@ -1,0 +1,31 @@
+[workspace]
+release = false
+release_always = false
+repo_url = "https://github.com/mccormickt/rig-ext"
+git_tag_name = "{{ package }}-v{{ version }}"
+git_release_name = "{{ package }} {{ version }}"
+publish_no_verify = false
+
+[[package]]
+name = "rig-a2a"
+release = true
+
+[[package]]
+name = "rig-codemode-core"
+release = true
+
+[[package]]
+name = "rig-celld"
+release = true
+
+[[package]]
+name = "rig-codemode"
+release = true
+
+[[package]]
+name = "rig-durable"
+release = true
+
+[[package]]
+name = "rig-typesafeai-tools"
+release = true
