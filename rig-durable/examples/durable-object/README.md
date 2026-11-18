@@ -122,9 +122,8 @@ outbound denial, body bounds, Unicode boundaries, divergent replay, aggregate
 budgets, and infinite CPU/job chains. See their crate READMEs; the workflow
 fixture does not replace those tests or claim to prove cleanup or memory safety.
 
-`scripts/workers/assets.py` verifies Cargo's selected runtime asset paths,
-fingerprints, engine package pins, and MIT notices. Ordinary Cargo builds use
-the checked-in assets without npm regeneration. The app build copies the notices
-and asset fingerprint beside its Worker bundle; conformance checks those copies.
-This is not registry package validation: `cargo package --no-verify` is blocked by the workspace's path-only
-`rig-celld` dependency. Publication and release ordering are outside this example.
+The [asset check](../../../scripts/workers/assets.py) verifies Cargo's runtime
+file selection, generated asset fingerprints, dependency pins, and license notices.
+The app build copies the notices and fingerprint beside the Worker bundle;
+conformance checks those copies. CI checks registry archives separately, as
+described in the [release guide](../../../RELEASE.md#ci-coverage).

@@ -1,75 +1,16 @@
 # rig-ext
 
-Extensions and integrations for the [Rig](https://github.com/0xPlaygrounds/rig) agent framework.
+`rig-ext` extends [Rig](https://github.com/0xPlaygrounds/rig), the Rust agent framework, with durable workflows, remote agents, storage, and tools. Use the crates separately or together.
 
 ## Crates
 
 | Crate | Description |
-|---|---|
-| [`rig-durable`](rig-durable/README.md) | Durable Rig agents on Duroxide, Temporal, or SQLite Durable Objects (Cloudflare and celld). |
-| [`rig-a2a`](rig-a2a/README.md) | Uses remote Agent2Agent (A2A) services as Rig completion models and agents. |
-| [`rig-celld`](rig-celld/README.md) | Durable Object SQL storage, a celld `sqlite-vec` vector-store adapter, and optional stateless JSON-only MCP tools for native and Workers targets. |
-| [`rig-codemode`](rig-codemode/README.md) | Runs model-written JavaScript that composes approved Rig tools in a bounded QuickJS sandbox. Optional `mcp` feature for `rig-rmcp` tools. |
-| [`rig-codemode-core`](rig-codemode-core) | Shared code-mode contracts, tool bindings, and replay interpreter. |
-| [`rig-typesafeai-tools`](rig-typesafeai-tools/README.md) | Exposes host-configured Jev evaluations as Rig tools for direct or code-mode calls. |
+| --- | --- |
+| [`rig-a2a`](rig-a2a/README.md) | Use a remote Agent2Agent (A2A) service as a Rig completion model or agent. |
+| [`rig-celld`](rig-celld/README.md) | Connect Rig to Durable Object storage, vector search on celld, Dynamic Workers, and stateless MCP tools. |
+| [`rig-codemode`](rig-codemode/README.md) | Let a model combine approved Rig tools in a single JavaScript function. |
+| [`rig-codemode-core`](rig-codemode-core/) | Build code-mode runtimes with shared tool bindings, execution limits, and a replay interpreter. |
+| [`rig-durable`](rig-durable/README.md) | Run agent workflows that resume after a restart on Duroxide, Temporal, or SQLite Durable Objects. |
+| [`rig-typesafeai-tools`](rig-typesafeai-tools/README.md) | Expose a host-configured TypeSafe Jev evaluator as a Rig tool. |
 
-## Build
-
-Use the stable Rust toolchain. All crates use the Rust 2024 edition. Run the
-native checks from the workspace root:
-
-```sh
-cargo check --locked --workspace
-cargo test --locked --workspace --all-features
-cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-cargo fmt --all -- --check
-```
-
-GitHub Actions covers native and WASM features, replay assets, and standalone
-examples. See [CI and releases](.github/README.md) for coverage, publication order,
-and the owner setup required for release-plz and crates.io.
-
-Until versions are available on crates.io, use a local path dependency when
-integrating these crates. Dependency versions and features are defined in
-[`Cargo.toml`](Cargo.toml) and each crate's manifest.
-
-Each crate README lists its API guide, examples, feature choices, and extra
-build requirements. Native tests do not exercise Workers bindings; use the
-Wasm checks and celld conformance example for those integrations. Temporal's
-live tests require a development server and are ignored by default.
-
-## Local Rust Workers
-
-The [Durable Object example](rig-durable/examples/durable-object/README.md)
-uses deterministic mock models and needs no API key. Build and exercise the
-packaged Rust Worker on celld and local workerd from an orb:
-
-```sh
-scripts/workers/install.sh
-scripts/workers/conformance.sh
-RUST_TEST_THREADS=1 scripts/workers/check.sh
-```
-
-The setup pins celld 0.6.2, worker-build 0.8.3, esbuild 0.28.2, and
-Miniflare 4.20260730.0 (workerd 1.20260730.1). The npm lock uses patched
-`sharp` and `undici` overrides. Run `npm audit --prefix scripts/workers` to
-check current advisories. The service restarts retain local SQL storage.
-No Cloudflare account, API key, or production deployment is needed.
-The example retains approval/deduplication controls and adds two real child
-engines, out-of-order race recovery, uncertain acknowledgement/effect checks,
-planner-failure drain, corrupt child replies, and configuration-drift pause and
-restoration. Logs and independent
-SQL/API evidence are saved in `.amp/in/artifacts/`. Services bind loopback only.
-Local workerd does not enforce the tested dynamic Worker CPU or subrequest
-limits; local tests do not prove Cloudflare production enforcement.
-
-Asset selection, fingerprints, and notices are checked separately from the
-actual Worker build. CI also creates registry `.crate` archives for the six
-public crates together; these commands do not publish packages.
-
-## Constraints
-
-- The workspace pins `worker` because its `wasm-streams` ABI must match Rig and reqwest. Mixing those ABIs in one Worker creates duplicate WASM symbols.
-- `rig-a2a` supports native targets only.
-- `rig-durable` supports WASM with default features disabled. Its `duroxide` and `temporal` backends are native-only; use `durable-object` on Workers.
-- `rig-celld/storage` supports Cloudflare and celld SQLite Durable Objects. `sqlite-vec` requires celld 0.6.0 or later. See the [`rig-celld` README](rig-celld/README.md#configure-celld).
+For maintainers: [CI and releases](RELEASE.md).

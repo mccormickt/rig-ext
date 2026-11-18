@@ -1,50 +1,19 @@
-# CI and releases
+# Releases
 
-## CI coverage
-
-`ci.yml` runs on pull requests, pushes to `main`, merge queues, and manual
-requests. Jobs use Linux and stable Rust. They install Protobuf, clang/lld,
-OpenSSL development files, and the `wasm32-unknown-unknown` target. Replay jobs
-use Node 22 and the tools pinned by `scripts/workers/install.sh`. No provider,
-Cloudflare, or crates.io credentials are needed for CI.
-
-| Check | Coverage |
-| --- | --- |
-| Native workspace | All 11 workspace members: default and all-feature tests, examples, doctests, Clippy on all targets, and formatting. |
-| Native feature isolation | Each public library without unrelated workspace features. A2A TLS choices; MCP; contracts-only and QuickJS code mode; Duroxide, SQLite guards, Temporal, and Durable Objects. Tests also run with Temporal/code mode and Durable Object/code mode independently of the default backend. |
-| WASM | All applicable public libraries and four Worker examples. Separate storage, MCP, dynamic-worker, replay, and Durable Object feature sets. Dependency-tree checks reject unrelated backends. TypeSafe tools and local code-mode dispatch/policy tests run in Node through wasm-bindgen. |
-| Replay runtime | Build both Cargo-generated replay artifacts; check hashes, Cargo file selection, pins, and notices; run the ignored Dynamic Worker and WASM memory-bound tests on local workerd; build the Durable Object Worker. |
-| Standalone examples | Test and lint the separately locked Rig-native prototype. Compile the independent Loader fixture for WASM and the replay fixture for native and WASM. These two fixtures have no committed lockfile, so their first check resolves dependencies; subsequent checks use that lock. |
-| Packaging | Package and compile the six public crate archives together. Cargo uses a temporary local registry for unpublished workspace dependencies. This checks archive creation, dependency versions, file selection, and default-feature archive builds without an upload. Publishing also retains Cargo's archive build verification. |
-
-`rig-a2a` is native-only. Native QuickJS, Duroxide, Temporal, and the code-mode
-`rig-rmcp` adapter are not WASM backends. The separate `rig-celld` MCP adapter
-supports WASM. Do not replace the target-specific checks with a WASM workspace
-`--all-features` build. The guest runtime manifest is generated from
-`rig-codemode/runtime/guest/Cargo.toml.in` and is built by the replay asset build.
-
-CI does not run the ignored live Temporal server tests, the ignored MCP runtime
-test, or the orb-managed Durable Object crash/restart suite. Run
-`scripts/workers/conformance.sh` in an orb for the latter. The MCP runtime test
-currently copies its fingerprint from `runtime/fingerprint.json`, but the
-asset build writes `runtime/build/fingerprint.json`; that test needs a separate
-fix before it can run from a clean checkout. Local workerd tests do not prove
-Cloudflare production CPU or subrequest enforcement.
-
-For the workspace checks locally, install the pinned tools, then run
-`scripts/workers/check.sh`. The optional `native` and `wasm` arguments select
-the two CI portions. `RUST_TEST_THREADS=1` matches CI.
+After [CI](.github/workflows/ci.yml) passes on `main`, the
+[release workflow](.github/workflows/release-plz.yml) prepares a release PR
+with version and changelog updates. Publishing requires a merged release PR
+and successful CI on its `main` commit. Complete the [owner setup](#owner-setup)
+before the first release.
 
 ## Publication eligibility and order
 
-As checked on 2026-11-09, none of the six public crate names exists on
-crates.io. Confirm the names again before the first release; an available name
-does not reserve it. The external Rig 0.45 dependencies are published.
+Confirm that the crate names are available on crates.io before the first
+release. An available name is not reserved.
 
-All six libraries are enabled explicitly in `release-plz.toml`. Examples,
-conformance fixtures, the generated guest, and test tooling are not release
-products. Their manifests retain `publish = false`. Newly added crates are not
-released until added to the allowlist.
+The [release configuration](release-plz.toml) lists the six libraries to
+publish. Examples, conformance fixtures, the generated guest, and test tools
+set `publish = false`. New crates must be added to the list before release.
 
 Normal and build dependencies determine this order:
 
@@ -72,9 +41,8 @@ replay CI job must pass on the release PR before it is merged.
 
 ## Owner setup
 
-These are repository and registry owner actions. Do not paste credentials into
-an issue, PR, or Amp transcript. Use GitHub **Settings → Secrets and variables →
-Actions**, and the environment settings described below.
+Store credentials in GitHub **Settings → Secrets and variables → Actions**
+and in the environment settings described below.
 
 1. Enable Actions and permit the actions used by these workflows. Keep the
    default `GITHUB_TOKEN` permissions read-only; the publish job requests
@@ -133,3 +101,20 @@ for their first release, so this workflow uses a registry token for bootstrap.
 
 References: [release-plz setup](https://release-plz.dev/docs/github/quickstart)
 and [configuration](https://release-plz.dev/docs/config).
+
+## CI coverage
+
+[CI](.github/workflows/ci.yml) runs on pull requests, pushes to `main`, merge queues, and manual requests. Jobs use Linux and stable Rust with Protobuf, clang/lld, OpenSSL development files, and the `wasm32-unknown-unknown` target. Replay jobs use Node 22 and the pinned [Workers tools](scripts/workers/install.sh). CI needs no provider, Cloudflare, or crates.io credentials.
+
+| Check | Coverage |
+| --- | --- |
+| Native workspace | Default and all-feature tests, examples, doctests, Clippy on all targets, and formatting. |
+| Native feature isolation | Each public library without unrelated workspace features, including A2A TLS choices, MCP, QuickJS, and the durable backends. Tests cover Temporal and Durable Objects with code mode independently of Duroxide. |
+| WASM | Applicable public libraries and four Worker examples. Dependency-tree checks reject unrelated backends. TypeSafe tools and code-mode dispatch tests run in Node through wasm-bindgen. |
+| Replay runtime | Build both replay artifacts; check hashes, Cargo file selection, pins, and notices; run Dynamic Worker and WASM memory-bound tests on local workerd; build the Durable Object Worker. |
+| Standalone examples | Test and lint the separately locked Rig-native prototype. Compile the Loader fixture for WASM and the replay fixture for native and WASM. These two fixtures resolve dependencies on their first check. |
+| Packaging | Package and compile all six public crates together. Cargo uses a temporary local registry to resolve unpublished workspace dependencies. This checks the archives without publishing them. |
+
+For local workspace checks, install the pinned Workers tools, then run `RUST_TEST_THREADS=1 scripts/workers/check.sh`. Use the `native` or `wasm` argument to select one set of checks. A WASM workspace build with `--all-features` is not a substitute: `rig-a2a`, native QuickJS, Duroxide, Temporal, and the code-mode `rig-rmcp` adapter are native-only.
+
+CI does not run the live Temporal tests, the MCP runtime test, or the [Durable Object crash and restart suite](rig-durable/examples/durable-object/README.md). The MCP test expects `runtime/fingerprint.json`, but the asset build writes `runtime/build/fingerprint.json`. Local workerd tests do not establish that Cloudflare enforces production CPU or subrequest limits.

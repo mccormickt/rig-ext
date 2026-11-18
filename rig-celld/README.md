@@ -187,8 +187,10 @@ curl -fsSL https://celld.dev/install.sh | sh
 npm install --global esbuild
 ```
 
-The examples are architecture references. Add authentication, history compaction, and request idempotency before you use them in production. See the [workspace constraints](../README.md#constraints) for the Workers ABI requirement.
+The examples are architecture references. Add authentication, history compaction, and request idempotency before you use them in production.
 
 ## Portability
+
+Use the `worker` version pinned in the [workspace manifest](../Cargo.toml). Its `wasm-streams` ABI must match Rig and reqwest to avoid duplicate WASM symbols.
 
 The `storage` feature works on Cloudflare and celld without a compatibility flag. The `sqlite-vec` adapter is specific to celld. Cloudflare Durable Object SQLite does not allow the `sqlite-vec` extension or the `vec0` virtual table. The remaining Rig agent code can use another `VectorStoreIndex` on Cloudflare.

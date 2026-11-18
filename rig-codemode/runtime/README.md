@@ -224,9 +224,8 @@ review notices when dependency pins change.
 
 Rebuild twice with the same toolchain and compare hashes to check reproducibility.
 Cargo's package file list includes the guest Rust source, manifest template,
-lock file, preparation code, and notices. CI packages the public workspace crates
-together so Cargo can resolve their unpublished registry dependencies locally.
-See the [release guide](../../.github/README.md) for publication order and owner setup.
+lock file, preparation code, and notices. See the [release guide](../../RELEASE.md)
+for registry package checks and publication order.
 
 ## Real Rust/runtime conformance
 

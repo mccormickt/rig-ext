@@ -24,7 +24,7 @@ npm install --global esbuild
 
 Use celld 0.6.0 or later for the nested transaction of the index upsert.
 
-The Workers ABI must match Rig and reqwest. See the [workspace constraints](../../../README.md#constraints).
+Use the [pinned Workers dependency](../../README.md#portability) for ABI compatibility with Rig and reqwest.
 
 ## Build
 
